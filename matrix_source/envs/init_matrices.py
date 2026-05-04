@@ -23,6 +23,7 @@ def init_static_matrices(config):
         edge_nodes = computing_nodes
         
     comp_node_id_to_idx = {node['id']: i for i, node in enumerate(computing_nodes)}
+    edge_ids= [comp_node_id_to_idx[node.get("id")] for node in edge_nodes]
     num_comp_nodes = len(computing_nodes)
     
     # 2. Khởi tạo Terminals (Round Robin assignment to Edge Nodes)
@@ -77,13 +78,33 @@ def init_static_matrices(config):
         if node_id in comp_node_id_to_idx:
             max_queue_delay[comp_node_id_to_idx[node_id]] = torch.tensor(delays).float()
 
+    # 7. Adjacency Matrix (for Mean Field) - 2 hops limit
+    adj_matrix = torch.zeros((num_comp_nodes, num_comp_nodes))
+    for node_id, i in comp_node_id_to_idx.items():
+        # Find nodes within 2 hops
+        lengths = nx.single_source_shortest_path_length(G, node_id, cutoff=2)
+        for target_id, dist in lengths.items():
+            if target_id in comp_node_id_to_idx and target_id != node_id:
+                j = comp_node_id_to_idx[target_id]
+                adj_matrix[i, j] = 1.0
+
+    # 8. Terminal Adjacency Matrix
+    terminal_adj_matrix = torch.zeros((num_terminals, num_terminals))
+    for i in range(num_terminals):
+        for j in range(num_terminals):
+            if i != j and terminals[i].edge_id == terminals[j].edge_id:
+                terminal_adj_matrix[i, j] = 1.0
+
     return {
         "comp_node_id_to_idx": comp_node_id_to_idx,
         "resource_matrix": resource_matrix,
         "transmission_delay_matrix": delay_matrix,
         "terminal_to_comp_node_map": terminal_to_comp_node_map,
         "max_queue_delay": max_queue_delay,
-        "terminals": terminals # Return the generated terminals
+        "adj_matrix": adj_matrix,
+        "terminal_adj_matrix": terminal_adj_matrix,
+        "terminals": terminals,
+        "edge_ids": edge_ids
     }
 
 def init_metadata_tensors(config):

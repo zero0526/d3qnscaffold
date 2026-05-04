@@ -23,22 +23,25 @@ class MatrixSixGEnvironment:
         self.time_manager = TimeManager(slot_duration=self.engine.slot_duration)
 
     def reset(self):
-        self.engine.reset()
         self.time_manager.reset()
+        res_upper = self.engine.reset()
+        return res_upper
 
     def step_upper(self, placement_matrix):
         """
-        Upper-level decision: Update service placement.
+        Upper-level decision: Update service placement and return timeframe summary.
         """
-        self.engine.update_placement(placement_matrix)
+        summary = self.engine.update_placement(placement_matrix)
+        summary["is_done"] = self.time_manager.current_step >= self.time_manager.max_steps
+        return summary
 
-    def step_lower(self, terminal_indices, svc_indices, node_indices, model_indices):
+    def step_lower(self, terminal_indices, svc_indices, task_batch_sizes, node_indices, model_indices):
         """
         Execute the lower-level step via the physical engine.
         """
         # 1. Process Arrivals
         node_arrival_matrix, trans_energy_total, cold_delays = self.engine.process_arrivals(
-            terminal_indices, svc_indices, node_indices, model_indices
+            terminal_indices, svc_indices, node_indices, model_indices, task_batch_sizes
         )
         
         # 2. Solver Optimization
@@ -55,7 +58,10 @@ class MatrixSixGEnvironment:
             "reward": results['reward'].item(),
             "backlog": results['backlog'].clone(),
             "energy": results['energy'].item(),
-            "violations": results['violations'].item(),
+            "violations": results['violations'],
+            "obs": results['obs'],
+            "mean_field": results['mean_field'],
+            "prev_actions": results['prev_actions'],
             "new_frame": self.time_manager.is_new_frame()
         }
 

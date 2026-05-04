@@ -70,7 +70,7 @@ class DuelingNetwork(nn.Module):
 
 # ---D3QN AGENT ---
 class D3QNAgent:
-    def __init__(self, node_id:str, node_type: str, state_dim, action_dim, u_action_dim: int, mf_hidden_sizes: Tuple[int, ...],mf_lr:float, hidden_sizes=(128, 64),
+    def __init__(self, node_id:int, node_type: str, state_dim, action_dim, u_action_dim: int, mf_hidden_sizes: Tuple[int, ...],mf_lr:float, hidden_sizes=(128, 64),
                  lr=1e-4, gamma=0.99, alpha=0.005, buffer_size=cfg.hyper_neural["MEMORY_SIZE"], buffer_min_size=cfg.hyper_neural["BUFFER_MIN_SIZE"], batch_size=64, exclude_zero=False):
         self.action_dim = action_dim
         self.u_action_dim = u_action_dim # Store u_action_dim
@@ -79,7 +79,7 @@ class D3QNAgent:
         self.alpha = float(alpha)  # Ensure it is a scalar float
         self.batch_size = batch_size
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.node_id= node_id
+        self.node_id: int= node_id
         self.node_type = node_type
         self.min_batch_size= buffer_min_size[0] if node_type!="terminal" else buffer_min_size[1]
         # Evaluation Network, Target Network

@@ -7,7 +7,7 @@ class MatrixWorkloadGenerator:
        - Kích thước: (Num_Terminals x Num_Services).
     """
     def __init__(self, config, metadata):
-        self.num_terminals = config.get('num_terminals', 1)
+        self.num_terminals = config.hyper_neural.get("NUM_LOWER_AGENTS", 1)
         self.num_services = len(metadata['service_ids']) if 'service_ids' in metadata else 0
         self.zipf_probs = metadata['zipf_probs']
         self.device = config.get('device', 'cpu')
@@ -15,7 +15,7 @@ class MatrixWorkloadGenerator:
     def generate_step(self):
         """
         Mỗi terminal sinh đúng 1 task tại mỗi step.
-        Trả về (terminal_indices, svc_indices) của các task mới.
+        Trả về (terminal_indices, svc_indices, task_batch_sizes) của các task mới.
         """
         # 1. Toàn bộ terminals đều có task (chỉ số 0 đến num_terminals - 1)
         terminal_indices = torch.arange(self.num_terminals, device=self.device)
@@ -23,4 +23,9 @@ class MatrixWorkloadGenerator:
         # 2. Sample service cho từng terminal theo xác suất Zipf
         svc_indices = torch.multinomial(self.zipf_probs.to(self.device), self.num_terminals, replacement=True)
         
-        return terminal_indices, svc_indices
+        # 3. Sample batch size cho từng task (Số lượng item trong task)
+        min_b = self.config.get('task_min_batch', 1)
+        max_b = self.config.get('task_max_batch', 20)
+        task_batch_sizes = torch.randint(min_b, max_b + 1, (self.num_terminals,), device=self.device).float()
+        
+        return terminal_indices, svc_indices, task_batch_sizes

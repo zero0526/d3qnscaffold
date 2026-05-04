@@ -13,6 +13,10 @@ class TimeManager:
         self.current_step = 0
         self.time_elapsed = 0.0
 
+    def reset(self):
+        self.current_step = 0
+        self.time_elapsed = 0.0
+
     def tick(self):
         self.current_step += 1
         self.time_elapsed += self.slot_duration

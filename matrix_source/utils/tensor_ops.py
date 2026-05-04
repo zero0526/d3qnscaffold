@@ -96,6 +96,12 @@ def calculate_lyapunov_drift(current_backlog, arrivals, processed):
     drift = current_backlog * (arrivals - processed)
     return drift.sum()
 
+def transform2prob(phi: torch.Tensor)-> torch.Tensor:
+    # phi: num_node x num_service 
+    sum_workload_per_node= phi.sum(dim=-1, keepdim=True) + 1e-6
+    return phi/sum_workload_per_node
+
+
 def compute_batch_energy(f_alloc, processed, epsilon_comp, cold_delays, epsilon_cold=10.0):
     comp_energy = epsilon_comp * (f_alloc ** 2) * processed
     cold_energy = cold_delays*epsilon_cold
