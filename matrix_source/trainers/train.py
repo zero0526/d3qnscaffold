@@ -10,17 +10,15 @@ from matrix_source.agents import D3QNAgent
 from matrix_source.configs import cfg
 from matrix_source.utils.math_utils import to_binary, from_binary, one_hot
 from matrix_source.visualize.aggregator import MetricsAggregator
-from matrix_source.envs.init_matrices import init_static_matrices, init_metadata_tensors
 
 class Trainer:
     def __init__(self):
         self.config = cfg
         self.device = cfg.hyper_neural.get('DEVICE', 'cpu')
-        static_matrices= init_static_matrices(terminals=, config=)
-        metadata= init_metadata_tensors(cfg)
+        
         # 1. Initialize Environment & Workload
-        self.env = MatrixSixGEnvironment(config=cfg, static_matrices=None, metadata=None, device=self.device)
-        self.workload_gen = MatrixWorkloadGenerator(cfg, self.env.engine.metadata)
+        self.env = MatrixSixGEnvironment(config=cfg, device=self.device)
+        self.workload_gen = MatrixWorkloadGenerator(cfg, self.env.metadata)
 
         self.upper_agents: Dict[int, D3QNAgent] = {}
         self.lower_agents: Dict[int, D3QNAgent] = {}

@@ -1,38 +1,52 @@
 import torch
 import networkx as nx
+from matrix_source.models.terminal import Terminal
 
-def init_static_matrices(terminals, config):
+def init_static_matrices(config):
     """
     NHIỆM VỤ CỦA THÀNH PHẦN (INITIALIZER):
     1. Lọc các nút có tài nguyên tính toán (edge, network, cloud).
-    2. Chuyển đổi dữ liệu topology sang các ma trận PyTorch cố định.
+    2. Tự động khởi tạo Terminal và gán vào các Edge Node (Round Robin).
+    3. Chuyển đổi dữ liệu topology sang các ma trận PyTorch cố định.
     """
     topology_data= config.get("topology_data")
     nodes_data = topology_data['nodes_data']
     links_data = topology_data['links_data']
     
-    # Chỉ lấy các node có tài nguyên tính toán
+    # 1. Lọc các Computing Nodes
     computing_node_types = ["edge", "network", "cloud"]
     computing_nodes = [node for node in nodes_data if node.get('type') in computing_node_types]
+    edge_nodes = [node for node in nodes_data if node.get('type') == 'edge']
     
+    if not edge_nodes:
+        # Fallback if no edge nodes found, use all computing nodes
+        edge_nodes = computing_nodes
+        
     comp_node_id_to_idx = {node['id']: i for i, node in enumerate(computing_nodes)}
-    
     num_comp_nodes = len(computing_nodes)
     
-    # 2. Resource Matrix (Num_Computing_Nodes x 3) [CPU, RAM, HDD]
+    # 2. Khởi tạo Terminals (Round Robin assignment to Edge Nodes)
+    # Lấy số lượng từ hyper_neural config
+    num_terminals = config.hyper_neural.get("NUM_LOWER_AGENTS", 1)
+    terminals = []
+    for k in range(num_terminals):
+        # Lấy edge node theo vòng tròn (Round Robin)
+        target_edge = edge_nodes[k % len(edge_nodes)]
+        terminals.append(Terminal(terminal_id=k, edge_id=target_edge['id']))
+    
+    # 3. Resource Matrix (Num_Computing_Nodes x 3) [CPU, RAM, HDD]
     resource_list = []
     for node in computing_nodes:
         specs = node.get('specs', {})
         resource_list.append([specs.get('cpu', 0), specs.get('ram', 0), specs.get('hdd', 0)])
     resource_matrix = torch.tensor(resource_list, dtype=torch.float32)
     
-    # 3. Delay Matrix (Num_Computing_Nodes x Num_Computing_Nodes)
+    # 4. Delay Matrix (Num_Computing_Nodes x Num_Computing_Nodes)
     G = nx.Graph()
     for node in nodes_data:
         G.add_node(node['id'])
     for link in links_data:
-        rate = link.get('transmission_rate', 250.0) # Default rate if not provided
-        # We store both hop weight (1) and the actual rate
+        rate = link.get('transmission_rate', 250.0) 
         G.add_edge(link['source'], link['target'], weight=1.0, rate=rate)
     
     delay_matrix = torch.zeros((num_comp_nodes, num_comp_nodes))
@@ -42,34 +56,23 @@ def init_static_matrices(terminals, config):
                 delay_matrix[i, j] = 0.0
                 continue
             try:
-                # Tìm đường đi ngắn nhất theo số bước nhảy (hop count)
                 path = nx.shortest_path(G, source=src_id, target=dst_id, weight='weight')
-                
-                # Tính trung bình transmission rate trên toàn tuyến
-                rates = []
-                for k in range(len(path) - 1):
-                    rates.append(G[path[k]][path[k+1]]['rate'])
-                
+                rates = [G[path[k]][path[k+1]]['rate'] for k in range(len(path) - 1)]
                 avg_rate = sum(rates) / len(rates) if rates else 1e9
-                num_hosts = max(len(path) - 1,0)
-                
-                # Công thức: số host * (1 / tốc độ trung bình)
+                num_hosts = max(len(path) - 1, 0)
                 delay_matrix[i, j] = num_hosts * (1.0 / avg_rate)
             except nx.NetworkXNoPath:
                 delay_matrix[i, j] = float('inf')
             
-    # 4. Terminal to Computing Node Mapping Matrix (Num_Terminals x Num_Computing_Nodes)
-    num_terminals = len(terminals)
+    # 5. Terminal to Computing Node Mapping Matrix
     terminal_to_comp_node_map = torch.zeros((num_terminals, num_comp_nodes))
-    
     for k, terminal in enumerate(terminals):
-        if hasattr(terminal, 'edge_id') and terminal.edge_id in comp_node_id_to_idx:
+        if terminal.edge_id in comp_node_id_to_idx:
             terminal_to_comp_node_map[k, comp_node_id_to_idx[terminal.edge_id]] = 1
             
-    # 5. Max Queue Delay Matrix (Num_Computing_Nodes x Num_Services)
+    # 6. Max Queue Delay Matrix
     max_queue_delay = torch.zeros((num_comp_nodes, len(config.get('service_ids', [0,1,2,3,4]))))
     delay_data = config.get('delay_config', {})
-    
     for node_id, delays in delay_data.get('nodes', {}).items():
         if node_id in comp_node_id_to_idx:
             max_queue_delay[comp_node_id_to_idx[node_id]] = torch.tensor(delays).float()
@@ -79,7 +82,8 @@ def init_static_matrices(terminals, config):
         "resource_matrix": resource_matrix,
         "transmission_delay_matrix": delay_matrix,
         "terminal_to_comp_node_map": terminal_to_comp_node_map,
-        "max_queue_delay": max_queue_delay
+        "max_queue_delay": max_queue_delay,
+        "terminals": terminals # Return the generated terminals
     }
 
 def init_metadata_tensors(config):

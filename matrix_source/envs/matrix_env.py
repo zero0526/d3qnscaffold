@@ -1,16 +1,25 @@
 import torch
 from matrix_source.envs.time_manager import TimeManager
 from matrix_source.envs.matrix_physical_engine import MatrixPhysicalEngine
+from matrix_source.envs.init_matrices import init_static_matrices, init_metadata_tensors
 
 class MatrixSixGEnvironment:
-    def __init__(self, config, static_matrices, metadata, device="cpu"):
+    def __init__(self, config, device="cpu"):
         self.config = config
         self.device = device
         
-        # Engine handles all physical states and optimizations
-        self.engine = MatrixPhysicalEngine(config, static_matrices, metadata, device)
+        # 1. Initialize Matrices and Metadata (Automated)
+        init_data = init_static_matrices(config)
+        self.static_matrices = init_data
+        self.terminals = init_data['terminals']
         
-        # Time Management
+        metadata = init_metadata_tensors(config)
+        self.metadata = metadata
+        
+        # 2. Initialize Engine
+        self.engine = MatrixPhysicalEngine(config, self.static_matrices, metadata, device)
+        
+        # 3. Time Management
         self.time_manager = TimeManager(slot_duration=self.engine.slot_duration)
 
     def reset(self):
@@ -53,12 +62,10 @@ class MatrixSixGEnvironment:
     def get_observation(self, node_indices=None):
         """
         Returns condensed observations from the Engine's state.
-        Now compatible with 3D Float Queue.
+        Observable channels: (Backlog, CPU_Alloc, Placement, CPU_Util, RAM_Util, HDD_Util, Power_Util)
         """
-        # (Nodes x Services)
         backlog_2d = self.engine.backlog_queue.sum(dim=-1)
         
-        # Observable channels: (Backlog, CPU_Alloc, Placement, CPU_Util, RAM_Util, HDD_Util, Power_Util)
         obs = torch.stack([
             backlog_2d,
             self.engine.cpu_alloc_matrix,
