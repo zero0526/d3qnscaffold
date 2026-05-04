@@ -1,5 +1,4 @@
-from src.configs.configs import cfg
-from trainers.train import  Trainer
+from matrix_source.trainers.train import  Trainer
 if __name__ == '__main__':
     trainer= Trainer()
     trainer.train()

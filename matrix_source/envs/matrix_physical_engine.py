@@ -28,14 +28,15 @@ class MatrixPhysicalEngine:
         self.cold_start_delay_max = config.get('cold_start_delay_max', 0.85)
         self.energy_cold_start = config.get('energy_cold_start', 10.0)
         
-        # State Tensors (3D Float Queue)
+        # State Tensors (3D Dual Float Queue)
         self.num_nodes = self.resource_specs.shape[0]
         self.num_services = self.service_omega.shape[0]
-        self.max_K = config.get('max_queue_size', 100) # Thiết lập K=100 theo yêu cầu
+        self.max_K = config.get('max_queue_size', 100) 
         
         # (Nodes x Services x Max_K)
         self.backlog_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), device=self.device)
         self.deadline_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), device=self.device)
+        self.q_deadline_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), device=self.device)
         
         self.cpu_alloc_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
         self.placement_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
@@ -51,6 +52,7 @@ class MatrixPhysicalEngine:
     def reset(self):
         self.backlog_queue.zero_()
         self.deadline_queue.zero_()
+        self.q_deadline_queue.zero_()
         self.cpu_alloc_matrix.zero_()
         self.placement_matrix.zero_()
         self.prev_placement_matrix.zero_()
@@ -83,10 +85,11 @@ class MatrixPhysicalEngine:
         num_tasks = len(svc_indices)
         trans_energy_total = 0.0
         node_arrival_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
+        cold_delays = torch.tensor([], device=self.device) # Initialize early
         self.immediate_fails = 0
         
         if num_tasks == 0:
-            return node_arrival_matrix, trans_energy_total
+            return node_arrival_matrix, trans_energy_total, cold_delays
 
         src_node_indices = torch.argmax(self.terminal_to_node_map[terminal_indices], dim=1)
         task_data_sizes = self.service_input_size[svc_indices].squeeze()
@@ -98,42 +101,44 @@ class MatrixPhysicalEngine:
         trans_energy_total = trans_energy_tasks.sum()
 
         task_workloads = self.model_workloads[svc_indices, model_indices]
-        task_mean_deadlines = self.service_deadlines[svc_indices, 2] 
+        task_mean_deadlines = self.service_deadlines[svc_indices]
         task_max_queue = self.max_queue_delay[node_indices, svc_indices]
         
         task_cold_start = self.newly_placed_mask[node_indices, svc_indices] & (self.service_omega[svc_indices].squeeze() == 0)
         cold_delays = task_cold_start * random.uniform(self.cold_start_delay_min, self.cold_start_delay_max)
-        t_rem_raw = task_mean_deadlines - trans_delays - task_max_queue - cold_delays
+        
+        # Dual-Deadline Calculation
+        t_rem_raw = task_mean_deadlines - trans_delays - cold_delays
+        t_q_rem = t_rem_raw - task_max_queue
         
         valid_mask = t_rem_raw >= 1e-4
         self.immediate_fails = (~valid_mask).sum().item()
         
         if valid_mask.any():
-            vn, vs, vw, vt = node_indices[valid_mask], svc_indices[valid_mask], task_workloads[valid_mask], t_rem_raw[valid_mask]
+            vn, vs, vw, vt, vq = node_indices[valid_mask], svc_indices[valid_mask], task_workloads[valid_mask], t_rem_raw[valid_mask], t_q_rem[valid_mask]
             
-            # CHUẨN FIFO: Luôn điền vào sau Task cuối cùng (vì queue đã được dồn hàng)
-            for n, s, w, t in zip(vn, vs, vw, vt):
-                # Đếm số task đang có để tìm vị trí tiếp theo
+            for n, s, w, t, q in zip(vn, vs, vw, vt, vq):
                 num_active = (self.backlog_queue[n, s, :] > 0).sum().item()
                 if num_active < self.max_K:
-                    self.backlog_queue[n, s, int(num_active)] = w
-                    self.deadline_queue[n, s, int(num_active)] = t
+                    idx = int(num_active)
+                    self.backlog_queue[n, s, idx] = w
+                    self.deadline_queue[n, s, idx] = t
+                    self.q_deadline_queue[n, s, idx] = q
                 else:
-                    # Queue của node này đã đạt 100 -> Đánh fail luôn
                     self.immediate_fails += 1
             
             node_arrival_matrix.index_put_((vn, vs), vw, accumulate=True)
             
-        return node_arrival_matrix, trans_energy_total
+        return node_arrival_matrix, trans_energy_total, cold_delays
 
     def get_f_min_matrix(self):
         f_min_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
         valid_tasks = self.backlog_queue > 0
         if not valid_tasks.any():
             return f_min_matrix
-            
+
         cum_backlog = torch.cumsum(self.backlog_queue, dim=-1)
-        req_matrix = cum_backlog / (self.deadline_queue + 1e-9)
+        req_matrix = cum_backlog / (self.q_deadline_queue + 1e-9)
         req_matrix = torch.where(valid_tasks, req_matrix, torch.zeros_like(req_matrix))
         f_min_matrix, _ = torch.max(req_matrix, dim=-1)
         return f_min_matrix
@@ -147,23 +152,24 @@ class MatrixPhysicalEngine:
         f_min = f_min_matrix.clamp(max=f_max)
         self.cpu_alloc_matrix = self.solver.solve(G, Z, f_min, f_max)
 
-    def execute_and_collect_metrics(self, node_arrival_matrix, trans_energy_total):
+    def execute_and_collect_metrics(self, node_arrival_matrix, trans_energy_total, cold_delays):
         current_backlog_total = self.backlog_queue.sum(dim=-1)
-        available_f_slot = self.cpu_alloc_matrix * self.slot_duration
         
-        # 1. Deplete (FIFO)
-        self.backlog_queue, actual_processed = ops.deplete_float_queue(self.backlog_queue, available_f_slot)
+        # 1. Deplete (FIFO) với định thời gian chính xác
+        self.backlog_queue, actual_processed, in_slot_violation_mask = ops.deplete_float_queue(
+            self.backlog_queue, self.deadline_queue, self.cpu_alloc_matrix, self.slot_duration
+        )
         
-        # 2. Aging + Cleaning + DỒN HÀNG (Compaction)
-        self.backlog_queue, self.deadline_queue, expired_count = ops.age_and_clean_float_queue(
-            self.backlog_queue, self.deadline_queue, self.slot_duration
+        # 2. Aging + Cleaning + DỒN HÀNG
+        self.backlog_queue, self.deadline_queue, self.q_deadline_queue, expired_count = ops.age_and_clean_dual_queue(
+            self.backlog_queue, self.deadline_queue, self.q_deadline_queue, in_slot_violation_mask, self.slot_duration
         )
         
         num_violations = expired_count + self.immediate_fails
         total_drift = ops.calculate_lyapunov_drift(current_backlog_total, node_arrival_matrix, actual_processed)
         comp_energy = ops.compute_batch_energy(
             self.cpu_alloc_matrix, actual_processed, self.energy_coef, 
-            self.newly_placed_mask, self.service_omega, epsilon_cold=self.energy_cold_start
+            cold_delays, epsilon_cold=self.energy_cold_start
         )
         total_energy = comp_energy + trans_energy_total
         

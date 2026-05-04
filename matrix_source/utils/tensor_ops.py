@@ -10,72 +10,83 @@ def compute_transmission_metrics(src_nodes, dst_nodes, delay_matrix, data_sizes,
     delay_matrix: (M, M)
     data_sizes: (Task_Count,)
     """
-    # 1. Transmission Delay
     trans_delays = delay_matrix[src_nodes, dst_nodes] * data_sizes
-    
-    # 2. Transmission Energy
     trans_energy = beta * trans_delays
-    
     return trans_delays, trans_energy
 
 # ==========================================
-# 2. FLOAT DEADLINE QUEUE OPERATIONS (3D)
+# 2. HIGH-PRECISION FLOAT QUEUE OPERATIONS (3D)
 # ==========================================
 
-def deplete_float_queue(backlog, available_f_slot):
+def deplete_float_queue(backlog, deadline, cpu_alloc, slot_duration):
     """
-    Xử lý hàng đợi FIFO dựa trên năng lực tính toán (vectorized).
-    backlog: (M, S, K) - Khối lượng GFLOPS của từng Task
-    available_f_slot: (M, S) - Tổng GFLOPS có thể xử lý cho cặp (Node, Service)
-    """
-    # 1. Tính khối lượng công việc tích lũy (Cumulative Backlog)
-    cum_backlog = torch.cumsum(backlog, dim=-1)
-    
-    # Khối lượng đứng trước mỗi task k
-    before_processed = cum_backlog - backlog
-    
-    # 2. Xác định phần đã xử lý của mỗi task trong slot này
-    start_processing_f = (available_f_slot.unsqueeze(-1) - before_processed).clamp(min=0)
-    
-    # Task chỉ được xử lý tối đa bằng khối lượng còn lại của nó
-    actual_task_processed = torch.min(start_processing_f, backlog)
-    
-    # 3. Cập nhật backlog và tính tổng thực tế đã xử lý
-    new_backlog = backlog - actual_task_processed
-    actual_processed_total = actual_task_processed.sum(dim=-1)
-    
-    return new_backlog, actual_processed_total
-
-def age_and_clean_float_queue(backlog, deadline, slot_duration):
-    """
-    Trừ deadline, phát hiện vi phạm QoS và DỒN HÀNG (Vectorized).
+    Xử lý hàng đợi với định thời gian chính xác (Precise Timing).
     backlog: (M, S, K)
     deadline: (M, S, K)
+    cpu_alloc: (M, S) - Tần số CPU cấp cho cặp (Node, Service)
     """
-    # 1. Giảm deadline
+    f = cpu_alloc.unsqueeze(-1) + 1e-9 # (M, S, 1)
+    
+    # 1. Tính thời điểm hoàn thành dự kiến của từng task (Time to Finish)
+    cum_backlog = torch.cumsum(backlog, dim=-1)
+    time_to_finish = cum_backlog / f # (M, S, K)
+    
+    # 2. Phân loại Task
+    # Thành công trong slot: Xong trước deadline và trong tầm 0.1s
+    success_mask = (backlog > 0) & (time_to_finish <= slot_duration) & (time_to_finish <= deadline)
+    
+    # Thất bại trong slot: Deadline hết trước khi kịp xong và deadline nằm trong 0.1s hiện tại
+    violation_mask = (backlog > 0) & (deadline <= slot_duration) & (deadline < time_to_finish)
+    
+    # 3. Cập nhật khối lượng (Chỉ những task chưa Done và chưa Fail mới giữ lại backlog)
+    processed_mask = success_mask | violation_mask
+    
+    # Tính toán lượng thực sự xử lý để tính năng lượng
+    # Nếu task thành công, xử lý hết backlog. Nếu thất bại, xử lý một phần hoặc 0? 
+    # Để đơn giản: ta tính năng lượng dựa trên cpu_alloc và slot_duration ở lớp trên.
+    # Ở đây ta chỉ cập nhật backlog.
+    new_backlog = backlog.clone()
+    new_backlog[processed_mask] = 0
+    
+    # Những task chưa xong hẳn nhưng cũng chưa fail:
+    pending_mask = (backlog > 0) & (~processed_mask)
+    # Giảm bớt khối lượng cho task đang được xử lý dở dang (nếu có)
+    # Lượng CPU còn dư sau khi xử lý các task trước đó
+    before_backlog = cum_backlog - backlog
+    available_for_pending = (f * slot_duration - before_backlog).clamp(min=0)
+    actual_processed_pending = torch.min(available_for_pending, new_backlog)
+    new_backlog = new_backlog - actual_processed_pending
+    
+    actual_processed_total = (backlog - new_backlog).sum(dim=-1)
+    
+    return new_backlog, actual_processed_total, violation_mask
+
+def age_and_clean_dual_queue(backlog, deadline, q_deadline, in_slot_violation_mask, slot_duration):
+    """
+    Trừ deadline và dọn dẹp hàng đợi.
+    in_slot_violation_mask: Mask các task đã fail ngay trong bước deplete
+    """
+    # 1. Giảm deadline tuyệt đối
     deadline = deadline - slot_duration
     
-    # 2. Phát hiện vi phạm
-    violations_mask = (deadline <= 0) & (backlog > 0)
-    violation_count = violations_mask.sum().item()
+    # 2. Xác định tổng số vi phạm
+    # Vi phạm cũ (từ bước deplete) + Vi phạm mới (do vừa trừ slot_duration xong bị âm)
+    # Lưu ý: backlog > 0 đảm bảo ta không đếm lại các task đã xử lý xong
+    total_violation_mask = in_slot_violation_mask | ((deadline <= 0) & (backlog > 0))
+    violation_count = total_violation_mask.sum().item()
     
-    # 3. Xóa dữ liệu task vi phạm hoặc đã xong
-    backlog[violations_mask] = 0
-    deadline[violations_mask] = 0
+    # 3. Xóa Task vi phạm
+    backlog[total_violation_mask] = 0
     
-    # 4. CHUYÊN NGHIỆP: Dồn hàng (Compaction) về phía trước để giữ FIFO
-    # Tạo mặt nạ task còn sống (1: sống, 0: trống)
+    # 4. DỒN HÀNG (Compaction)
     mask = (backlog > 0).float()
-    
-    # Sắp xếp mặt nạ Giảm dần để đẩy các số 1 lên đầu. 
-    # Dùng stable=True để giữ nguyên thứ tự thời gian của các task sống.
     _, indices = torch.sort(mask, dim=-1, descending=True, stable=True)
     
-    # Gom hàng lại theo indices mới
     backlog = torch.gather(backlog, dim=-1, index=indices)
     deadline = torch.gather(deadline, dim=-1, index=indices)
+    q_deadline = torch.gather(q_deadline, dim=-1, index=indices)
     
-    return backlog, deadline, violation_count
+    return backlog, deadline, q_deadline, violation_count
 
 # ==========================================
 # 3. LYAPUNOV & ENERGY
@@ -85,8 +96,7 @@ def calculate_lyapunov_drift(current_backlog, arrivals, processed):
     drift = current_backlog * (arrivals - processed)
     return drift.sum()
 
-def compute_batch_energy(f_alloc, processed, epsilon_comp, newly_placed_mask, omega, epsilon_cold=10.0):
+def compute_batch_energy(f_alloc, processed, epsilon_comp, cold_delays, epsilon_cold=10.0):
     comp_energy = epsilon_comp * (f_alloc ** 2) * processed
-    cold_start_mask = newly_placed_mask & (omega.squeeze() == 0)
-    cold_energy = cold_start_mask.float() * epsilon_cold
+    cold_energy = cold_delays*epsilon_cold
     return comp_energy.sum() + cold_energy.sum()

@@ -1,13 +1,13 @@
 import torch
-import numpy as np
 import networkx as nx
 
-def init_static_matrices(topology_data, terminals, config):
+def init_static_matrices(terminals, config):
     """
     NHIỆM VỤ CỦA THÀNH PHẦN (INITIALIZER):
     1. Lọc các nút có tài nguyên tính toán (edge, network, cloud).
     2. Chuyển đổi dữ liệu topology sang các ma trận PyTorch cố định.
     """
+    topology_data= config.get("topology_data")
     nodes_data = topology_data['nodes_data']
     links_data = topology_data['links_data']
     
@@ -51,7 +51,7 @@ def init_static_matrices(topology_data, terminals, config):
                     rates.append(G[path[k]][path[k+1]]['rate'])
                 
                 avg_rate = sum(rates) / len(rates) if rates else 1e9
-                num_hosts = len(path)
+                num_hosts = max(len(path) - 1,0)
                 
                 # Công thức: số host * (1 / tốc độ trung bình)
                 delay_matrix[i, j] = num_hosts * (1.0 / avg_rate)
@@ -82,10 +82,11 @@ def init_static_matrices(topology_data, terminals, config):
         "max_queue_delay": max_queue_delay
     }
 
-def init_metadata_tensors(services_dict, config):
+def init_metadata_tensors(config):
     """
     NHIỆM VỤ: Khởi tạo các tensor chứa thuộc tính của Service và Model.
     """
+    services_dict= config.services
     service_items = sorted(services_dict.items(), key=lambda x: x[1]['id'])
     num_services = len(service_items)
     
@@ -93,7 +94,7 @@ def init_metadata_tensors(services_dict, config):
     
     model_workloads = torch.zeros((num_services, max_models))
     model_accuracies = torch.zeros((num_services, max_models))
-    service_deadlines = torch.zeros((num_services, 3)) 
+    service_deadlines = torch.zeros(num_services)
     service_omega = torch.zeros((num_services, 1))
     service_input_size = torch.zeros((num_services, 1))
     service_size = torch.zeros((num_services, 1))
@@ -109,7 +110,7 @@ def init_metadata_tensors(services_dict, config):
         service_size[i] = svc.get('size', 0.0)
         
         mean_dl = svc.get('mean_deadline', 1.0)
-        service_deadlines[i, 2] = mean_dl
+        service_deadlines[i] = mean_dl
         
         models = svc.get('models', [])
         for j, model in enumerate(models):

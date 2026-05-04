@@ -28,7 +28,7 @@ class MatrixSixGEnvironment:
         Execute the lower-level step via the physical engine.
         """
         # 1. Process Arrivals
-        node_arrival_matrix, trans_energy_total = self.engine.process_arrivals(
+        node_arrival_matrix, trans_energy_total, cold_delays = self.engine.process_arrivals(
             terminal_indices, svc_indices, node_indices, model_indices
         )
         
@@ -37,7 +37,7 @@ class MatrixSixGEnvironment:
         self.engine.optimize_allocation(node_arrival_matrix, f_min_matrix)
         
         # 3. Execution & Metrics
-        results = self.engine.execute_and_collect_metrics(node_arrival_matrix, trans_energy_total)
+        results = self.engine.execute_and_collect_metrics(node_arrival_matrix, trans_energy_total, cold_delays)
         
         # 4. Finalize Slot
         self.time_manager.tick()

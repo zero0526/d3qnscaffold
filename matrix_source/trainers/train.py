@@ -1,13 +1,12 @@
-from src.envs import SixGEnvironment, Task
-from src.agents import D3QNAgent
-from src.configs import cfg
-from src.utils import one_hot, to_binary, from_binary
-from src.visualize.aggregator import MetricsAggregator
+from matrix_source.envs.matrix_env import MatrixSixGEnvironment
+from matrix_source.agents import D3QNAgent
+from matrix_source.configs import cfg
+from matrix_source.utils import one_hot, to_binary, from_binary
+from matrix_source.visualize.aggregator import MetricsAggregator
 
 from typing import Dict, List, Tuple, Any
 from collections import defaultdict
 import numpy as np
-import math
 from tqdm import tqdm
 import sys
 
@@ -15,7 +14,7 @@ import sys
 class Trainer:
     def __init__(self):
         self.config = cfg
-        self.env = SixGEnvironment(num_terminals=cfg.hyper_neural["NUM_LOWER_AGENTS"], config=cfg)
+        self.env = MatrixSixGEnvironment(num_terminals=cfg.hyper_neural["NUM_LOWER_AGENTS"], config=cfg)
 
         self.upper_agents: Dict[str, D3QNAgent] = {}
         self.lower_agents: Dict[str, D3QNAgent] = {}
