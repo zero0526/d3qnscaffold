@@ -160,6 +160,7 @@ class MatrixPhysicalEngine:
         hdd_over = hdd_reqs > self.resource_specs[:, 2].unsqueeze(1).to(self.device)
         
         over_mask = ram_over | hdd_over
+        over_mask = over_mask.expand_as(valid_placement)
         valid_placement[over_mask] = self.placement_matrix[over_mask]
         self.placement_violations = over_mask.float().sum().item()
         
