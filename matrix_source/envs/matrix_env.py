@@ -20,20 +20,29 @@ class MatrixSixGEnvironment:
         self.engine = MatrixPhysicalEngine(config, self.static_matrices, metadata, device)
         
         # 3. Time Management
-        self.time_manager = TimeManager(slot_duration=self.engine.slot_duration)
+        self.time_manager = TimeManager(
+            slot_duration=self.engine.slot_duration,
+            timeframe_size=config.hyper_neural["TIME_SLOT_PER_TIMEFRAME"] ,
+            max_steps=config.hyper_neural["NUMOF_TF_EP"]*config.hyper_neural["TIME_SLOT_PER_TIMEFRAME"]
+        )
 
     def reset(self):
         self.time_manager.reset()
-        res_upper = self.engine.reset()
-        return res_upper
+        return self.engine.reset()
 
     def step_upper(self, placement_matrix):
         """
-        Upper-level decision: Update service placement and return timeframe summary.
+        Upper-level decision: Update service placement internally.
         """
-        summary = self.engine.update_placement(placement_matrix)
-        summary["is_done"] = self.time_manager.current_step >= self.time_manager.max_steps
-        return summary
+        self.engine.set_upper_action(placement_matrix)
+        
+    def collect_upper_metrics(self):
+        """
+        Collect results for the timeframe that just finished.
+        """
+        metrics = self.engine.collect_upper_metrics()
+        metrics["is_done"] = self.time_manager.current_step >= self.time_manager.max_steps
+        return metrics
 
     def step_lower(self, terminal_indices, svc_indices, task_batch_sizes, node_indices, model_indices):
         """
@@ -64,24 +73,3 @@ class MatrixSixGEnvironment:
             "prev_actions": results['prev_actions'],
             "new_frame": self.time_manager.is_new_frame()
         }
-
-    def get_observation(self, node_indices=None):
-        """
-        Returns condensed observations from the Engine's state.
-        Observable channels: (Backlog, CPU_Alloc, Placement, CPU_Util, RAM_Util, HDD_Util, Power_Util)
-        """
-        backlog_2d = self.engine.backlog_queue.sum(dim=-1)
-        
-        obs = torch.stack([
-            backlog_2d,
-            self.engine.cpu_alloc_matrix,
-            self.engine.placement_matrix,
-            self.engine.used_resources[:, 0].unsqueeze(1).expand(-1, self.engine.num_services),
-            self.engine.used_resources[:, 1].unsqueeze(1).expand(-1, self.engine.num_services),
-            self.engine.used_resources[:, 2].unsqueeze(1).expand(-1, self.engine.num_services),
-            self.engine.used_resources[:, 3].unsqueeze(1).expand(-1, self.engine.num_services)
-        ], dim=-1) # (M, S, 7)
-        
-        if node_indices is not None:
-            return obs[node_indices]
-        return obs

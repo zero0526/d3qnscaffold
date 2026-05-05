@@ -9,7 +9,7 @@ def init_static_matrices(config):
     2. Tự động khởi tạo Terminal và gán vào các Edge Node (Round Robin).
     3. Chuyển đổi dữ liệu topology sang các ma trận PyTorch cố định.
     """
-    topology_data= config.get("topology_data")
+    topology_data= config.topology_data
     nodes_data = topology_data['nodes_data']
     links_data = topology_data['links_data']
     
@@ -72,8 +72,8 @@ def init_static_matrices(config):
             terminal_to_comp_node_map[k, comp_node_id_to_idx[terminal.edge_id]] = 1
             
     # 6. Max Queue Delay Matrix
-    max_queue_delay = torch.zeros((num_comp_nodes, len(config.get('service_ids', [0,1,2,3,4]))))
-    delay_data = config.get('delay_config', {})
+    max_queue_delay = torch.zeros((num_comp_nodes, len(config.services)))
+    delay_data = config.delay_queue_max
     for node_id, delays in delay_data.get('nodes', {}).items():
         if node_id in comp_node_id_to_idx:
             max_queue_delay[comp_node_id_to_idx[node_id]] = torch.tensor(delays).float()
@@ -124,7 +124,7 @@ def init_metadata_tensors(config):
     service_input_size = torch.zeros((num_services, 1))
     service_size = torch.zeros((num_services, 1))
     
-    zipf_param = config.get('zipf_param', 0.8)
+    zipf_param = config.zipf_param
     ranks = torch.arange(1, num_services + 1, dtype=torch.float32)
     zipf_weights = 1.0 / torch.pow(ranks, zipf_param)
     zipf_probs = zipf_weights / zipf_weights.sum()

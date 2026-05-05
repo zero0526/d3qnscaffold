@@ -15,31 +15,32 @@ class MatrixPhysicalEngine:
         self.adj_matrix = static_matrices['adj_matrix'].to(device)
         self.terminal_adj_matrix = static_matrices['terminal_adj_matrix'].to(device)
         
-        self.service_omega = metadata['service_omega']
-        self.service_deadlines = metadata['service_deadlines']
-        self.service_input_size = metadata['service_input_size']
-        self.model_workloads = metadata['model_workloads']
-        self.model_accuracies = metadata['model_accuracies']
-        self.max_queue_delay = static_matrices['max_queue_delay'] 
-        self.service_size = metadata['service_size'] / 1024.0 # MB -> GB
+        self.service_omega = metadata['service_omega'].to(device)
+        self.service_deadlines = metadata['service_deadlines'].to(device)
+        self.service_input_size = metadata['service_input_size'].to(device)
+        self.model_workloads = metadata['model_workloads'].to(device)
+        self.model_accuracies = metadata['model_accuracies'].to(device)
+        self.max_queue_delay = static_matrices['max_queue_delay'].to(device)
+        self.service_size = (metadata['service_size'] / 1024.0).to(device) # MB -> GB
         
         # Dynamics Configuration
-        self.slot_duration = config.get('slot_duration', 0.1)
-        self.lypa_coef = config.get('lypa_coef', 10.0)
-        self.energy_coef = config.get('energy_coef', 1.0)
-        self.cold_start_delay_min = config.get('cold_start_delay_min', 0.5)
-        self.cold_start_delay_max = config.get('cold_start_delay_max', 0.85)
-        self.energy_cold_start = config.get('energy_cold_start', 10.0)
+        self.slot_duration = config.hyper_neural["SLOT_DURATION"]
+        self.lypa_coef = config.lypa_coef
+        self.energy_coef = config.energy_coef
+        self.cold_start_delay_min = config.cold_start_time.get("min")
+        self.cold_start_delay_max = config.cold_start_time.get("max")
+        self.energy_cold_start = config.cold_start_energy_coef
         
         # Reward Weights
-        self.omega_1 = config.get('omega_1', 10.0)
-        self.omega_2 = config.get('omega_2', 0.1)
+
+        self.omega_1 = config.hyper_neural["OMEGA_Q1"]
+        self.omega_2 =config.hyper_neural["OMEGA_Q2"]
         
         # State Tensors
         self.num_nodes = self.resource_specs.shape[0]
         self.num_services = self.service_omega.shape[0]
         self.num_terminals = self.terminal_to_node_map.shape[0]
-        self.max_K = config.get('max_queue_size', 100) 
+        self.max_K = config.max_queue_size
         
         self.backlog_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), device=self.device)
         self.deadline_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), device=self.device)
@@ -76,19 +77,30 @@ class MatrixPhysicalEngine:
         self.prev_node_indices.zero_()
         self.prev_model_indices.zero_()
         self.current_task_reqs.zero_()
-        return self.reset_upper()
-    
-    def reset_upper(self):
-        # Calculate Mean Fields (Average actions of nodes)
+        
+        # Initial Observations
+        phi_prob = ops.transform2prob(self.phi_accumulator)
+        obs_upper = {
+            "actions": self.placement_matrix.clone(),
+            "phi_prob": phi_prob,
+            'mean_fields': torch.zeros((self.num_nodes, self.num_services), device=self.device)
+        }
+        
+        obs_lower = self.get_lower_obs()
+        
+        return {"upper": obs_upper, "lower": obs_lower}
+
+    def collect_upper_metrics(self):
+        # Calculate Mean Fields for nodes
         neighbor_count = self.adj_matrix.sum(dim=1, keepdim=True).clamp(min=1.0)
         mean_fields = (self.adj_matrix @ self.placement_matrix) / neighbor_count
         
-        # Convert phi statistics to probability distribution
+        # Phi statistics for this timeframe
         phi_prob = ops.transform2prob(self.phi_accumulator)
         
         res = {
             "actions": self.placement_matrix.clone(),
-            "phi": phi_prob,
+            "phi_prob": phi_prob,
             "mean_fields": mean_fields,
             "reward_global": self.reward_global_accumulator
         }
@@ -96,20 +108,15 @@ class MatrixPhysicalEngine:
         # Reset accumulators for next timeframe
         self.phi_accumulator.zero_()
         self.reward_global_accumulator = 0.0
-        self.reset_lower()
         return res
 
-    def reset_lower(self):
-        # Initial lower observation format
+    def get_lower_obs(self):
         mean_field_terminals = self._calc_terminal_mean_field()
-        
         obs = {
             "task_reqs": self.current_task_reqs.clone(),
-            "backlog_prev": self.backlog_queue.sum(dim=-1).clone(),
-            "cpu_alloc_prev": self.cpu_alloc_matrix.clone()
+            "backlog": self.backlog_queue.sum(dim=-1).clone(),
+            "cpu_alloc": self.cpu_alloc_matrix.clone()
         }
-        
-        self.immediate_fails = 0
         return {
             "obs": obs,
             "mean_field": mean_field_terminals,
@@ -120,27 +127,37 @@ class MatrixPhysicalEngine:
         }
 
     def _calc_terminal_mean_field(self):
+        """
+        Tính toán Mean Field cho Terminals dựa trên hành động trước đó (One-hot encoded).
+        Trả về phân phối xác suất trung bình của láng giềng đối với Node và Model.
+        """
         # neighboring_count: (Num_Terminals, 1)
         neighbor_count = self.terminal_adj_matrix.sum(dim=1, keepdim=True).clamp(min=1.0)
         
-        # Calculate mean actions of neighbors
-        mf_node = (self.terminal_adj_matrix @ self.prev_node_indices.float().unsqueeze(1)) / neighbor_count
-        mf_model = (self.terminal_adj_matrix @ self.prev_model_indices.float().unsqueeze(1)) / neighbor_count
+        # 1. Mã hóa One-hot cho Nodes (Num_Terminals, Num_Nodes)
+        node_one_hot = torch.nn.functional.one_hot(self.prev_node_indices, num_classes=self.num_nodes).float()
+        
+        # 2. Mã hóa One-hot cho Models (Num_Terminals, Max_Models)
+        num_models = self.model_workloads.shape[1]
+        model_one_hot = torch.nn.functional.one_hot(self.prev_model_indices, num_classes=num_models).float()
+        
+        # 3. Tính toán phân phối trung bình của láng giềng
+        mf_node = (self.terminal_adj_matrix @ node_one_hot) / neighbor_count
+        mf_model = (self.terminal_adj_matrix @ model_one_hot) / neighbor_count
+        
+        # Kết quả: (Num_Terminals, Num_Nodes + Max_Models)
         return torch.cat([mf_node, mf_model], dim=-1)
 
-    def update_placement(self, new_placement):
-        # Before updating, get current summary (Step Upper logic)
-        res = self.reset_upper()
-        
+    def set_upper_action(self, new_placement):
         self.prev_placement_matrix = self.placement_matrix.clone()
         valid_placement = new_placement.clone()
         omega_1_mask = (self.service_omega.squeeze() == 1)
         omega_0_mask = (self.service_omega.squeeze() == 0)
         
         ram_reqs = (valid_placement * omega_1_mask) @ self.service_size
-        ram_over = ram_reqs > self.resource_specs[:, 1].to(self.device)
+        ram_over = ram_reqs > self.resource_specs[:, 1].unsqueeze(1).to(self.device)
         hdd_reqs = (valid_placement * omega_0_mask) @ self.service_size
-        hdd_over = hdd_reqs > self.resource_specs[:, 2].to(self.device)
+        hdd_over = hdd_reqs > self.resource_specs[:, 2].unsqueeze(1).to(self.device)
         
         over_mask = ram_over | hdd_over
         valid_placement[over_mask] = self.placement_matrix[over_mask]
@@ -149,8 +166,6 @@ class MatrixPhysicalEngine:
         self.placement_matrix = valid_placement
         self.newly_placed_mask = (self.placement_matrix > 0) & (self.prev_placement_matrix == 0)
         self.cpu_alloc_matrix *= self.placement_matrix
-        
-        return res
 
     def process_arrivals(self, terminal_indices, svc_indices, node_indices, model_indices, task_batch_sizes):
         # Store current actions for next slot's prev_actions
@@ -175,7 +190,7 @@ class MatrixPhysicalEngine:
         
         trans_delays, trans_energy_tasks = ops.compute_transmission_metrics(
             src_node_indices, node_indices, self.delay_matrix, task_data_sizes, 
-            beta=self.config.get('trans_energy_beta', 1e-6)
+            beta=self.config.trans_energy_beta
         )
         trans_energy_total = trans_energy_tasks.sum()
 
@@ -268,26 +283,20 @@ class MatrixPhysicalEngine:
         self.reward_global_accumulator += f1.item()
         
         qos_penalty = self.omega_1 * torch.exp(torch.tensor(self.omega_2 * num_violations, device=self.device))
-        reward = -(f1 + qos_penalty + self.placement_violations * 50.0)
+        reward = -(f1 + qos_penalty )
         
         # MARL observations
         mean_field_terminals = self._calc_terminal_mean_field()
         obs = {
             "task_reqs": self.current_task_reqs.clone(),
-            "backlog_prev": self.backlog_queue.sum(dim=-1).clone(),
-            "cpu_alloc_prev": prev_cpu_alloc
+            "backlog": self.backlog_queue.sum(dim=-1).clone(),
+            "cpu_alloc": self.cpu_alloc_matrix.clone() # Fixed: Clone to avoid data corruption in replay buffer
         }
-        
-        self.used_resources[:, 0] = self.cpu_alloc_matrix.sum(dim=1) 
-        self.used_resources[:, 1] = (self.placement_matrix * (self.service_omega.T.to(self.device) == 1)) @ self.service_size.to(self.device)
-        self.used_resources[:, 2] = (self.placement_matrix * (self.service_omega.T.to(self.device) == 0)) @ self.service_size.to(self.device)
-        self.used_resources[:, 3] = comp_energy / (self.resource_specs[:, 0].to(self.device).sum() + 1e-9)
         
         self.placement_violations = 0
         
         return {
             "reward": reward,
-            "backlog": current_backlog_total,
             "energy": total_energy,
             "violations": num_violations,
             "obs": obs,

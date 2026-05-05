@@ -64,6 +64,8 @@ class BaseConfig(BaseSettings):
     task_arrival_rate: float= Field(default=1)
     zipf_param: float= Field(default=0.8)
     default_batch_size: int= Field(default=20)
+    task_max_batch: int= Field(default=20)
+    task_min_batch: int= Field(default=20)
     hyper_neural: Dict[str, Any]= Field(default={})
     services: Dict[str,Dict[str, Any]]= Field(default={})
     delay_coef:float= Field(default=0.9)

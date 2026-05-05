@@ -10,7 +10,7 @@ class MatrixWorkloadGenerator:
         self.num_terminals = config.hyper_neural.get("NUM_LOWER_AGENTS", 1)
         self.num_services = len(metadata['service_ids']) if 'service_ids' in metadata else 0
         self.zipf_probs = metadata['zipf_probs']
-        self.device = config.get('device', 'cpu')
+        self.device = config.device
 
     def generate_step(self):
         """
@@ -24,8 +24,8 @@ class MatrixWorkloadGenerator:
         svc_indices = torch.multinomial(self.zipf_probs.to(self.device), self.num_terminals, replacement=True)
         
         # 3. Sample batch size cho từng task (Số lượng item trong task)
-        min_b = self.config.get('task_min_batch', 1)
-        max_b = self.config.get('task_max_batch', 20)
+        min_b = self.config.task_min_batch
+        max_b = self.config.task_max_batch
         task_batch_sizes = torch.randint(min_b, max_b + 1, (self.num_terminals,), device=self.device).float()
         
         return terminal_indices, svc_indices, task_batch_sizes
