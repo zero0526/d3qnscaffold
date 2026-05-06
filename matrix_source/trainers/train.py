@@ -24,10 +24,8 @@ class Trainer:
         self.num_terminals = self.workload_gen.num_terminals
         self.max_models = self.env.metadata.get("max_models", 5)
 
-        # Upper State Dim: (Previous Actions + Phi Probability) -> S*2
+        # State Dims
         self.upper_state_dim = self.num_services * 2
-        
-        # Lower State Dim: task_req(4) + backlog(N) + alloc(N)
         self.lower_state_dim = 4 + (self.num_nodes * 2)
 
         self.upper_action_dim = self.num_services
@@ -35,7 +33,7 @@ class Trainer:
         self.lower_action_dim = self.num_nodes + self.max_models
         self.lower_u_action_dim = self.num_nodes * self.max_models
 
-        # --- Training Hyperparams ---
+        # --- Hyperparams ---
         self.min_epsilon = cfg.hyper_neural.get("EPSILON", 0.05)
         self.epsilon_decay = cfg.hyper_neural.get("EPSILON_DECAY", 0.9985)
         self.epsilons = {nid: 1.0 for nid in range(self.num_nodes)}
@@ -91,7 +89,6 @@ class Trainer:
             obs_upper = obs['upper']
             prev_lower_res = obs['lower']
             
-            # Initial state for Upper Level (Tensor)
             current_upper_state = self.get_upper_state(obs_upper) 
             
             for slot in range(max_slots):
@@ -156,18 +153,13 @@ class Trainer:
             tid = int(tid_val)
             sid = int(s_idx[i])
             
-            # Construct s_task: [data_size, acc, dl, type]
             data_size = (batch_sizes[i] * unit_sizes[sid]).item()
             s_task = torch.tensor([
-                data_size, 
-                tasks_min_accuracy[i], 
-                task_deadlines[i], 
-                service_omega[sid]
+                data_size, tasks_min_accuracy[i], task_deadlines[i], service_omega[sid]
             ], device=self.device)
             
             s = torch.cat([s_task, obs_dict['backlog'][:, sid], obs_dict['cpu_alloc'][:, sid]])
             
-            # Action Masking
             p_mask = placement_matrix[:, sid] > 0
             a_mask = model_accs[sid, :] >= tasks_min_accuracy[i]
             mask = torch.outer(p_mask.float(), a_mask.float()).flatten()

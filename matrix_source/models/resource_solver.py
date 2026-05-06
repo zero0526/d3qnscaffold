@@ -60,20 +60,20 @@ class KKTSolverADMM:
         # Adaptive rho initialization
         rho = 2 * Z.mean(dim=1, keepdim=True).clamp(min=1e-4) # (M, 1)
         
+        # Pre-calculate budgets (Constant within solve call)
+        budgets = (self.f_max_node - f_min.sum(dim=1, keepdim=True)).clamp(min=0.0)
+        
+        # Pre-calculate denominator for f-update
+        denom = rho + 2 * Z
+        
         for _ in range(self.max_iter):
             z_prev = z.clone()
             
-            # 1. f-update: Analytical solution to (G*f - Z*f^2) + rho/2 * ||f - z + u||^2
-            # Derivative w.r.t f: G - 2*Z*f + rho*(f - z + u) = 0
-            # f * (rho + 2*Z) = G + rho*(z - u)
-            f = (G + rho * (z - u)) / (rho + 2 * Z)
+            # 1. f-update
+            f = (G + rho * (z - u)) / denom
             
             # 2. z-update: Simplex projection
-            z_tilde = f + u
-            z_shift = z_tilde - f_min
-            budgets = (self.f_max_node - f_min.sum(dim=1, keepdim=True)).clamp(min=0.0)
-            
-            z_proj = self.project_simplex(z_shift, budgets)
+            z_proj = self.project_simplex(f + u - f_min, budgets)
             z = torch.clamp(z_proj + f_min, max=f_max)
             
             # 3. u-update: Dual update

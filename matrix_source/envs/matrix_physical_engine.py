@@ -42,6 +42,7 @@ class MatrixPhysicalEngine:
         self.max_K = config.max_queue_size
         
         self.backlog_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), device=self.device)
+        self.backlog_counts = torch.zeros((self.num_nodes, self.num_services), dtype=torch.long, device=self.device)
         self.deadline_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), device=self.device)
         self.q_deadline_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), device=self.device)
         
@@ -233,12 +234,12 @@ class MatrixPhysicalEngine:
             self.phi_accumulator.index_put_((vn, vs), vb, accumulate=True)
             
             for n, s, w, t, q in zip(vn, vs, vw, vt, vq):
-                num_active = (self.backlog_queue[n, s, :] > 0).sum().item()
-                if num_active < self.max_K:
-                    idx = int(num_active)
+                idx = self.backlog_counts[n, s].item()
+                if idx < self.max_K:
                     self.backlog_queue[n, s, idx] = w
                     self.deadline_queue[n, s, idx] = t
                     self.q_deadline_queue[n, s, idx] = q
+                    self.backlog_counts[n, s] += 1
                 else:
                     self.immediate_fails += 1
             
@@ -278,6 +279,9 @@ class MatrixPhysicalEngine:
         self.backlog_queue, self.deadline_queue, self.q_deadline_queue, expired_count = ops.age_and_clean_dual_queue(
             self.backlog_queue, self.deadline_queue, self.q_deadline_queue, in_slot_violation_mask, self.slot_duration
         )
+        
+        # Recalculate counts after queue shifts (Vectorized)
+        self.backlog_counts = (self.backlog_queue > 1e-6).sum(dim=-1)
         
         num_violations = expired_count + self.immediate_fails
         total_drift = ops.calculate_lyapunov_drift(current_backlog_total, node_arrival_matrix, self.cpu_alloc_matrix*self.slot_duration)
