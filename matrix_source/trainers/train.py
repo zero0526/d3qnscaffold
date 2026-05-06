@@ -50,6 +50,8 @@ class Trainer:
 
     def __init_agents(self):
         for nid in range(self.num_nodes):
+            if nid in self.env.static_matrices["cloud_ids"]:
+                continue
             self.upper_agents[nid] = D3QNAgent(
                 node_id=nid, node_type="edge",
                 state_dim=self.upper_state_dim,
@@ -157,6 +159,9 @@ class Trainer:
             mf = mf_global[nid]
             a_id = agent.choose_action(s, mf, self.epsilons[nid], self.zeta)
             act_matrix[nid] = torch.tensor(to_binary(a_id, self.num_services), device=self.device)
+        # cloud always run all services
+        for nid in self.env.static_matrices["cloud_ids"]:
+            act_matrix[nid] = torch.ones(self.num_services, device=self.device)
         return act_matrix
 
     def get_lower_actions(self, res_lower, t_idx, s_idx, tasks_min_accuracy, task_deadlines, batch_sizes):
@@ -250,16 +255,17 @@ class Trainer:
         if isinstance(n_mf, torch.Tensor): n_mf = n_mf.cpu().numpy()
 
         for nid in range(self.num_nodes):
-            s = s_all[nid].cpu().numpy()
-            ns = ns_all[nid].cpu().numpy()
-            
-            # Action decoding
-            a_binary = acts_matrix[nid].cpu().numpy().astype(int)
-            a_id = 0
-            for bit in a_binary:
-                a_id = (a_id << 1) | bit
-                
-            self.upper_agents[nid].store_transition(s, c_mf[nid], n_mf[nid], a_id, reward, ns, done)
+            if nid not in self.env.static_matrices["cloud_ids"]:
+                s = s_all[nid].cpu().numpy()
+                ns = ns_all[nid].cpu().numpy()
+
+                # Action decoding
+                a_binary = acts_matrix[nid].cpu().numpy().astype(int)
+                a_id = 0
+                for bit in a_binary:
+                    a_id = (a_id << 1) | bit
+
+                self.upper_agents[nid].store_transition(s, c_mf[nid], n_mf[nid], a_id, reward, ns, done)
 
     def update_rates(self, ep):
         for nid in self.epsilons:

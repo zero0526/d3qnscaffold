@@ -17,13 +17,14 @@ def init_static_matrices(config):
     computing_node_types = ["edge", "network", "cloud"]
     computing_nodes = [node for node in nodes_data if node.get('type') in computing_node_types]
     edge_nodes = [node for node in nodes_data if node.get('type') == 'edge']
-    
+    cloud_nodes = [node for node in nodes_data if node.get('type') == 'cloud']
     if not edge_nodes:
         # Fallback if no edge nodes found, use all computing nodes
         edge_nodes = computing_nodes
         
     comp_node_id_to_idx = {node['id']: i for i, node in enumerate(computing_nodes)}
     edge_ids= [comp_node_id_to_idx[node.get("id")] for node in edge_nodes]
+    cloud_ids = [comp_node_id_to_idx[node.get("id")] for node in cloud_nodes]
     num_comp_nodes = len(computing_nodes)
     
     # 2. Khởi tạo Terminals (Round Robin assignment to Edge Nodes)
@@ -104,7 +105,8 @@ def init_static_matrices(config):
         "adj_matrix": adj_matrix,
         "terminal_adj_matrix": terminal_adj_matrix,
         "terminals": terminals,
-        "edge_ids": edge_ids
+        "edge_ids": edge_ids,
+        "cloud_ids": cloud_ids
     }
 
 def init_metadata_tensors(config):
