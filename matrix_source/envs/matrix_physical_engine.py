@@ -233,14 +233,28 @@ class MatrixPhysicalEngine:
             )
             self.phi_accumulator.index_put_((vn, vs), vb, accumulate=True)
             
+            # Get current baseline f_min per node
+            f_min_existing = self.get_f_min_matrix().sum(dim=1)
+            node_max_f = self.resource_specs[:, 0]
+            
             for n, s, w, t, q in zip(vn, vs, vw, vt, vq):
-                idx = self.backlog_counts[n, s].item()
-                if idx < self.max_K:
-                    self.backlog_queue[n, s, idx] = w
-                    self.deadline_queue[n, s, idx] = t
-                    self.q_deadline_queue[n, s, idx] = q
-                    self.backlog_counts[n, s] += 1
+                # Calculate f_min required by this new task
+                f_min_task = w / (t + 1e-9)
+                
+                # Check if admitting this task would exceed node physical capacity
+                if f_min_existing[n] + f_min_task <= node_max_f[n]:
+                    idx = self.backlog_counts[n, s].item()
+                    if idx < self.max_K:
+                        self.backlog_queue[n, s, idx] = w
+                        self.deadline_queue[n, s, idx] = t
+                        self.q_deadline_queue[n, s, idx] = q
+                        self.backlog_counts[n, s] += 1
+                        # Update running f_min for subsequent tasks in same slot
+                        f_min_existing[n] += f_min_task
+                    else:
+                        self.immediate_fails += 1
                 else:
+                    # Physically impossible to meet deadline at this node
                     self.immediate_fails += 1
             
             node_arrival_matrix.index_put_((vn, vs), vw, accumulate=True)

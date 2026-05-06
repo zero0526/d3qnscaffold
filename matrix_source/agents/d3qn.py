@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
 from typing import Tuple
 from matrix_source.agents.ffn import FFN
 from matrix_source.agents.ReplayBuffer import ReplayBuffer
@@ -159,15 +158,40 @@ class D3QNAgent:
         return int(action)
 
     def learn_mf(self, state, prev_mf, ground_truth_mf):
-        # We now train MF network via Minibatch in learn() to avoid noisy Batch=1 updates
-        pass
+        # Convert to tensors
+        if not torch.is_tensor(state):
+            s = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        else:
+            s = state.detach().unsqueeze(0).to(self.device)
+            
+        if not torch.is_tensor(prev_mf):
+            pmf = torch.FloatTensor(prev_mf).unsqueeze(0).to(self.device)
+        else:
+            pmf = prev_mf.detach().unsqueeze(0).to(self.device)
+            
+        if not torch.is_tensor(ground_truth_mf):
+            gt_mf = torch.FloatTensor(ground_truth_mf).unsqueeze(0).to(self.device)
+        else:
+            gt_mf = ground_truth_mf.detach().unsqueeze(0).to(self.device)
+            
+        # Prediction
+        mf_input = torch.cat([s, pmf], dim=-1)
+        pred_mf = self.mf_net(mf_input)
+        
+        # Optimization
+        loss = self.loss_fn(pred_mf, gt_mf)
+        self.mf_optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.mf_net.parameters(), max_norm=1.0)
+        self.mf_optimizer.step()
 
-    def store_transition(self, state, prev_mf, curr_mf, action, reward, next_state, done):
+    def store_transition_train_mf(self, state, prev_mf, curr_mf, action, reward, next_state, done):
+        self.learn_mf(state, prev_mf, curr_mf)
         self.memory.add(state, prev_mf, curr_mf, action, reward, next_state, done)
 
     def learn(self):
         if len(self.memory) < self.min_batch_size:
-            return None  # dont enough data
+            return None  # don't enough data
 
         # Sample data
         states, prev_mfs, curr_mfs, actions, rewards, next_states, dones = self.memory.sample(self.batch_size)
@@ -175,12 +199,6 @@ class D3QNAgent:
         # ---------------- TRAIN MF NETWORK ----------------
         mf_input = torch.cat([states, prev_mfs], dim=-1)
         pred_curr_mfs = self.mf_net(mf_input)
-        mf_loss = self.loss_fn(pred_curr_mfs, curr_mfs)
-        
-        self.mf_optimizer.zero_grad()
-        mf_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.mf_net.parameters(), max_norm=1.0)
-        self.mf_optimizer.step()
 
         # ---------------- DOUBLE DQN LOGIC ----------------
         pred_mfs_detached = pred_curr_mfs.detach()

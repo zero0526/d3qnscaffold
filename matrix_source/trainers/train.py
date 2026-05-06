@@ -188,7 +188,7 @@ class Trainer:
             ns = torch.cat([n_obs['task_reqs'][tid], n_obs['backlog'][:, sid], n_obs['cpu_alloc'][:, sid]])
             
             a_id = int(n_idx[i] * self.max_models + m_idx[i])
-            self.lower_agents[tid].store_transition(s, c_mf[tid], n_mf[tid], a_id, reward, ns, done)
+            self.lower_agents[tid].store_transition_train_mf(s, c_mf[tid], n_mf[tid], a_id, reward, ns, done)
 
     def store_upper_transitions(self, s_all, ns_all, current_res, next_res, acts_matrix, done):
         reward = next_res['reward_global']
@@ -201,7 +201,7 @@ class Trainer:
             a_id = 0
             for bit in a_binary: a_id = (a_id << 1) | bit
 
-            self.upper_agents[nid].store_transition(s, c_mf[nid], n_mf[nid], a_id, reward, ns, done)
+            self.upper_agents[nid].store_transition_train_mf(s, c_mf[nid], n_mf[nid], a_id, reward, ns, done)
 
     def update_rates(self, ep):
         for nid in self.epsilons: self.epsilons[nid] = max(self.min_epsilon, self.epsilons[nid] * self.epsilon_decay)
