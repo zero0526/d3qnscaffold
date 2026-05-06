@@ -62,7 +62,13 @@ class MatrixPhysicalEngine:
         self.reward_global_accumulator = 0.0
         
         # Solver
-        self.solver = KKTSolverADMM(config, self.resource_specs, self.service_omega)
+        f_max_all = self.resource_specs[:, 0].to(self.device).unsqueeze(1)
+        self.solver = KKTSolverADMM(
+            f_max_node=f_max_all,
+            rho=config.admm_rho,
+            max_iter=config.admm_max_iter,
+            tol=config.admm_tol
+        )
         self.immediate_fails = 0
         self.placement_violations = 0
 
@@ -168,7 +174,7 @@ class MatrixPhysicalEngine:
         self.newly_placed_mask = (self.placement_matrix > 0) & (self.prev_placement_matrix == 0)
         self.cpu_alloc_matrix *= self.placement_matrix
 
-    def process_arrivals(self, terminal_indices, svc_indices, node_indices, model_indices, task_batch_sizes):
+    def process_arrivals(self, terminal_indices, svc_indices, node_indices, model_indices, task_batch_sizes, task_deadlines, task_accuracies):
         # Store current actions for next slot's prev_actions
         self.prev_node_indices.index_copy_(0, terminal_indices, node_indices)
         self.prev_model_indices.index_copy_(0, terminal_indices, model_indices)
@@ -191,16 +197,16 @@ class MatrixPhysicalEngine:
         
         trans_delays, trans_energy_tasks = ops.compute_transmission_metrics(
             src_node_indices, node_indices, self.delay_matrix, task_data_sizes, 
-            beta=self.config.trans_energy_beta
+            beta=self.config.transmission_coef
         )
         trans_energy_total = trans_energy_tasks.sum()
 
         base_workloads = self.model_workloads[svc_indices, model_indices]
         task_workloads = base_workloads * task_batch_sizes
         
-        task_mean_deadlines = self.service_deadlines[svc_indices]
+        task_mean_deadlines = task_deadlines
+        task_accuracies = task_accuracies
         task_max_queue = self.max_queue_delay[node_indices, svc_indices]
-        task_accuracies = self.model_accuracies[svc_indices, model_indices]
         task_types = self.service_omega[svc_indices].squeeze()
         
         # Populate current_task_reqs: [data_size, dl, acc, type]

@@ -71,7 +71,9 @@ class BaseConfig(BaseSettings):
     delay_coef:float= Field(default=0.9)
     delay_queue_max: Dict[str, np.ndarray]= Field(default={})
     max_queue_size: int = Field(default=100)
-
+    admm_rho: float= Field(default=1.0)
+    admm_max_iter:int = Field(default=200)
+    admm_tol:float = Field(default=1e-4)
     class Config:
         env_file = get_env_file()
         env_file_encoding = "utf-8"

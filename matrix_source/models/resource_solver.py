@@ -34,9 +34,8 @@ class KKTSolverADMM:
         valid = mu > theta
         
         # Get the largest index i that satisfies the condition
-        # We can use mask and gather or argmax on cumulative validity
-        # rho_idx shape: (Batch,)
-        rho_idx = torch.sum(valid.float(), dim=1).long() - 1
+        # Clamp to 0 to avoid index -1 when budgets are 0 or precision causes no matches
+        rho_idx = (torch.sum(valid.float(), dim=1).long() - 1).clamp(min=0)
         
         # Selected thresholds
         chosen_theta = torch.gather(theta, 1, rho_idx.unsqueeze(1))

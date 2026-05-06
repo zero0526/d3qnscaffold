@@ -119,7 +119,7 @@ def init_metadata_tensors(config):
     
     model_workloads = torch.zeros((num_services, max_models))
     model_accuracies = torch.zeros((num_services, max_models))
-    service_deadlines = torch.zeros(num_services)
+    service_deadlines = torch.zeros(num_services, 3)
     service_omega = torch.zeros((num_services, 1))
     service_input_size = torch.zeros((num_services, 1))
     service_size = torch.zeros((num_services, 1))
@@ -134,8 +134,10 @@ def init_metadata_tensors(config):
         service_input_size[i] = svc.get('input_data_size', 0.0)
         service_size[i] = svc.get('size', 0.0)
         
-        mean_dl = svc.get('mean_deadline', 1.0)
-        service_deadlines[i] = mean_dl
+        min_dl = svc.get('mean_deadline', 1.0)
+        max_dl = min_dl + svc.get('std_deadline', 1.0)
+        
+        service_deadlines[i] = torch.linspace(min_dl, max_dl, 3)
         
         models = svc.get('models', [])
         for j, model in enumerate(models):

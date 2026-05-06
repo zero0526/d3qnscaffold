@@ -8,24 +8,59 @@ class MatrixWorkloadGenerator:
     """
     def __init__(self, config, metadata):
         self.num_terminals = config.hyper_neural.get("NUM_LOWER_AGENTS", 1)
-        self.num_services = len(metadata['service_ids']) if 'service_ids' in metadata else 0
+        self.num_services = metadata['service_size'].shape[0]
         self.zipf_probs = metadata['zipf_probs']
+        self.accuracies = metadata['model_accuracies']
+        self.deadlines = metadata['service_deadlines']
         self.device = config.device
+        self.min_batch_size = config.task_min_batch
+        self.max_batch_size = config.task_max_batch
 
     def generate_step(self):
         """
         Mỗi terminal sinh đúng 1 task tại mỗi step.
-        Trả về (terminal_indices, svc_indices, task_batch_sizes) của các task mới.
         """
-        # 1. Toàn bộ terminals đều có task (chỉ số 0 đến num_terminals - 1)
-        terminal_indices = torch.arange(self.num_terminals, device=self.device)
-        
-        # 2. Sample service cho từng terminal theo xác suất Zipf
-        svc_indices = torch.multinomial(self.zipf_probs.to(self.device), self.num_terminals, replacement=True)
-        
-        # 3. Sample batch size cho từng task (Số lượng item trong task)
-        min_b = self.config.task_min_batch
-        max_b = self.config.task_max_batch
-        task_batch_sizes = torch.randint(min_b, max_b + 1, (self.num_terminals,), device=self.device).float()
-        
-        return terminal_indices, svc_indices, task_batch_sizes
+        device = self.device
+        N = self.num_terminals
+
+        # 1. Terminal indices
+        terminal_indices = torch.arange(N, device=device)
+
+        # 2. Sample service (Zipf)
+        svc_indices = torch.multinomial(self.zipf_probs, N, replacement=True)
+
+        # 3. Batch size
+        task_batch_sizes = torch.randint(
+            self.min_batch_size,
+            self.max_batch_size + 1,
+            (N,),
+            device=device,
+            dtype=torch.float32
+        )
+
+        # 4. Accuracy sampling (dùng gather nhanh hơn)
+        acc_pool = self.accuracies[svc_indices]   # (N, num_models)
+        rand_acc_cols = torch.randint(
+            0, acc_pool.shape[1], (N,), device=device
+        )
+        tasks_min_accuracy = acc_pool.gather(1, rand_acc_cols.unsqueeze(1)).squeeze(1)
+
+        # 5. Deadline sampling (mask + multinomial an toàn)
+        dl_pool = self.deadlines[svc_indices]     # (N, num_deadlines)
+
+        valid_mask = (dl_pool > 0).float()
+
+        zero_rows = valid_mask.sum(dim=1) == 0
+        if zero_rows.any():
+            valid_mask[zero_rows] = 1.0
+
+        rand_dl_cols = torch.multinomial(valid_mask, 1).squeeze(1)
+        task_deadlines = dl_pool.gather(1, rand_dl_cols.unsqueeze(1)).squeeze(1) - 1e1
+
+        return (
+            terminal_indices,
+            svc_indices,
+            task_batch_sizes,
+            tasks_min_accuracy,
+            task_deadlines
+        )

@@ -44,13 +44,13 @@ class MatrixSixGEnvironment:
         metrics["is_done"] = self.time_manager.current_step >= self.time_manager.max_steps
         return metrics
 
-    def step_lower(self, terminal_indices, svc_indices, task_batch_sizes, node_indices, model_indices):
+    def step_lower(self, terminal_indices, svc_indices, task_batch_sizes, node_indices, model_indices, task_deadlines, tasks_min_accuracy):
         """
         Execute the lower-level step via the physical engine.
         """
         # 1. Process Arrivals
         node_arrival_matrix, trans_energy_total, cold_delays = self.engine.process_arrivals(
-            terminal_indices, svc_indices, node_indices, model_indices, task_batch_sizes
+            terminal_indices, svc_indices, node_indices, model_indices, task_batch_sizes, task_deadlines, tasks_min_accuracy
         )
         
         # 2. Solver Optimization
@@ -65,7 +65,6 @@ class MatrixSixGEnvironment:
         
         return {
             "reward": results['reward'].item(),
-            "backlog": results['backlog'].clone(),
             "energy": results['energy'].item(),
             "violations": results['violations'],
             "obs": results['obs'],
