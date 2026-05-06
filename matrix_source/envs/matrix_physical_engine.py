@@ -1,4 +1,3 @@
-import random
 import torch
 import matrix_source.utils.tensor_ops as ops
 from matrix_source.models.resource_solver import KKTSolverADMM
@@ -216,7 +215,9 @@ class MatrixPhysicalEngine:
         self.current_task_reqs.index_copy_(0, terminal_indices, req_features)
 
         task_cold_start = self.newly_placed_mask[node_indices, svc_indices] & (task_types == 0)
-        cold_delays = task_cold_start.float() * random.uniform(self.cold_start_delay_min, self.cold_start_delay_max)
+        # Vectorized on-device random sampling
+        rand_vals = torch.rand(task_cold_start.shape, device=self.device)
+        cold_delays = task_cold_start.float() * (rand_vals * (self.cold_start_delay_max - self.cold_start_delay_min) + self.cold_start_delay_min)
         
         t_rem_raw = task_mean_deadlines - trans_delays - cold_delays
         t_q_rem = t_rem_raw - task_max_queue

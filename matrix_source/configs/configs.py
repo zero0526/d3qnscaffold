@@ -1,6 +1,7 @@
-from src.utils.CreateSpec import SNDLibLoad
+from matrix_source.utils.CreateSpec import SNDLibLoad
 import numpy as np
 from pydantic_settings import BaseSettings
+import torch
 from pydantic import Field
 from typing import Dict, Any
 import os
@@ -41,7 +42,7 @@ def default_topology_config(topology: str, config: Any) -> Dict[str, Any]:
 
 class BaseConfig(BaseSettings):
     topology: str= Field(default="atlanta_smaller")
-    device: str= Field(default="cpu")
+    device: str= Field(default= "cuda" if torch.cuda.is_available() else "cpu")
     logs: str= Field(default=str(PROJECT_ROOT / "data" / "logs"))
     checkpoints: str= Field(default=str(PROJECT_ROOT / "data" / "checkpoints"))
     results: str= Field(default=str(PROJECT_ROOT / "data" / "results"))

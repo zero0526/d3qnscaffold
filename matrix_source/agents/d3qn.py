@@ -116,9 +116,17 @@ class D3QNAgent:
             g.zero_()
         self.steps_in_round = 0
 
-    def choose_action(self, state, prev_mf, epsilon, zeta, mask:np.ndarray= None, assigned_node_id=None):
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-        mf_tensor = torch.FloatTensor(prev_mf).unsqueeze(0).to(self.device)
+    def choose_action(self, state, prev_mf, epsilon, zeta, mask=None, assigned_node_id=None):
+        # Convert inputs to tensors if they aren't already
+        if not torch.is_tensor(state):
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        else:
+            state_tensor = state.detach().unsqueeze(0).to(self.device)
+
+        if not torch.is_tensor(prev_mf):
+            mf_tensor = torch.FloatTensor(prev_mf).unsqueeze(0).to(self.device)
+        else:
+            mf_tensor = prev_mf.detach().unsqueeze(0).to(self.device)
 
         with torch.no_grad():
             mf_input = torch.cat([state_tensor, mf_tensor], dim=-1)
@@ -127,23 +135,26 @@ class D3QNAgent:
             # Predict Q-values
             q_values = self.eval_net(state_tensor, pred_mf)
 
-            # Apply masking mechanism
-            if mask is not None and np.any(mask):
-                mask_tensor = torch.FloatTensor(mask).to(self.device).unsqueeze(0)
-                # Apply large penalty to masked actions (-1e18 for numerical stability in softmax)
-                q_values = q_values + (mask_tensor - 1.0) * 1e18
+            # Apply masking mechanism (Tensor-based)
+            if mask is not None:
+                if not torch.is_tensor(mask):
+                    mask_tensor = torch.tensor(mask, device=self.device).float().unsqueeze(0)
+                else:
+                    mask_tensor = mask.detach().to(self.device).float().unsqueeze(0)
+                
+                # Apply large penalty to masked actions (-1e10 for numerical stability with exp)
+                q_values = q_values + (mask_tensor - 1.0) * 1e10
             
             if self.exclude_zero and self.u_action_dim > 1:
-                q_values[:, 0] -= 1e18
+                q_values[:, 0] -= 1e10
             
             # Boltzmann Selection (Softmax with temperature parameter zeta)
-            # P(a) = exp(zeta * Q_a) / sum(exp(zeta * Q_i))
-            # We use torch.softmax on (zeta * Q) for numerical stability.
+            # Use pure torch for sampling (multinomial) to stay on device
             scaled_q = q_values * zeta
-            probs = torch.softmax(scaled_q, dim=1).cpu().numpy().squeeze()
+            probs = torch.softmax(scaled_q, dim=1)
             
-            # Weighted random selection based on Boltzmann probabilities
-            action = np.random.choice(len(probs), p=probs)
+            # Sample action index
+            action = torch.multinomial(probs, 1).item()
             
         return int(action)
 

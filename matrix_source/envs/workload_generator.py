@@ -6,13 +6,13 @@ class MatrixWorkloadGenerator:
     1. Sinh ra các Task mới dưới dạng Ma Trận (Arrival Matrix).
        - Kích thước: (Num_Terminals x Num_Services).
     """
-    def __init__(self, config, metadata):
+    def __init__(self, config, metadata, device="cpu"):
         self.num_terminals = config.hyper_neural.get("NUM_LOWER_AGENTS", 1)
         self.num_services = metadata['service_size'].shape[0]
         self.zipf_probs = metadata['zipf_probs']
         self.accuracies = metadata['model_accuracies']
         self.deadlines = metadata['service_deadlines']
-        self.device = config.device
+        self.device = device
         self.min_batch_size = config.task_min_batch
         self.max_batch_size = config.task_max_batch
 

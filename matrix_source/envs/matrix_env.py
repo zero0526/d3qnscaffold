@@ -9,11 +9,11 @@ class MatrixSixGEnvironment:
         self.device = device
         
         # 1. Initialize Matrices and Metadata (Automated)
-        init_data = init_static_matrices(config)
+        init_data = init_static_matrices(config, device=device)
         self.static_matrices = init_data
         self.terminals = init_data['terminals']
         
-        metadata = init_metadata_tensors(config)
+        metadata = init_metadata_tensors(config, device=device)
         self.metadata = metadata
         
         # 2. Initialize Engine

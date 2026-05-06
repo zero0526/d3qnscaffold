@@ -2,7 +2,7 @@ import torch
 import networkx as nx
 from matrix_source.models.terminal import Terminal
 
-def init_static_matrices(config):
+def init_static_matrices(config, device="cpu"):
     """
     NHIỆM VỤ CỦA THÀNH PHẦN (INITIALIZER):
     1. Lọc các nút có tài nguyên tính toán (edge, network, cloud).
@@ -41,7 +41,7 @@ def init_static_matrices(config):
     for node in computing_nodes:
         specs = node.get('specs', {})
         resource_list.append([specs.get('cpu', 0), specs.get('ram', 0), specs.get('hdd', 0)])
-    resource_matrix = torch.tensor(resource_list, dtype=torch.float32)
+    resource_matrix = torch.tensor(resource_list, dtype=torch.float32, device=device)
     
     # 4. Delay Matrix (Num_Computing_Nodes x Num_Computing_Nodes)
     G = nx.Graph()
@@ -51,7 +51,7 @@ def init_static_matrices(config):
         rate = link.get('transmission_rate', 250.0) 
         G.add_edge(link['source'], link['target'], weight=1.0, rate=rate)
     
-    delay_matrix = torch.zeros((num_comp_nodes, num_comp_nodes))
+    delay_matrix = torch.zeros((num_comp_nodes, num_comp_nodes), device=device)
     for src_id, i in comp_node_id_to_idx.items():
         for dst_id, j in comp_node_id_to_idx.items():
             if src_id == dst_id:
@@ -67,20 +67,20 @@ def init_static_matrices(config):
                 delay_matrix[i, j] = float('inf')
             
     # 5. Terminal to Computing Node Mapping Matrix
-    terminal_to_comp_node_map = torch.zeros((num_terminals, num_comp_nodes))
+    terminal_to_comp_node_map = torch.zeros((num_terminals, num_comp_nodes), device=device)
     for k, terminal in enumerate(terminals):
         if terminal.edge_id in comp_node_id_to_idx:
             terminal_to_comp_node_map[k, comp_node_id_to_idx[terminal.edge_id]] = 1
             
     # 6. Max Queue Delay Matrix
-    max_queue_delay = torch.zeros((num_comp_nodes, len(config.services)))
+    max_queue_delay = torch.zeros((num_comp_nodes, len(config.services)), device=device)
     delay_data = config.delay_queue_max
     for node_id, delays in delay_data.get('nodes', {}).items():
         if node_id in comp_node_id_to_idx:
             max_queue_delay[comp_node_id_to_idx[node_id]] = torch.tensor(delays).float()
 
     # 7. Adjacency Matrix (for Mean Field) - 2 hops limit
-    adj_matrix = torch.zeros((num_comp_nodes, num_comp_nodes))
+    adj_matrix = torch.zeros((num_comp_nodes, num_comp_nodes), device=device)
     for node_id, i in comp_node_id_to_idx.items():
         # Find nodes within 2 hops
         lengths = nx.single_source_shortest_path_length(G, node_id, cutoff=2)
@@ -90,7 +90,7 @@ def init_static_matrices(config):
                 adj_matrix[i, j] = 1.0
 
     # 8. Terminal Adjacency Matrix
-    terminal_adj_matrix = torch.zeros((num_terminals, num_terminals))
+    terminal_adj_matrix = torch.zeros((num_terminals, num_terminals), device=device)
     for i in range(num_terminals):
         for j in range(num_terminals):
             if i != j and terminals[i].edge_id == terminals[j].edge_id:
@@ -109,7 +109,7 @@ def init_static_matrices(config):
         "cloud_ids": cloud_ids
     }
 
-def init_metadata_tensors(config):
+def init_metadata_tensors(config, device="cpu"):
     """
     NHIỆM VỤ: Khởi tạo các tensor chứa thuộc tính của Service và Model.
     """
@@ -119,15 +119,15 @@ def init_metadata_tensors(config):
     
     max_models = max([len(svc.get('models', [])) for k, svc in service_items])
     
-    model_workloads = torch.zeros((num_services, max_models))
-    model_accuracies = torch.zeros((num_services, max_models))
-    service_deadlines = torch.zeros(num_services, 3)
-    service_omega = torch.zeros((num_services, 1))
-    service_input_size = torch.zeros((num_services, 1))
-    service_size = torch.zeros((num_services, 1))
+    model_workloads = torch.zeros((num_services, max_models), device=device)
+    model_accuracies = torch.zeros((num_services, max_models), device=device)
+    service_deadlines = torch.zeros((num_services, 3), device=device)
+    service_omega = torch.zeros((num_services, 1), device=device)
+    service_input_size = torch.zeros((num_services, 1), device=device)
+    service_size = torch.zeros((num_services, 1), device=device)
     
     zipf_param = config.zipf_param
-    ranks = torch.arange(1, num_services + 1, dtype=torch.float32)
+    ranks = torch.arange(1, num_services + 1, dtype=torch.float32, device=device)
     zipf_weights = 1.0 / torch.pow(ranks, zipf_param)
     zipf_probs = zipf_weights / zipf_weights.sum()
     
