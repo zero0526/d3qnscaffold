@@ -40,22 +40,21 @@ class MatrixWorkloadGenerator:
 
         # 4. Accuracy sampling (dùng gather nhanh hơn)
         acc_pool = self.accuracies[svc_indices]   # (N, num_models)
-        rand_acc_cols = torch.randint(
-            0, acc_pool.shape[1], (N,), device=device
-        )
-        tasks_min_accuracy = acc_pool.gather(1, rand_acc_cols.unsqueeze(1)).squeeze(1)
 
-        # 5. Deadline sampling (mask + multinomial an toàn)
-        dl_pool = self.deadlines[svc_indices]     # (N, num_deadlines)
-
-        valid_mask = (dl_pool > 0).float()
-
+        valid_mask = (acc_pool > 0).float()
         zero_rows = valid_mask.sum(dim=1) == 0
         if zero_rows.any():
             valid_mask[zero_rows] = 1.0
+        rand_acc_cols = torch.multinomial(valid_mask, 1).squeeze(1)
+        tasks_min_accuracy = acc_pool.gather(1, rand_acc_cols.unsqueeze(1)).squeeze(1) - 1e0
 
-        rand_dl_cols = torch.multinomial(valid_mask, 1).squeeze(1)
-        task_deadlines = dl_pool.gather(1, rand_dl_cols.unsqueeze(1)).squeeze(1) - 1e1
+        # 5. Deadline sampling (mask + multinomial an toàn)
+        dl_pool = self.deadlines[svc_indices]     # (N, num_deadlines)
+        rand_dl_cols = torch.randint(
+            0, dl_pool.shape[1], (N,), device=device
+        )
+        task_deadlines = dl_pool.gather(1, rand_dl_cols.unsqueeze(1)).squeeze(1)
+
 
         return (
             terminal_indices,
