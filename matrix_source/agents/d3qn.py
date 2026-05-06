@@ -6,7 +6,7 @@ from typing import Tuple
 from matrix_source.agents.ffn import FFN
 from matrix_source.agents.ReplayBuffer import ReplayBuffer
 
-from configs.configs import cfg
+from matrix_source.configs.configs import cfg
 
 class RunningNorm:
     def __init__(self, shape):
