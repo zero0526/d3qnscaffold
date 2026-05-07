@@ -44,6 +44,7 @@ class BaseConfig(BaseSettings):
     topology: str= Field(default="atlanta_smaller")
     device: str= Field(default= "cuda" if torch.cuda.is_available() else "cpu")
     logs: str= Field(default=str(PROJECT_ROOT / "data" / "logs"))
+    plot_dir: str= Field(default=str(PROJECT_ROOT / "data" / "plots"))
     checkpoints: str= Field(default=str(PROJECT_ROOT / "data" / "checkpoints"))
     results: str= Field(default=str(PROJECT_ROOT / "data" / "results"))
     node_type_path: str= Field(default=str(PROJECT_ROOT / "data" / "distribute_node" / "nodes.yaml"))

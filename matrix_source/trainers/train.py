@@ -110,14 +110,32 @@ class Trainer:
                     next_upper_state = self.get_upper_state(res_upper)
                     
                     is_ep_done = (slot == max_slots - 1)
+                    # Pass upper metrics to aggregator
+                    # We'll pass mf_loss in store_upper_transitions
                     self.store_upper_transitions(current_upper_state, next_upper_state, obs_upper, res_upper, u_acts_matrix, is_ep_done)
                     
                     current_upper_state = next_upper_state
                     obs_upper = res_upper
 
             self.update_rates(ep)
-            for agent in list(self.upper_agents.values()) + list(self.lower_agents.values()):
-                agent.learn()
+            
+            # ---------------- LEARNING ----------------
+            upper_td_losses = []
+            lower_td_losses = []
+            
+            for agent in self.upper_agents.values():
+                loss = agent.learn()
+                if loss is not None:
+                    upper_td_losses.append(loss)
+                    
+            for agent in self.lower_agents.values():
+                loss = agent.learn()
+                if loss is not None:
+                    lower_td_losses.append(loss)
+            
+            self.aggregator.record_td_losses(upper_td_losses, lower_td_losses)
+            self.aggregator.store_history()
+            self.aggregator.report_episode(ep)
 
     def get_upper_state(self, obs_upper):
         return torch.cat([obs_upper['actions'], obs_upper['phi_prob']], dim=-1)
@@ -180,6 +198,7 @@ class Trainer:
         c_obs, n_obs = current_res['obs'], next_res['obs']
         c_mf, n_mf = current_res['mean_field'], next_res['mean_field']
 
+        mf_losses = []
         for i, tid_val in enumerate(t_idx.tolist()):
             tid = int(tid_val)
             sid = int(s_idx[i])
@@ -188,20 +207,43 @@ class Trainer:
             ns = torch.cat([n_obs['task_reqs'][tid], n_obs['backlog'][:, sid], n_obs['cpu_alloc'][:, sid]])
             
             a_id = int(n_idx[i] * self.max_models + m_idx[i])
-            self.lower_agents[tid].store_transition_train_mf(s, c_mf[tid], n_mf[tid], a_id, reward, ns, done)
+            loss = self.lower_agents[tid].store_transition_train_mf(s, c_mf[tid], n_mf[tid], a_id, reward, ns, done)
+            if loss is not None:
+                mf_losses.append(loss)
+        
+        avg_mf_loss = np.mean(mf_losses) if mf_losses else None
+        
+        # Pass a sample state for feature distribution analysis
+        sample_state = None
+        if t_idx.tolist():
+            tid = int(t_idx[0])
+            sid = int(s_idx[0])
+            sample_state = torch.cat([c_obs['task_reqs'][tid], c_obs['backlog'][:, sid], c_obs['cpu_alloc'][:, sid]])
+            
+        self.aggregator.add_lower(next_res, mf_loss=avg_mf_loss, state=sample_state)
 
     def store_upper_transitions(self, s_all, ns_all, current_res, next_res, acts_matrix, done):
         reward = next_res['reward_global']
         c_mf = current_res.get('mean_fields', torch.zeros((self.num_nodes, self.num_services), device=self.device))
         n_mf = next_res['mean_fields']
 
+        mf_losses = []
         for nid in self.upper_agents:
             s, ns = s_all[nid], ns_all[nid]
             a_binary = acts_matrix[nid].cpu().numpy().astype(int)
             a_id = 0
             for bit in a_binary: a_id = (a_id << 1) | bit
 
-            self.upper_agents[nid].store_transition_train_mf(s, c_mf[nid], n_mf[nid], a_id, reward, ns, done)
+            loss = self.upper_agents[nid].store_transition_train_mf(s, c_mf[nid], n_mf[nid], a_id, reward, ns, done)
+            if loss is not None:
+                mf_losses.append(loss)
+        
+        avg_mf_loss = np.mean(mf_losses) if mf_losses else None
+        
+        # Pass a sample state (first node)
+        sample_state = s_all[0] if len(s_all) > 0 else None
+            
+        self.aggregator.add_upper(next_res, mf_loss=avg_mf_loss, state=sample_state)
 
     def update_rates(self, ep):
         for nid in self.epsilons: self.epsilons[nid] = max(self.min_epsilon, self.epsilons[nid] * self.epsilon_decay)

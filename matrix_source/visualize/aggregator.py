@@ -3,6 +3,8 @@ import matplotlib.pyplot as plt
 from collections import defaultdict, deque
 import os
 
+from matrix_source.configs.configs import cfg
+
 class MetricsAggregator:
     def __init__(self):
         self.history = defaultdict(list)
@@ -18,10 +20,21 @@ class MetricsAggregator:
         # Info metrics
         self.episode_f1 = []
         self.episode_energy = []
+        self.episode_violations = [] # Added for clarity
         self.episode_virtual_delay = []
         self.episode_realized_delay = []
         self.episode_success_qos = []
         self.episode_violate_qos = []
+
+        # Training Losses
+        self.episode_upper_mf_losses = []
+        self.episode_lower_mf_losses = []
+        self.episode_upper_td_losses = []
+        self.episode_lower_td_losses = []
+
+        # State Tracking for Normalization Analysis
+        self.episode_upper_states = []
+        self.episode_lower_states = []
 
         # Per-node per-service delays (realized)
         self.episode_node_service_delays = defaultdict(lambda: defaultdict(list))
@@ -29,23 +42,38 @@ class MetricsAggregator:
         # Offloading flow matrix: [SourceNode][TargetNode] -> count
         self.episode_offloading_matrix = defaultdict(lambda: defaultdict(int))
 
-    def add_upper(self, step_output):
+    def add_upper(self, step_output, mf_loss=None, state=None):
         """Adds data from an upper-level step."""
         self.episode_upper_rewards.append(step_output.get("reward", 0))
+        if mf_loss is not None:
+            self.episode_upper_mf_losses.append(float(mf_loss))
+        if state is not None:
+            if hasattr(state, "detach"):
+                s_np = state.detach().cpu().numpy()
+            else:
+                s_np = np.array(state)
+            self.episode_upper_states.append(s_np.flatten())
         
         remaining = step_output.get("remaining_task", {})
-        # Aggregate remaining tasks across all nodes (summing the vectors)
         if remaining:
             total_remaining = sum(np.sum(v) for v in remaining.values())
             self.episode_remaining_tasks.append(total_remaining)
 
-    def add_lower(self, step_output):
+    def add_lower(self, step_output, mf_loss=None, state=None):
         """Adds data from a lower-level step."""
         self.episode_lower_rewards.append(step_output.get("reward", 0))
-        
+        if mf_loss is not None:
+            self.episode_lower_mf_losses.append(float(mf_loss))
+        if state is not None:
+            if hasattr(state, "detach"):
+                s_np = state.detach().cpu().numpy()
+            else:
+                s_np = np.array(state)
+            self.episode_lower_states.append(s_np.flatten())
+            
         info = step_output.get("info", {})
         
-        # F1 and Energy distributions (per node)
+        # F1 and Energy distributions
         f1_dist = info.get("f1", {})
         if f1_dist:
             self.episode_f1.append(sum(f1_dist.values()))
@@ -53,8 +81,12 @@ class MetricsAggregator:
         energy_dist = info.get("energy", {})
         if energy_dist:
             self.episode_energy.append(sum(energy_dist.values()))
+
+        # Violations count
+        violations = step_output.get("violations", 0)
+        self.episode_violations.append(violations)
             
-        # Delay and QoS info (per node vectors)
+        # Delay info
         v_delay = info.get("virtual_delay", {})
         if v_delay:
             self.episode_virtual_delay.append(np.mean([np.mean(v) for v in v_delay.values()]))
@@ -62,10 +94,9 @@ class MetricsAggregator:
         r_delay = info.get("realized_delay", {})
         if r_delay:
             self.episode_realized_delay.append(np.mean([np.mean(v) for v in r_delay.values()]))
-            # Track per-node per-service avg delay
             for nid, delays in r_delay.items():
                 for sid, d in enumerate(delays):
-                    if d > 1e-9: # Only track actual delays
+                    if d > 1e-9:
                         self.episode_node_service_delays[nid][sid].append(d)
 
         success_qos = info.get("success_qos", {})
@@ -76,6 +107,13 @@ class MetricsAggregator:
         if violate_qos:
             self.episode_violate_qos.append(sum(np.sum(v) for v in violate_qos.values()))
 
+    def record_td_losses(self, upper_losses, lower_losses):
+        """Records TD losses at the end of an episode."""
+        if upper_losses:
+            self.episode_upper_td_losses.append(np.mean(upper_losses))
+        if lower_losses:
+            self.episode_lower_td_losses.append(np.mean(lower_losses))
+
     def store_history(self):
         """Saves episode averages to history and RESETS intra-episode data."""
         self.history["upper_reward"].append(np.sum(self.episode_upper_rewards))
@@ -84,16 +122,26 @@ class MetricsAggregator:
         
         self.history["avg_f1"].append(np.mean(self.episode_f1) if self.episode_f1 else 0)
         self.history["total_energy"].append(np.sum(self.episode_energy) if self.episode_energy else 0)
+        self.history["total_violations"].append(np.sum(self.episode_violations) if self.episode_violations else 0)
+        
         self.history["avg_virtual_delay"].append(np.mean(self.episode_virtual_delay) if self.episode_virtual_delay else 0)
         self.history["avg_realized_delay"].append(np.mean(self.episode_realized_delay) if self.episode_realized_delay else 0)
         self.history["total_success_qos"].append(np.sum(self.episode_success_qos) if self.episode_success_qos else 0)
         self.history["total_violate_qos"].append(np.sum(self.episode_violate_qos) if self.episode_violate_qos else 0)
         
-        # Calculate QoS Rate: Success / (Success + Violate)
+        # Training Losses
+        self.history["avg_upper_mf_loss"].append(np.mean(self.episode_upper_mf_losses) if self.episode_upper_mf_losses else 0)
+        self.history["avg_lower_mf_loss"].append(np.mean(self.episode_lower_mf_losses) if self.episode_lower_mf_losses else 0)
+        self.history["avg_upper_td_loss"].append(np.mean(self.episode_upper_td_losses) if self.episode_upper_td_losses else 0)
+        self.history["avg_lower_td_loss"].append(np.mean(self.episode_lower_td_losses) if self.episode_lower_td_losses else 0)
+
+        # QoS Success Rate
         success = np.sum(self.episode_success_qos) if self.episode_success_qos else 0
         violate = np.sum(self.episode_violate_qos) if self.episode_violate_qos else 0
         qos_success_rate = success / (success + violate) if (success + violate) > 0 else 0
         self.history["qos_success_rate"].append(qos_success_rate)
+        
+        self.history["avg_remaining_tasks"].append(np.mean(self.episode_remaining_tasks) if self.episode_remaining_tasks else 0)
 
         # Keep old qos_rate for backward compatibility if needed, but we focus on success rate
         qos_rate = success / (violate if violate > 0 else 1.0)
@@ -106,6 +154,7 @@ class MetricsAggregator:
         # Auto-plot every 100 episodes
         if self.episode_count % 100 == 0:
             self.plot_history(ep=self.episode_count)
+            self.plot_state_distributions(ep=self.episode_count)
 
         # Auto-reset for next episode
         # Note: We reset AFTER report_episode is called usually,
@@ -136,6 +185,12 @@ class MetricsAggregator:
         print(f"Total Energy:     {energy:.4f} J")
         print(f"QoS Success Rate: {qos_success_rate:.2%}")
         print(f"Avg Remaining Tasks: {self.history['avg_remaining_tasks'][-1] if self.history['avg_remaining_tasks'] else 0:.2f}")
+
+        # State statistics reporting
+        if self.episode_upper_states or self.episode_lower_states:
+            print("\n--- Input State Statistics (Mean ± Std) ---")
+            self._print_state_stats("Upper Agents", self.episode_upper_states)
+            self._print_state_stats("Lower Agents", self.episode_lower_states)
 
         print("\n--- Average Delay per Node and Service ---")
         if not self.episode_node_service_delays:
@@ -184,6 +239,29 @@ class MetricsAggregator:
                     fmt_values.append(f"{int(val):7}")
             print(row + " | ".join(fmt_values))
 
+    def _print_state_stats(self, label, states):
+        """Calculates and prints mean/std per feature from a list of flattened states."""
+        if not states:
+            print(f"{label}: No state data.")
+            return
+
+        # Stack into [Samples, Features]
+        states_matrix = np.stack(states)
+        means = np.mean(states_matrix, axis=0)
+        stds = np.std(states_matrix, axis=0)
+        mins = np.min(states_matrix, axis=0)
+        maxs = np.max(states_matrix, axis=0)
+
+        print(f"\n[{label}] Feature distribution (Samples: {len(states)}):")
+        header = f"{'Feat':<5} | {'Mean ± Std':<20} | {'Range [Min, Max]':<25}"
+        print(header)
+        print("-" * len(header))
+
+        for i in range(len(means)):
+            stat_str = f"{means[i]:8.3f} ± {stds[i]:8.3f}"
+            range_str = f"[{mins[i]:9.3f}, {maxs[i]:9.3f}]"
+            print(f"{i:<5} | {stat_str:<20} | {range_str:<25}")
+
     def _print_traffic_matrix(self):
         """Prints the [SourceNode][TargetNode] count matrix."""
         # Get all source nodes and target nodes encountered
@@ -209,7 +287,7 @@ class MetricsAggregator:
             return data
         return np.convolve(data, np.ones(window)/window, mode='valid')
 
-    def plot_history(self, save_dir="src/visualize/plots", ep=None):
+    def plot_history(self, save_dir=cfg.plot_dir, ep=None):
         """Generates and saves performance charts showing evolution."""
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
@@ -217,11 +295,11 @@ class MetricsAggregator:
         episodes = range(1, len(self.history["total_reward"]) + 1)
         window = 10 # Window for smoothing
         
-        plt.figure(figsize=(18, 12))
-        plt.suptitle(f"Model Evolution Over Episodes (up to {len(episodes)})", fontsize=16)
+        plt.figure(figsize=(24, 12))
+        plt.suptitle(f"Model Evolution Over Episodes (up to {len(episodes)})", fontsize=20)
         
-        # Plot 1: Rewards (with moving average)
-        plt.subplot(2, 3, 1)
+        # Plot 1: Rewards
+        plt.subplot(2, 4, 1)
         plt.plot(episodes, self.history["total_reward"], alpha=0.3, color='blue', label="Raw Total")
         if len(episodes) >= window:
             ma = self._moving_average(self.history["total_reward"], window)
@@ -231,7 +309,7 @@ class MetricsAggregator:
         plt.legend()
         
         # Plot 2: F1 Score
-        plt.subplot(2, 3, 2)
+        plt.subplot(2, 4, 2)
         plt.plot(episodes, self.history["avg_f1"], alpha=0.3, color='green')
         if len(episodes) >= window:
             ma = self._moving_average(self.history["avg_f1"], window)
@@ -240,7 +318,7 @@ class MetricsAggregator:
         plt.xlabel("Episode")
         
         # Plot 3: Energy
-        plt.subplot(2, 3, 3)
+        plt.subplot(2, 4, 3)
         plt.plot(episodes, self.history["total_energy"], alpha=0.3, color='orange')
         if len(episodes) >= window:
             ma = self._moving_average(self.history["total_energy"], window)
@@ -249,7 +327,7 @@ class MetricsAggregator:
         plt.xlabel("Episode")
         
         # Plot 4: Delays
-        plt.subplot(2, 3, 4)
+        plt.subplot(2, 4, 4)
         plt.plot(episodes, self.history["avg_realized_delay"], alpha=0.3, color='red', label="Realized")
         if len(episodes) >= window:
             ma = self._moving_average(self.history["avg_realized_delay"], window)
@@ -258,34 +336,111 @@ class MetricsAggregator:
         plt.xlabel("Episode")
         plt.legend()
         
-        # Plot 5: QoS Rate (Success / Violate)
-        plt.subplot(2, 3, 5)
-        plt.plot(episodes, self.history["qos_rate"], alpha=0.3, color='purple')
+        # Plot 5: QoS Success Rate
+        plt.subplot(2, 4, 5)
+        plt.plot(episodes, self.history["qos_success_rate"], alpha=0.3, color='purple')
         if len(episodes) >= window:
-            ma = self._moving_average(self.history["qos_rate"], window)
-            plt.plot(range(window, len(self.history["qos_rate"]) + 1), ma, color='purple', linewidth=2)
-        plt.title("QoS Rate (Success/Violate)")
+            ma = self._moving_average(self.history["qos_success_rate"], window)
+            plt.plot(range(window, len(self.history["qos_success_rate"]) + 1), ma, color='purple', linewidth=2)
+        plt.ylim(0, 1.05)
+        plt.title("QoS Success Rate")
         plt.xlabel("Episode")
 
         # Plot 6: Remaining Tasks
-        plt.subplot(2, 3, 6)
+        plt.subplot(2, 4, 6)
         plt.plot(episodes, self.history["avg_remaining_tasks"], alpha=0.3, color='brown')
         if len(episodes) >= window:
             ma = self._moving_average(self.history["avg_remaining_tasks"], window)
             plt.plot(range(window, len(self.history["avg_remaining_tasks"]) + 1), ma, color='brown')
         plt.title("Task Clearing Efficiency")
         plt.xlabel("Episode")
+
+        # Plot 7: MF Training Losses
+        plt.subplot(2, 4, 7)
+        plt.plot(episodes, self.history["avg_upper_mf_loss"], alpha=0.3, color='cyan', label="Upper")
+        plt.plot(episodes, self.history["avg_lower_mf_loss"], alpha=0.3, color='magenta', label="Lower")
+        if len(episodes) >= window:
+            ma_u = self._moving_average(self.history["avg_upper_mf_loss"], window)
+            ma_l = self._moving_average(self.history["avg_lower_mf_loss"], window)
+            plt.plot(range(window, len(self.history["avg_upper_mf_loss"]) + 1), ma_u, color='cyan')
+            plt.plot(range(window, len(self.history["avg_lower_mf_loss"]) + 1), ma_l, color='magenta')
+        plt.yscale('log')
+        plt.title("Mean Field Loss (Log)")
+        plt.xlabel("Episode")
+        plt.legend()
+
+        # Plot 8: TD Training Losses (Q-Network)
+        plt.subplot(2, 4, 8)
+        plt.plot(episodes, self.history["avg_upper_td_loss"], alpha=0.3, color='teal', label="Upper")
+        plt.plot(episodes, self.history["avg_lower_td_loss"], alpha=0.3, color='olive', label="Lower")
+        if len(episodes) >= window:
+            ma_u = self._moving_average(self.history["avg_upper_td_loss"], window)
+            ma_l = self._moving_average(self.history["avg_lower_td_loss"], window)
+            plt.plot(range(window, len(self.history["avg_upper_td_loss"]) + 1), ma_u, color='teal')
+            plt.plot(range(window, len(self.history["avg_lower_td_loss"]) + 1), ma_l, color='olive')
+        plt.yscale('log')
+        plt.title("TD Loss (Log)")
+        plt.xlabel("Episode")
+        plt.legend()
         
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         
         # Save latest
         plt.savefig(os.path.join(save_dir, "training_metrics.png"))
         
-        # Save archival copy if episode number is provided
+        # Save archival copy
         if ep is not None:
             archive_dir = os.path.join(save_dir, "archive")
             if not os.path.exists(archive_dir):
                 os.makedirs(archive_dir)
             plt.savefig(os.path.join(archive_dir, f"metrics_ep_{ep}.png"))
+            
+        plt.close()
+
+    def plot_state_distributions(self, save_dir=cfg.plot_dir, ep=None):
+        """Generates boxplots for Upper and Lower agent input features."""
+        if not self.episode_upper_states and not self.episode_lower_states:
+            return
+            
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+            
+        plt.figure(figsize=(20, 10))
+        plt.suptitle(f"Agent Input Feature Distributions (Episode {self.episode_count})", fontsize=20)
+        
+        # Plot Upper Agents
+        plt.subplot(2, 1, 1)
+        if self.episode_upper_states:
+            data = np.stack(self.episode_upper_states)
+            plt.boxplot(data, vert=True, patch_artist=True)
+            plt.title(f"Upper Agent State Features (Samples: {len(self.episode_upper_states)})")
+            plt.ylabel("Value Range")
+            plt.grid(True, alpha=0.3)
+        else:
+            plt.text(0.5, 0.5, "No data for Upper Agents", ha='center')
+
+        # Plot Lower Agents
+        plt.subplot(2, 1, 2)
+        if self.episode_lower_states:
+            data = np.stack(self.episode_lower_states)
+            plt.boxplot(data, vert=True, patch_artist=True)
+            plt.title(f"Lower Agent State Features (Samples: {len(self.episode_lower_states)})")
+            plt.ylabel("Value Range")
+            plt.xlabel("Feature Index")
+            plt.grid(True, alpha=0.3)
+        else:
+            plt.text(0.5, 0.5, "No data for Lower Agents", ha='center')
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        
+        # Save latest
+        plt.savefig(os.path.join(save_dir, "state_distributions.png"))
+        
+        # Save archival copy
+        if ep is not None:
+            archive_dir = os.path.join(save_dir, "archive")
+            if not os.path.exists(archive_dir):
+                os.makedirs(archive_dir)
+            plt.savefig(os.path.join(archive_dir, f"state_dist_ep_{ep}.png"))
             
         plt.close()

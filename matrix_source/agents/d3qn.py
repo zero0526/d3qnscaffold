@@ -2,9 +2,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from typing import Tuple
-from matrix_source.agents.ffn import FFN
-from matrix_source.agents.ReplayBuffer import ReplayBuffer
 
+from matrix_source.agents.ReplayBuffer import ReplayBuffer
 from matrix_source.configs.configs import cfg
 
 class RunningNorm:
@@ -34,38 +33,201 @@ class RunningNorm:
     def normalize(self, x):
         return (x - self.mean) / (torch.sqrt(self.var) + 1e-8)
 
+class ResidualBlock(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+
+        self.block = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.SiLU(),
+
+            nn.Linear(dim, dim)
+        )
+
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        return self.norm(x + self.block(x))
+
 class DuelingNetwork(nn.Module):
-    def __init__(self, input_dim: int, action_dim: int, hidden_sizes: Tuple[int, ...]):
-        super(DuelingNetwork, self).__init__()
-        # Shared Base Feature Extractor (FedRep Base)
+
+    def __init__(
+        self,
+        state_dim: int,
+        mf_dim: int,
+        action_dim: int,
+        hidden_sizes: Tuple[int, int]
+    ):
+        super().__init__()
+
+        h1, h2 = hidden_sizes
+
+        # =========================
+        # Separate projections
+        # =========================
+
+        self.state_proj = nn.Sequential(
+            nn.Linear(state_dim, h1 // 2),
+            nn.LayerNorm(h1 // 2),
+            nn.SiLU()
+        )
+
+        self.mf_proj = nn.Sequential(
+            nn.Linear(mf_dim, h1 // 2),
+            nn.LayerNorm(h1 // 2),
+            nn.SiLU()
+        )
+
+        # =========================
+        # Shared backbone (FedRep base)
+        # =========================
+
         self.base = nn.Sequential(
-            nn.Linear(input_dim, hidden_sizes[0]),
-            nn.ReLU()
+            nn.Linear(h1, h1),
+            nn.LayerNorm(h1),
+            nn.SiLU(),
+
+            nn.Linear(h1, h2),
+            nn.LayerNorm(h2),
+            nn.SiLU()
         )
-        # Personalized Heads (FedRep Heads)
+
+        # =========================
+        # Residual stabilization
+        # =========================
+
+        self.res_block = ResidualBlock(h2)
+
+        # =========================
+        # Value stream
+        # =========================
+
         self.value_stream = nn.Sequential(
-            nn.Linear(hidden_sizes[0], hidden_sizes[1]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[1], 1)
+            nn.Linear(h2, h2),
+            nn.LayerNorm(h2),
+            nn.SiLU(),
+
+            nn.Linear(h2, 1)
         )
+
+        # =========================
+        # Advantage stream
+        # =========================
+
         self.advantage_stream = nn.Sequential(
-            nn.Linear(hidden_sizes[0], hidden_sizes[1]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[1], action_dim)
+            nn.Linear(h2, h2),
+            nn.LayerNorm(h2),
+            nn.SiLU(),
+
+            nn.Linear(h2, action_dim)
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+
+        for m in self.modules():
+
+            if isinstance(m, nn.Linear):
+
+                nn.init.orthogonal_(m.weight, gain=1.0)
+
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+
+        # Smaller final layer init for stable Q at start
+
+        nn.init.orthogonal_(
+            self.value_stream[-1].weight,
+            gain=0.01
+        )
+
+        nn.init.orthogonal_(
+            self.advantage_stream[-1].weight,
+            gain=0.01
         )
 
     def forward(self, state, pred_mf):
-        x = torch.cat([state, pred_mf], dim=-1)
+        # Input projections
+        s = self.state_proj(state)
+        m = self.mf_proj(pred_mf)
+        x = torch.cat([s, m], dim=-1)
+
+        # Shared representation
         features = self.base(x)
+        features = self.res_block(features)
+
+        # Dueling heads
         V = self.value_stream(features)
         A = self.advantage_stream(features)
 
-        # Q(s, a) = V(s) + (A(s, a) - mean(A(s, a)))
-        Q = V + (A - A.mean(dim=1, keepdim=True))
+        # Dueling aggregation
+        Q = V + (A - A.mean(dim=-1, keepdim=True))
+
         return Q
 
     def get_base_params(self):
-        return list(self.base.parameters())
+
+        return (
+            list(self.state_proj.parameters()) +
+            list(self.mf_proj.parameters()) +
+            list(self.base.parameters()) +
+            list(self.res_block.parameters())
+        )
+
+class MF(nn.Module):
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        hidden_sizes: Tuple[int, ...]
+    ):
+
+        super().__init__()
+        layers = []
+        in_features = input_size
+
+        for h_dim in hidden_sizes:
+            layers.extend([
+                nn.Linear(in_features, h_dim),
+                nn.LayerNorm(h_dim),
+                nn.SiLU()
+            ])
+            in_features = h_dim
+
+        layers.append(
+            nn.Linear(in_features, output_size)
+        )
+        self.network = nn.Sequential(*layers)
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        linear_layers = []
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                linear_layers.append(m)
+                nn.init.orthogonal_(
+                    m.weight,
+                    gain=1.0
+                )
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        # Small final layer init
+        # Helps stabilize early MF predictions
+        nn.init.orthogonal_(
+            linear_layers[-1].weight,
+            gain=0.01
+        )
+
+    def forward(self, x):
+
+        x = self.network(x)
+        # Constrain MF to [0,1]
+        x = torch.sigmoid(x)
+        return x
 
 # ---D3QN AGENT ---
 class D3QNAgent:
@@ -83,13 +245,13 @@ class D3QNAgent:
         self.min_batch_size= buffer_min_size[0] if node_type!="terminal" else buffer_min_size[1]
         # Evaluation Network, Target Network
         input_dim = state_dim + action_dim
-        self.eval_net = DuelingNetwork(input_dim, u_action_dim, hidden_sizes).to(self.device)
-        self.target_net = DuelingNetwork(input_dim, u_action_dim, hidden_sizes).to(self.device)
+        self.eval_net = DuelingNetwork(state_dim,action_dim , u_action_dim, hidden_sizes).to(self.device)
+        self.target_net = DuelingNetwork(state_dim,action_dim , u_action_dim, hidden_sizes).to(self.device)
 
         self.target_net.load_state_dict(self.eval_net.state_dict())
         self.target_net.eval()
 
-        self.mf_net = FFN(input_size=state_dim + action_dim, output_size=action_dim, hidden_sizes=mf_hidden_sizes).to(self.device)
+        self.mf_net = MF(input_size=state_dim + action_dim, output_size=action_dim, hidden_sizes=mf_hidden_sizes).to(self.device)
         self.mf_optimizer = optim.Adam(self.mf_net.parameters(), lr=mf_lr)
         self.optimizer = optim.Adam(self.eval_net.parameters(), lr=lr)
         self.loss_fn = nn.MSELoss()
@@ -184,10 +346,12 @@ class D3QNAgent:
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.mf_net.parameters(), max_norm=1.0)
         self.mf_optimizer.step()
+        return loss.item()
 
     def store_transition_train_mf(self, state, prev_mf, curr_mf, action, reward, next_state, done):
-        self.learn_mf(state, prev_mf, curr_mf)
+        mf_loss = self.learn_mf(state, prev_mf, curr_mf)
         self.memory.add(state, prev_mf, curr_mf, action, reward, next_state, done)
+        return mf_loss
 
     def learn(self):
         if len(self.memory) < self.min_batch_size:

@@ -17,8 +17,8 @@ NEURON_NET:
     OMEGA_Q3: 5
 
     HIDDEN_MF: 50
-    HIDDEN_Q1: 128
-    HIDDEN_Q2: 64
+    HIDDEN_Q1: 256
+    HIDDEN_Q2: 128
 
     UPPER_LR: 1e-4
     LOWER_LR: 1e-4
