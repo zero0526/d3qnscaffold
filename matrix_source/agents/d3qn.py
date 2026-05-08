@@ -407,7 +407,7 @@ class D3QNAgent:
         self.learn_step_counter += 1
 
         # Log every 100 learning steps to avoid console flooding
-        if self.learn_step_counter % 100 == 0:
+        if self.learn_step_counter % 50 == 0:
             print(f"[Agent {self.node_id} ({self.node_type})] Update {self.learn_step_counter:5d} | "
                   f"Avg Q: {avg_q:8.3f} | TD Loss: {loss_val:8.5f} | ΔLoss: {loss_change:9.5f}")
 

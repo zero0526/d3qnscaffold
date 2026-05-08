@@ -212,6 +212,15 @@ class Trainer:
             if nid == self.env.cloud_node_id: continue
             node_placement, node_phi = all_states[nid]
             state = np.concatenate([node_placement, node_phi], axis=-1)
+            
+            # Apply Normalization
+            norm_factors = self.config.normalization.get("upper_state", {}).get("features", {})
+            if norm_factors:
+                for idx, divisor in norm_factors.items():
+                    idx_int = int(idx)
+                    if idx_int < len(state):
+                        state[idx_int] /= (divisor if divisor != 0 else 1.0)
+            
             prev_states[nid] = state
             mf = all_mfs[nid]
 
@@ -237,6 +246,10 @@ class Trainer:
             curr_s = np.concatenate([node_placement, node_phi], axis=-1)
 
             agent_reward = global_reward - (local_penalties.get(nid, 0) * local_penalty_scale)
+            
+            # Normalize Reward
+            rew_divisor = self.config.normalization.get("rewards", {}).get("upper_divisor", 1.0)
+            agent_reward /= (rew_divisor if rew_divisor != 0 else 1.0)
 
             self.upper_agents[nid].store_transition(
                 prev_states[nid], prev_mfs[nid], curr_mfs[nid],
@@ -310,24 +323,24 @@ class Trainer:
         return final_mask
 
     def get_lower_state(self, task, backlogs, cpu_allocations, global_backlogs=None, global_cpu=None):
-        norm_d = task.total_data_size_mb / 400.0
-        norm_deadline = (task.deadline - task.created_at) / 7.0
-        norm_acc = task.min_accuracy / 100.0
+        # Build raw state parts
+        state_parts = [np.array([task.omega, task.total_data_size_mb, (task.deadline - task.created_at), task.min_accuracy]), 
+                       backlogs, cpu_allocations]
 
-        # Service-specific loads
-        norm_backlogs = backlogs / 1000.0
-        norm_resource_allocations = cpu_allocations / 4000.0
-
-        state_parts = [np.array([task.omega, norm_d, norm_deadline, norm_acc]), norm_backlogs,
-                       norm_resource_allocations]
-
-        # Global node loads (cross-service awareness)
         if global_backlogs is not None and global_cpu is not None:
-            norm_global_backlogs = global_backlogs / 5000.0  # Scale reflects total capacity
-            norm_global_cpu = global_cpu / 15000.0
-            state_parts.extend([norm_global_backlogs, norm_global_cpu])
+            state_parts.extend([global_backlogs, global_cpu])
 
-        return np.concatenate(state_parts, axis=-1)
+        state = np.concatenate(state_parts, axis=-1)
+        
+        # Apply Normalization
+        norm_factors = self.config.normalization.get("lower_state", {}).get("features", {})
+        if norm_factors:
+            for idx, divisor in norm_factors.items():
+                idx_int = int(idx)
+                if idx_int < len(state):
+                    state[idx_int] /= (divisor if divisor != 0 else 1.0)
+        
+        return state
 
     def decode_lower_action_idx(self, lower_action_id: int):
         node_id = int(lower_action_id // self.env.max_models_total)
@@ -371,6 +384,10 @@ class Trainer:
             if tid in rewards:
                 penalty = self.config.hyper_neural.get("OMEGA_Q1", 1.0) * 20.0
                 rw -= penalty
+            
+            # Normalize Reward
+            rew_divisor = self.config.normalization.get("rewards", {}).get("lower_divisor", 1.0)
+            rw /= (rew_divisor if rew_divisor != 0 else 1.0)
 
             self.lower_agents[tid].store_transition(
                 prev_states[tid],

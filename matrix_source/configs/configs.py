@@ -52,6 +52,7 @@ class BaseConfig(BaseSettings):
     neural_cfg_path: str= Field(default=str(PROJECT_ROOT / "data" / "training_cfg.yaml"))
     service_path: str= Field(default=str(PROJECT_ROOT / "data" / "ai_services.yaml"))
     delay_path: str = Field(default=str(PROJECT_ROOT / "data" / "delay.yaml"))
+    normalization_path: str = Field(default=str(PROJECT_ROOT / "data" / "normalization.yaml"))
     nodes_type:Dict[str,str] = Field(default={})
     nodes_config:Dict[str,str] = Field(default={})
     energy_coef: float = Field(default=5e-10)
@@ -76,6 +77,7 @@ class BaseConfig(BaseSettings):
     admm_rho: float= Field(default=1.0)
     admm_max_iter:int = Field(default=200)
     admm_tol:float = Field(default=1e-4)
+    normalization: Dict[str, Any] = Field(default={})
     class Config:
         env_file = get_env_file()
         env_file_encoding = "utf-8"
@@ -87,6 +89,7 @@ cfg.topology_data = default_topology_config(cfg.topology, cfg)
 cfg.hyper_neural = load_yaml(cfg.neural_cfg_path, "NEURON_NET")
 cfg.services = load_yaml(cfg.service_path, "service")
 cfg.delay_queue_max = load_yaml(cfg.delay_path, "nodes")
+cfg.normalization = load_yaml(cfg.normalization_path)
 
 
 

@@ -2,6 +2,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from collections import defaultdict, deque
 import os
+import logging
+from configs.configs import cfg
 
 from matrix_source.configs.configs import cfg
 
@@ -9,7 +11,37 @@ class MetricsAggregator:
     def __init__(self):
         self.history = defaultdict(list)
         self.episode_count = 0
+        self._setup_logger()
         self.reset_episode()
+
+    def _setup_logger(self):
+        """Sets up a logger that writes to both terminal and a file."""
+        log_dir = cfg.logs
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        
+        log_file = os.path.join(log_dir, "metrics.log")
+        
+        self.logger = logging.getLogger("MetricsAggregator")
+        self.logger.setLevel(logging.INFO)
+        
+        # Clear existing handlers if any
+        if self.logger.hasHandlers():
+            self.logger.handlers.clear()
+            
+        # File handler
+        fh = logging.FileHandler(log_file, encoding='utf-8')
+        fh.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+        self.logger.addHandler(fh)
+        
+        # Console handler
+        ch = logging.StreamHandler()
+        ch.setFormatter(logging.Formatter('%(message)s'))
+        self.logger.addHandler(ch)
+
+    def log(self, message):
+        """Logs a message to both console and file."""
+        self.logger.info(message)
 
     def reset_episode(self):
         """Resets the accumulators for a new episode."""
@@ -77,11 +109,6 @@ class MetricsAggregator:
             self.episode_lower_states.append(s_np.flatten())
             
         info = step_output.get("info", {})
-        
-        # F1 and Energy distributions
-        f1_dist = info.get("f1", {})
-        if f1_dist:
-            self.episode_f1.append(sum(f1_dist.values()))
             
         energy_dist = step_output.get("energy", {})
         if energy_dist:
@@ -157,8 +184,6 @@ class MetricsAggregator:
         qos_rate = success / (violate if violate > 0 else 1.0)
         self.history["qos_rate"].append(qos_rate)
         
-        self.history["avg_remaining_tasks"].append(np.mean(self.episode_remaining_tasks) if self.episode_remaining_tasks else 0)
-        
         self.episode_count += 1
 
         # Auto-plot every 50 episodes
@@ -188,36 +213,36 @@ class MetricsAggregator:
         energy = self.history["total_energy"][-1] if self.history["total_energy"] else 0
         qos_success_rate = self.history["qos_success_rate"][-1] if self.history["qos_success_rate"] else 0
         
-        print(f"\n--- Episode {ep} Summary ---")
-        print(f"Avg Upper Reward: {upper_reward:.4f}")
-        print(f"Avg Lower Reward: {lower_reward:.4f}")
-        print(f"Total Reward:     {total_reward:.2f}")
-        print(f"Total Energy:     {energy:.4f} J")
-        print(f"QoS Success Rate: {qos_success_rate:.2%}")
-        print(f"Avg Remaining Tasks: {self.history['avg_remaining_tasks'][-1] if self.history['avg_remaining_tasks'] else 0:.2f}")
+        self.log(f"\n--- Episode {ep} Summary ---")
+        self.log(f"Avg Upper Reward: {upper_reward:.4f}")
+        self.log(f"Avg Lower Reward: {lower_reward:.4f}")
+        self.log(f"Total Reward:     {total_reward:.2f}")
+        self.log(f"Total Energy:     {energy:.4f} J")
+        self.log(f"QoS Success Rate: {qos_success_rate:.2%}")
+        self.log(f"Avg Remaining Tasks: {self.history['avg_remaining_tasks'][-1] if self.history['avg_remaining_tasks'] else 0:.2f}")
 
         # State statistics reporting
         if self.episode_upper_states or self.episode_lower_states:
-            print("\n--- Input State Statistics (Mean ± Std) ---")
+            self.log("\n--- Input State Statistics (Mean ± Std) ---")
             self._print_state_stats("Upper Agents", self.episode_upper_states)
             self._print_state_stats("Lower Agents", self.episode_lower_states)
 
-        print("\n--- Average Delay per Node and Service ---")
+        self.log("\n--- Average Delay per Node and Service ---")
         if not self.episode_node_service_delays:
-            print("No delay data recorded for this episode.")
+            self.log("No delay data recorded for this episode.")
         else:
             self._print_per_node_table(self.episode_node_service_delays, is_delay=True)
 
         if success_counts:
-            print("\n--- Successful Tasks count per Node and Service ---")
+            self.log("\n--- Successful Tasks count per Node and Service ---")
             self._print_per_node_table(success_counts)
 
         if failure_counts:
-            print("\n--- Failed Tasks count (Dropped/Overdue) per Node and Service ---")
+            self.log("\n--- Failed Tasks count (Dropped/Overdue) per Node and Service ---")
             self._print_per_node_table(failure_counts)
 
         if self.episode_offloading_matrix:
-            print("\n--- Offloading Traffic Matrix (Source -> Target) ---")
+            self.log("\n--- Offloading Traffic Matrix (Source -> Target) ---")
             self._print_traffic_matrix()
 
         # Task Completion Summary
@@ -230,19 +255,19 @@ class MetricsAggregator:
             violate_total = np.sum(self.episode_violate_qos) if self.episode_violate_qos else 0
             qos_rate = (success_total / (success_total + violate_total) * 100) if (success_total + violate_total) > 0 else 0
 
-            print("\n" + "="*50)
-            print("         EPISODE EXECUTION SUMMARY")
-            print("="*50)
-            print(f" Total Tasks Assigned   : {self.eps_assigned}")
-            print(f" Total Tasks Failed     : {self.eps_failed}")
-            print(f" Tasks Remaining (Queue): {self.last_remaining}")
-            print(f" Total Tasks Completed  : {total_completed}")
-            print("-" * 50)
-            print(f" Completion Rate (vs Assigned): {completion_rate:.2f}%")
-            print(f" QoS Success Rate (vs Proc):   {qos_rate:.2f}%")
-            print("="*50 + "\n")
+            self.log("\n" + "="*50)
+            self.log("         EPISODE EXECUTION SUMMARY")
+            self.log("="*50)
+            self.log(f" Total Tasks Assigned   : {self.eps_assigned}")
+            self.log(f" Total Tasks Failed     : {self.eps_failed}")
+            self.log(f" Tasks Remaining (Queue): {self.last_remaining}")
+            self.log(f" Total Tasks Completed  : {total_completed}")
+            self.log("-" * 50)
+            self.log(f" Completion Rate (vs Assigned): {completion_rate:.2f}%")
+            self.log(f" QoS Success Rate (vs Proc):   {qos_rate:.2f}%")
+            self.log("="*50 + "\n")
 
-        print("---------------------------\n")
+        self.log("---------------------------\n")
 
         # Reset episode data after reporting
         self.reset_episode()
@@ -254,8 +279,8 @@ class MetricsAggregator:
         num_services = len(sample_val) if isinstance(sample_val, (list, np.ndarray)) else len(sample_val)
         
         header = "Node ID | " + " | ".join([f"Svc {i}" for i in range(num_services)])
-        print(header)
-        print("-" * len(header))
+        self.log(header)
+        self.log("-" * len(header))
 
         for nid in sorted(data_dict.keys()):
             values = data_dict[nid]
@@ -269,12 +294,12 @@ class MetricsAggregator:
                     # For counts
                     val = values[sid]
                     fmt_values.append(f"{int(val):7}")
-            print(row + " | ".join(fmt_values))
+            self.log(row + " | ".join(fmt_values))
 
     def _print_state_stats(self, label, states):
         """Calculates and prints mean/std per feature from a list of flattened states."""
         if not states:
-            print(f"{label}: No state data.")
+            self.log(f"{label}: No state data.")
             return
 
         # Stack into [Samples, Features]
@@ -284,15 +309,15 @@ class MetricsAggregator:
         mins = np.min(states_matrix, axis=0)
         maxs = np.max(states_matrix, axis=0)
 
-        print(f"\n[{label}] Feature distribution (Samples: {len(states)}):")
+        self.log(f"\n[{label}] Feature distribution (Samples: {len(states)}):")
         header = f"{'Feat':<5} | {'Mean ± Std':<20} | {'Range [Min, Max]':<25}"
-        print(header)
-        print("-" * len(header))
+        self.log(header)
+        self.log("-" * len(header))
 
         for i in range(len(means)):
             stat_str = f"{means[i]:8.3f} ± {stds[i]:8.3f}"
             range_str = f"[{mins[i]:9.3f}, {maxs[i]:9.3f}]"
-            print(f"{i:<5} | {stat_str:<20} | {range_str:<25}")
+            self.log(f"{i:<5} | {stat_str:<20} | {range_str:<25}")
 
     def _print_traffic_matrix(self):
         """Prints the [SourceNode][TargetNode] count matrix."""
@@ -304,15 +329,15 @@ class MetricsAggregator:
         targets = sorted(list(all_targets), key=lambda x: (len(x), x)) # Sort targets: N1, N2, N10...
 
         header = "Src \\ Tgt | " + " | ".join([f"{t:<4}" for t in targets])
-        print(header)
-        print("-" * len(header))
+        self.log(header)
+        self.log("-" * len(header))
 
         for s in sources:
             row = f"{s:<9} | "
             counts = []
             for t in targets:
                 counts.append(f"{self.episode_offloading_matrix[s][t]:4}")
-            print(row + " | ".join(counts))
+            self.log(row + " | ".join(counts))
 
     def _moving_average(self, data, window=50):
         if len(data) < window:

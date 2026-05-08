@@ -68,6 +68,7 @@ class MatrixSixGEnvironment:
             "energy": results['energy'].item(),
             "violations": results['violations'],
             "obs": results['obs'],
+            "info": results["info"],
             "mean_field": results['mean_field'],
             "prev_actions": results['prev_actions'],
             "new_frame": self.time_manager.is_new_frame()
