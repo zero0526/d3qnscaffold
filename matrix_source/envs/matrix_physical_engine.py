@@ -107,7 +107,7 @@ class MatrixPhysicalEngine:
             "actions": self.placement_matrix.clone(),
             "phi_prob": phi_prob,
             "mean_fields": mean_fields,
-            "reward_global": float(self.reward_global_accumulator)
+            "reward_global": -float(self.reward_global_accumulator)
         }
         self.phi_accumulator.zero_()
         self.reward_global_accumulator = 0.0

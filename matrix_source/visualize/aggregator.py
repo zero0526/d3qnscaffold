@@ -81,7 +81,7 @@ class MetricsAggregator:
 
     def add_upper(self, step_output, mf_loss=None, state=None):
         """Adds data from an upper-level step."""
-        self.episode_upper_rewards.append(step_output.get("reward", 0))
+        self.episode_upper_rewards.append(step_output.get("reward_global", 0))
         if mf_loss is not None:
             self.episode_upper_mf_losses.append(float(mf_loss))
         if state is not None:
@@ -90,11 +90,6 @@ class MetricsAggregator:
             else:
                 s_np = np.array(state)
             self.episode_upper_states.append(s_np.flatten())
-        
-        remaining = step_output.get("remaining_task", {})
-        if remaining:
-            total_remaining = sum(np.sum(v) for v in remaining.values())
-            self.episode_remaining_tasks.append(total_remaining)
 
     def add_lower(self, step_output, mf_loss=None, state=None):
         """Adds data from a lower-level step."""
@@ -117,19 +112,6 @@ class MetricsAggregator:
         # Violations count
         violations = step_output.get("violations", 0)
         self.episode_violations.append(violations)
-            
-        # Delay info
-        v_delay = info.get("virtual_delay", {})
-        if v_delay:
-            self.episode_virtual_delay.append(np.mean([np.mean(v) for v in v_delay.values()]))
-            
-        r_delay = info.get("realized_delay", {})
-        if r_delay:
-            self.episode_realized_delay.append(np.mean([np.mean(v) for v in r_delay.values()]))
-            for nid, delays in r_delay.items():
-                for sid, d in enumerate(delays):
-                    if d > 1e-9:
-                        self.episode_node_service_delays[nid][sid].append(d)
 
         success_qos = info.get("success_qos", {})
         if success_qos:
@@ -164,12 +146,9 @@ class MetricsAggregator:
         self.history["lower_reward"].append(np.sum(self.episode_lower_rewards))
         self.history["total_reward"].append(np.sum(self.episode_upper_rewards) + np.sum(self.episode_lower_rewards))
         
-        self.history["avg_f1"].append(np.mean(self.episode_f1) if self.episode_f1 else 0)
         self.history["total_energy"].append(np.sum(self.episode_energy) if self.episode_energy else 0)
         self.history["total_violations"].append(np.sum(self.episode_violations) if self.episode_violations else 0)
         
-        self.history["avg_virtual_delay"].append(np.mean(self.episode_virtual_delay) if self.episode_virtual_delay else 0)
-        self.history["avg_realized_delay"].append(np.mean(self.episode_realized_delay) if self.episode_realized_delay else 0)
         self.history["total_success_qos"].append(np.sum(self.episode_success_qos) if self.episode_success_qos else 0)
         self.history["total_violate_qos"].append(np.sum(self.episode_violate_qos) if self.episode_violate_qos else 0)
         
