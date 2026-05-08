@@ -38,8 +38,16 @@ class Trainer:
         self.epsilon_decay = cfg.hyper_neural.get("EPSILON_DECAY", 0.9985)
         self.epsilons = {nid: 1.0 for nid in range(self.num_nodes)}
         self.lower_epsilons = {tid: 1.0 for tid in range(self.num_terminals)}
-        self.zeta = cfg.hyper_neural.get("ZETA", 1.0)
+        self.zeta_initial = cfg.hyper_neural.get("ZETA", 1.0)
+        self.zeta_max = cfg.hyper_neural.get("ZETA_MAX", 10.0)
+        self.zeta_upper = self.zeta_initial
+        self.zeta_lower = self.zeta_initial
 
+        # Training control variables
+        self.total_lower_steps = 0
+        self.total_upper_steps = 0
+        self.lower_stable_threshold = 50000
+        
         self.aggregator = MetricsAggregator()
         self.upper_agents: Dict[int, D3QNAgent] = {}
         self.lower_agents: Dict[int, D3QNAgent] = {}
@@ -102,11 +110,12 @@ class Trainer:
                     results = self.env.step_lower(t_idx, s_idx, batch_sizes, n_idx, m_idx, task_deadlines, tasks_min_accuracy)
                     self.store_lower_transitions(prev_lower_res, results, t_idx, s_idx, n_idx, m_idx)
                     prev_lower_res = results
+                    self.total_lower_steps += 1 # Count samples collected
 
                     #     train lower
                     lower_td_losses = []
                     for agent in self.lower_agents.values():
-                        loss = agent.learn()
+                        loss = agent.learn() # D3QNAgent checks min_batch_size internally
                         if loss is not None:
                             lower_td_losses.append(loss)
                     if lower_td_losses:
@@ -119,25 +128,32 @@ class Trainer:
                     next_upper_state = self.get_upper_state(res_upper)
 
                     is_ep_done = (slot == max_slots - 1)
-                    # Pass upper metrics to aggregator
-                    # We'll pass mf_loss in store_upper_transitions
-                    self.store_upper_transitions(current_upper_state, next_upper_state, obs_upper, res_upper, u_acts_matrix, is_ep_done)
+                    
+                    # Phased Curriculum: Only collect and train Upper after Lower is stable
+                    if self.total_lower_steps >= self.lower_stable_threshold:
+                        self.store_upper_transitions(current_upper_state, next_upper_state, obs_upper, res_upper, u_acts_matrix, is_ep_done)
+                        self.total_upper_steps += 1 # Approximate upper samples
+
+                        # train upper
+                        upper_td_losses = []
+                        for agent in self.upper_agents.values():
+                            loss = agent.learn()
+                            if loss is not None:
+                                upper_td_losses.append(loss)
+                        if upper_td_losses:
+                            self.aggregator.record_td_losses(upper_losses=upper_td_losses)
 
                     current_upper_state = next_upper_state
                     obs_upper = res_upper
-                    # train upper
-                    upper_td_losses = []
-                    for agent in self.upper_agents.values():
-                        loss = agent.learn()
-                        if loss is not None:
-                            upper_td_losses.append(loss)
-                    if upper_td_losses:
-                        self.aggregator.record_td_losses(upper_losses=upper_td_losses)
 
             # update ep and history
             self.update_rates(ep)
             self.aggregator.store_history()
             self.aggregator.report_episode(ep)
+            print(f"--- Global Metrics ---")
+            print(f"Lower Samples: {self.total_lower_steps} | Upper Samples: {self.total_upper_steps}")
+            print(f"Zeta Lower: {self.zeta_lower:.4f} | Zeta Upper: {self.zeta_upper:.4f}")
+            print(f"Current Epsilon (Edge N0): {self.epsilons[0]:.4f}")
 
     def get_upper_state(self, obs_upper):
         state = torch.cat([obs_upper['actions'], obs_upper['phi_prob']], dim=-1)
@@ -158,7 +174,7 @@ class Trainer:
         for nid, agent in self.upper_agents.items():
             s = current_upper_state[nid]
             mf = mf_global[nid]
-            a_id = agent.choose_action(s, mf, self.epsilons[nid], self.zeta)
+            a_id = agent.choose_action(s, mf, self.epsilons[nid], self.zeta_upper)
             act_matrix[nid] = torch.tensor(to_binary(a_id, self.num_services), device=self.device)
         
         for nid in self.env.static_matrices["cloud_ids"]:
@@ -203,7 +219,7 @@ class Trainer:
             
             if not mask.any(): mask = torch.ones_like(mask)
 
-            a_id = self.lower_agents[tid].choose_action(s, mf_terminals[tid], self.lower_epsilons[tid], self.zeta, mask=mask)
+            a_id = self.lower_agents[tid].choose_action(s, mf_terminals[tid], self.lower_epsilons[tid], self.zeta_lower, mask=mask)
             
             node_indices[i] = a_id // self.max_models
             model_indices[i] = a_id % self.max_models
@@ -282,8 +298,34 @@ class Trainer:
         self.aggregator.add_upper(next_res, mf_loss=avg_mf_loss, state=sample_state)
 
     def update_rates(self, ep):
-        for nid in self.epsilons: self.epsilons[nid] = max(self.min_epsilon, self.epsilons[nid] * self.epsilon_decay)
-        for tid in self.lower_epsilons: self.lower_epsilons[tid] = max(self.min_epsilon, self.lower_epsilons[tid] * self.epsilon_decay)
+        # 1. Update Epsilons
+        for nid in self.epsilons: 
+            self.epsilons[nid] = max(self.min_epsilon, self.epsilons[nid] * self.epsilon_decay)
+        for tid in self.lower_epsilons: 
+            self.lower_epsilons[tid] = max(self.min_epsilon, self.lower_epsilons[tid] * self.epsilon_decay)
+            
+        # 2. Phased Zeta Annealing
+        num_eps = self.config.hyper_neural.get('NUMOF_TRAIN_EP', 3000)
+        
+        # Lower Zeta: Increases from 20k to 50k samples
+        fraction = min(1.0, ep / num_eps)
+        if self.total_lower_steps < 20000:
+            self.zeta_lower = self.zeta_initial
+        elif self.total_lower_steps < self.lower_stable_threshold:
+            # Fast increase while lower is stabilizing (20k to 50k)
+            bump_factor = min(1.0, (self.total_lower_steps - 20000) / (self.lower_stable_threshold - 20000))
+            target = self.zeta_initial + (self.zeta_max * 0.5 - self.zeta_initial) * bump_factor
+            self.zeta_lower = max(self.zeta_lower, target)
+        else:
+            # Slow increase afterwards
+            self.zeta_lower = self.zeta_initial + (self.zeta_max - self.zeta_initial) * fraction
+            
+        # Upper Zeta: Only increases AFTER lower is stable and upper has enough valid samples
+        if self.total_lower_steps >= self.lower_stable_threshold and self.total_upper_steps > 5000:
+            upper_fraction = min(1.0, (ep) / num_eps) # Simplify scaling
+            self.zeta_upper = self.zeta_initial + (self.zeta_max - self.zeta_initial) * upper_fraction
+        else:
+            self.zeta_upper = self.zeta_initial # Remains low (exploration mode)
 
 if __name__ == "__main__":
     Trainer().train()
