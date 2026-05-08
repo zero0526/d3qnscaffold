@@ -144,12 +144,19 @@ class MetricsAggregator:
         self.eps_failed += info.get("immediate_fails", 0) + info.get("expired_count", 0)
         self.last_remaining = info.get("remaining", 0)
 
-    def record_td_losses(self, upper_losses, lower_losses):
-        """Records TD losses at the end of an episode."""
-        if upper_losses:
-            self.episode_upper_td_losses.append(np.mean(upper_losses))
-        if lower_losses:
-            self.episode_lower_td_losses.append(np.mean(lower_losses))
+    def record_td_losses(self, upper_losses=None, lower_losses=None):
+        """Records TD losses at their respective timescales (e.g. per-slot for lower, per-frame for upper)."""
+        if upper_losses is not None:
+            if isinstance(upper_losses, list) and len(upper_losses) > 0:
+                self.episode_upper_td_losses.append(np.mean(upper_losses))
+            elif isinstance(upper_losses, (float, int)):
+                self.episode_upper_td_losses.append(float(upper_losses))
+                
+        if lower_losses is not None:
+            if isinstance(lower_losses, list) and len(lower_losses) > 0:
+                self.episode_lower_td_losses.append(np.mean(lower_losses))
+            elif isinstance(lower_losses, (float, int)):
+                self.episode_lower_td_losses.append(float(lower_losses))
 
     def store_history(self):
         """Saves episode averages to history and RESETS intra-episode data."""

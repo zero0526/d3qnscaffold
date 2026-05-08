@@ -102,43 +102,54 @@ class Trainer:
                     results = self.env.step_lower(t_idx, s_idx, batch_sizes, n_idx, m_idx, task_deadlines, tasks_min_accuracy)
                     self.store_lower_transitions(prev_lower_res, results, t_idx, s_idx, n_idx, m_idx)
                     prev_lower_res = results
+
+                    #     train lower
+                    lower_td_losses = []
+                    for agent in self.lower_agents.values():
+                        loss = agent.learn()
+                        if loss is not None:
+                            lower_td_losses.append(loss)
+                    if lower_td_losses:
+                        self.aggregator.record_td_losses(lower_losses=lower_td_losses)
                 else:
                     self.env.time_manager.tick()
 
                 if self.env.time_manager.is_new_frame():
                     res_upper = self.env.collect_upper_metrics()
                     next_upper_state = self.get_upper_state(res_upper)
-                    
+
                     is_ep_done = (slot == max_slots - 1)
                     # Pass upper metrics to aggregator
                     # We'll pass mf_loss in store_upper_transitions
                     self.store_upper_transitions(current_upper_state, next_upper_state, obs_upper, res_upper, u_acts_matrix, is_ep_done)
-                    
+
                     current_upper_state = next_upper_state
                     obs_upper = res_upper
+                    # train upper
+                    upper_td_losses = []
+                    for agent in self.upper_agents.values():
+                        loss = agent.learn()
+                        if loss is not None:
+                            upper_td_losses.append(loss)
+                    if upper_td_losses:
+                        self.aggregator.record_td_losses(upper_losses=upper_td_losses)
 
+            # update ep and history
             self.update_rates(ep)
-            
-            # ---------------- LEARNING ----------------
-            upper_td_losses = []
-            lower_td_losses = []
-            
-            for agent in self.upper_agents.values():
-                loss = agent.learn()
-                if loss is not None:
-                    upper_td_losses.append(loss)
-                    
-            for agent in self.lower_agents.values():
-                loss = agent.learn()
-                if loss is not None:
-                    lower_td_losses.append(loss)
-            
-            self.aggregator.record_td_losses(upper_td_losses, lower_td_losses)
             self.aggregator.store_history()
             self.aggregator.report_episode(ep)
 
     def get_upper_state(self, obs_upper):
-        return torch.cat([obs_upper['actions'], obs_upper['phi_prob']], dim=-1)
+        state = torch.cat([obs_upper['actions'], obs_upper['phi_prob']], dim=-1)
+        
+        # Apply Normalization
+        norm_factors = self.config.normalization.get("upper_state", {}).get("features", {})
+        if norm_factors:
+            for idx, divisor in norm_factors.items():
+                idx_int = int(idx)
+                if idx_int < state.shape[-1]:
+                    state[..., idx_int] /= (divisor if divisor != 0 else 1.0)
+        return state
 
     def get_upper_actions(self, current_upper_state, obs_upper):
         act_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
@@ -178,6 +189,14 @@ class Trainer:
             
             s = torch.cat([s_task, obs_dict['backlog'][:, sid], obs_dict['cpu_alloc'][:, sid]])
             
+            # Apply Normalization
+            norm_factors = self.config.normalization.get("lower_state", {}).get("features", {})
+            if norm_factors:
+                for idx, divisor in norm_factors.items():
+                    idx_int = int(idx)
+                    if idx_int < s.shape[-1]:
+                        s[idx_int] /= (divisor if divisor != 0 else 1.0)
+            
             p_mask = placement_matrix[:, sid] > 0
             a_mask = model_accs[sid, :] >= tasks_min_accuracy[i]
             mask = torch.outer(p_mask.float(), a_mask.float()).flatten()
@@ -206,8 +225,21 @@ class Trainer:
             s = torch.cat([c_obs['task_reqs'][tid], c_obs['backlog'][:, sid], c_obs['cpu_alloc'][:, sid]])
             ns = torch.cat([n_obs['task_reqs'][tid], n_obs['backlog'][:, sid], n_obs['cpu_alloc'][:, sid]])
             
+            # Apply Normalization to States
+            norm_factors = self.config.normalization.get("lower_state", {}).get("features", {})
+            if norm_factors:
+                for idx, divisor in norm_factors.items():
+                    idx_int = int(idx)
+                    d = (divisor if divisor != 0 else 1.0)
+                    if idx_int < s.shape[-1]: s[idx_int] /= d
+                    if idx_int < ns.shape[-1]: ns[idx_int] /= d
+
+            # Normalize Reward
+            rew_divisor = self.config.normalization.get("rewards", {}).get("lower_divisor", 1.0)
+            normalized_reward = reward / (rew_divisor if rew_divisor != 0 else 1.0)
+            
             a_id = int(n_idx[i] * self.max_models + m_idx[i])
-            loss = self.lower_agents[tid].store_transition_train_mf(s, c_mf[tid], n_mf[tid], a_id, reward, ns, done)
+            loss = self.lower_agents[tid].store_transition_train_mf(s, c_mf[tid], n_mf[tid], a_id, normalized_reward, ns, done)
             if loss is not None:
                 mf_losses.append(loss)
         
@@ -234,7 +266,11 @@ class Trainer:
             a_id = 0
             for bit in a_binary: a_id = (a_id << 1) | bit
 
-            loss = self.upper_agents[nid].store_transition_train_mf(s, c_mf[nid], n_mf[nid], a_id, reward, ns, done)
+            # Normalize Reward
+            rew_divisor = self.config.normalization.get("rewards", {}).get("upper_divisor", 1.0)
+            normalized_reward = reward / (rew_divisor if rew_divisor != 0 else 1.0)
+
+            loss = self.upper_agents[nid].store_transition_train_mf(s, c_mf[nid], n_mf[nid], a_id, normalized_reward, ns, done)
             if loss is not None:
                 mf_losses.append(loss)
         

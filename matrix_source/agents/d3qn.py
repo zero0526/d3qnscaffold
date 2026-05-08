@@ -242,7 +242,7 @@ class D3QNAgent:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.node_id: int= node_id
         self.node_type = node_type
-        self.min_batch_size= buffer_min_size[0] if node_type!="terminal" else buffer_min_size[1]
+        self.min_batch_size= buffer_min_size[0] if node_type!="Terminal" else buffer_min_size[1]
         # Evaluation Network, Target Network
         input_dim = state_dim + action_dim
         self.eval_net = DuelingNetwork(state_dim,action_dim , u_action_dim, hidden_sizes).to(self.device)
@@ -277,8 +277,34 @@ class D3QNAgent:
             g.zero_()
         self.steps_in_round = 0
 
-    def choose_action(self, state, prev_mf, epsilon, zeta, mask=None, assigned_node_id=None):
-        # Convert inputs to tensors if they aren't already
+    def choose_action(self, state, prev_mf, epsilon, zeta, mask=None):
+        # 1. Handle Masking (convert to tensor early for both random and Q-based choice)
+        mask_tensor = None
+        if mask is not None:
+            if not torch.is_tensor(mask):
+                mask_tensor = torch.tensor(mask, device=self.device).float()
+            else:
+                mask_tensor = mask.detach().to(self.device).float()
+            mask_tensor = mask_tensor.view(-1) # Flatten for easy indexing
+
+        # 2. Cold-Start Logic: Use Random policy when memory is sparse
+        if len(self.memory)==self.min_batch_size:
+            print("Memory collect enough change to train " + str(self.min_batch_size))
+        if len(self.memory) < self.min_batch_size:
+            if mask_tensor is not None:
+                # Pick a random action from the set of unmasked (valid) actions
+                # mask_tensor == 1 indicates valid, 0 indicates invalid
+                valid_indices = torch.where(mask_tensor > 0.5)[0]
+                if len(valid_indices) > 0:
+                    action_idx = valid_indices[torch.randint(0, len(valid_indices), (1,))].item()
+                else:
+                    # Fallback if everything is masked (should not happen in valid env)
+                    action_idx = torch.randint(0, self.u_action_dim, (1,)).item()
+            else:
+                action_idx = torch.randint(0, self.u_action_dim, (1,)).item()
+            return int(action_idx)
+
+        # 3. Standard D3QN Policy (Q-values + Boltzmann + Masking)
         if not torch.is_tensor(state):
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         else:
@@ -296,21 +322,14 @@ class D3QNAgent:
             # Predict Q-values
             q_values = self.eval_net(state_tensor, pred_mf)
 
-            # Apply masking mechanism (Tensor-based)
-            if mask is not None:
-                if not torch.is_tensor(mask):
-                    mask_tensor = torch.tensor(mask, device=self.device).float().unsqueeze(0)
-                else:
-                    mask_tensor = mask.detach().to(self.device).float().unsqueeze(0)
-                
-                # Apply large penalty to masked actions (-1e10 for numerical stability with exp)
-                q_values = q_values + (mask_tensor - 1.0) * 1e10
+            # Apply masking penalty
+            if mask_tensor is not None:
+                q_values = q_values + (mask_tensor.unsqueeze(0) - 1.0) * 1e10
             
             if self.exclude_zero and self.u_action_dim > 1:
                 q_values[:, 0] -= 1e10
             
             # Boltzmann Selection (Softmax with temperature parameter zeta)
-            # Use pure torch for sampling (multinomial) to stay on device
             scaled_q = q_values * zeta
             probs = torch.softmax(scaled_q, dim=1)
             
@@ -388,12 +407,12 @@ class D3QNAgent:
         loss.backward()
         
         # SCAFFOLD Gradient Correction ONLY on Base Params
-        with torch.no_grad():
-            for p, g_sum, cp_i, cp_edge in zip(self.eval_net.get_base_params(), self.grad_sum, self.c_i, self.c_edge):
-                if p.grad is not None:
-                    raw_g = p.grad.data.clone()
-                    p.grad.data = raw_g - cp_i + cp_edge
-                    g_sum += raw_g
+        # with torch.no_grad():
+        #     for p, g_sum, cp_i, cp_edge in zip(self.eval_net.get_base_params(), self.grad_sum, self.c_i, self.c_edge):
+        #         if p.grad is not None:
+        #             raw_g = p.grad.data.clone()
+        #             p.grad.data = raw_g - cp_i + cp_edge
+        #             g_sum += raw_g
 
         torch.nn.utils.clip_grad_norm_(self.eval_net.parameters(), max_norm=1.0)
         self.steps_in_round += 1
