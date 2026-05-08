@@ -3,8 +3,6 @@ import matplotlib.pyplot as plt
 from collections import defaultdict, deque
 import os
 import logging
-from configs.configs import cfg
-
 from matrix_source.configs.configs import cfg
 
 class MetricsAggregator:
@@ -50,11 +48,8 @@ class MetricsAggregator:
         self.episode_remaining_tasks = []
         
         # Info metrics
-        self.episode_f1 = []
         self.episode_energy = []
         self.episode_violations = [] # Added for clarity
-        self.episode_virtual_delay = []
-        self.episode_realized_delay = []
         self.episode_success_qos = []
         self.episode_violate_qos = []
 
@@ -72,9 +67,6 @@ class MetricsAggregator:
         # State Tracking for Normalization Analysis
         self.episode_upper_states = []
         self.episode_lower_states = []
-
-        # Per-node per-service delays (realized)
-        self.episode_node_service_delays = defaultdict(lambda: defaultdict(list))
         
         # Offloading flow matrix: [SourceNode][TargetNode] -> count
         self.episode_offloading_matrix = defaultdict(lambda: defaultdict(int))
@@ -177,20 +169,6 @@ class MetricsAggregator:
             self.plot_history(ep=self.episode_count)
             self.plot_state_distributions(ep=self.episode_count)
 
-        # Auto-reset for next episode
-        # Note: We reset AFTER report_episode is called usually,
-        # but store_history is called FIRST in train.py.
-        # So we should probably NOT reset here if report_episode needs the data.
-        # However, report_episode in this class uses self.history which is NOT reset.
-        # But per-node delays ARE in episode_node_service_delays.
-        # I'll move reset_episode() to the end of report_episode or make report_episode use history.
-        # Actually, let's store the node delays in history too if we want them persistent.
-        # For now, I'll let train.py call report_episode then store_history maybe?
-        # No, train.py calls store_history then report_episode.
-        # I'll keep the episode data until reset_episode is explicitly called or at start of next store cycle.
-        # Let's just NOT reset here, and instead reset at the start of add_upper if it's a new episode.
-        # Or even better, reset at the end of report_episode.
-
     def report_episode(self, ep, success_counts=None, failure_counts=None):
         """Prints a summary of the current episode."""
         upper_reward = np.mean(self.episode_upper_rewards) if self.episode_upper_rewards else 0
@@ -212,12 +190,6 @@ class MetricsAggregator:
             self.log("\n--- Input State Statistics (Mean ± Std) ---")
             self._print_state_stats("Upper Agents", self.episode_upper_states)
             self._print_state_stats("Lower Agents", self.episode_lower_states)
-
-        self.log("\n--- Average Delay per Node and Service ---")
-        if not self.episode_node_service_delays:
-            self.log("No delay data recorded for this episode.")
-        else:
-            self._print_per_node_table(self.episode_node_service_delays, is_delay=True)
 
         if success_counts:
             self.log("\n--- Successful Tasks count per Node and Service ---")
@@ -338,11 +310,11 @@ class MetricsAggregator:
         episodes = range(1, len(self.history["total_reward"]) + 1)
         window = 10 # Window for smoothing
         
-        plt.figure(figsize=(24, 12))
+        plt.figure(figsize=(18, 10))
         plt.suptitle(f"Model Evolution Over Episodes (up to {len(episodes)})", fontsize=20)
         
         # Plot 1: Rewards
-        plt.subplot(2, 4, 1)
+        plt.subplot(2, 3, 1)
         plt.plot(episodes, self.history["total_reward"], alpha=0.3, color='blue', label="Raw Total")
         if len(episodes) >= window:
             ma = self._moving_average(self.history["total_reward"], window)
@@ -351,17 +323,8 @@ class MetricsAggregator:
         plt.xlabel("Episode")
         plt.legend()
         
-        # Plot 2: F1 Score
-        plt.subplot(2, 4, 2)
-        plt.plot(episodes, self.history["avg_f1"], alpha=0.3, color='green')
-        if len(episodes) >= window:
-            ma = self._moving_average(self.history["avg_f1"], window)
-            plt.plot(range(window, len(self.history["avg_f1"]) + 1), ma, color='green', label=f"MA-{window}")
-        plt.title("F1 Score Improvement")
-        plt.xlabel("Episode")
-        
-        # Plot 3: Energy
-        plt.subplot(2, 4, 3)
+        # Plot 2: Energy
+        plt.subplot(2, 3, 2)
         plt.plot(episodes, self.history["total_energy"], alpha=0.3, color='orange')
         if len(episodes) >= window:
             ma = self._moving_average(self.history["total_energy"], window)
@@ -369,18 +332,8 @@ class MetricsAggregator:
         plt.title("Energy Consumption Trend")
         plt.xlabel("Episode")
         
-        # Plot 4: Delays
-        plt.subplot(2, 4, 4)
-        plt.plot(episodes, self.history["avg_realized_delay"], alpha=0.3, color='red', label="Realized")
-        if len(episodes) >= window:
-            ma = self._moving_average(self.history["avg_realized_delay"], window)
-            plt.plot(range(window, len(self.history["avg_realized_delay"]) + 1), ma, color='red', label=f"MA-{window}")
-        plt.title("Delay Evolution")
-        plt.xlabel("Episode")
-        plt.legend()
-        
-        # Plot 5: QoS Success Rate
-        plt.subplot(2, 4, 5)
+        # Plot 3: QoS Success Rate
+        plt.subplot(2, 3, 3)
         plt.plot(episodes, self.history["qos_success_rate"], alpha=0.3, color='purple')
         if len(episodes) >= window:
             ma = self._moving_average(self.history["qos_success_rate"], window)
@@ -388,39 +341,43 @@ class MetricsAggregator:
         plt.ylim(0, 1.05)
         plt.title("QoS Success Rate")
         plt.xlabel("Episode")
-
-        # Plot 6: Remaining Tasks
-        plt.subplot(2, 4, 6)
+ 
+        # Plot 4: Remaining Tasks
+        plt.subplot(2, 3, 4)
         plt.plot(episodes, self.history["avg_remaining_tasks"], alpha=0.3, color='brown')
         if len(episodes) >= window:
             ma = self._moving_average(self.history["avg_remaining_tasks"], window)
             plt.plot(range(window, len(self.history["avg_remaining_tasks"]) + 1), ma, color='brown')
         plt.title("Task Clearing Efficiency")
         plt.xlabel("Episode")
-
-        # Plot 7: MF Training Losses
-        plt.subplot(2, 4, 7)
+ 
+        # Plot 5: MF Training Losses
+        plt.subplot(2, 3, 5)
         plt.plot(episodes, self.history["avg_upper_mf_loss"], alpha=0.3, color='cyan', label="Upper")
         plt.plot(episodes, self.history["avg_lower_mf_loss"], alpha=0.3, color='magenta', label="Lower")
         if len(episodes) >= window:
-            ma_u = self._moving_average(self.history["avg_upper_mf_loss"], window)
-            ma_l = self._moving_average(self.history["avg_lower_mf_loss"], window)
-            plt.plot(range(window, len(self.history["avg_upper_mf_loss"]) + 1), ma_u, color='cyan')
-            plt.plot(range(window, len(self.history["avg_lower_mf_loss"]) + 1), ma_l, color='magenta')
+            if len(self.history["avg_upper_mf_loss"]) >= window:
+                ma_u = self._moving_average(self.history["avg_upper_mf_loss"], window)
+                plt.plot(range(window, len(self.history["avg_upper_mf_loss"]) + 1), ma_u, color='cyan')
+            if len(self.history["avg_lower_mf_loss"]) >= window:
+                ma_l = self._moving_average(self.history["avg_lower_mf_loss"], window)
+                plt.plot(range(window, len(self.history["avg_lower_mf_loss"]) + 1), ma_l, color='magenta')
         plt.yscale('log')
         plt.title("Mean Field Loss (Log)")
         plt.xlabel("Episode")
         plt.legend()
-
-        # Plot 8: TD Training Losses (Q-Network)
-        plt.subplot(2, 4, 8)
+ 
+        # Plot 6: TD Training Losses (Q-Network)
+        plt.subplot(2, 3, 6)
         plt.plot(episodes, self.history["avg_upper_td_loss"], alpha=0.3, color='teal', label="Upper")
         plt.plot(episodes, self.history["avg_lower_td_loss"], alpha=0.3, color='olive', label="Lower")
         if len(episodes) >= window:
-            ma_u = self._moving_average(self.history["avg_upper_td_loss"], window)
-            ma_l = self._moving_average(self.history["avg_lower_td_loss"], window)
-            plt.plot(range(window, len(self.history["avg_upper_td_loss"]) + 1), ma_u, color='teal')
-            plt.plot(range(window, len(self.history["avg_lower_td_loss"]) + 1), ma_l, color='olive')
+            if len(self.history["avg_upper_td_loss"]) >= window:
+                ma_u = self._moving_average(self.history["avg_upper_td_loss"], window)
+                plt.plot(range(window, len(self.history["avg_upper_td_loss"]) + 1), ma_u, color='teal')
+            if len(self.history["avg_lower_td_loss"]) >= window:
+                ma_l = self._moving_average(self.history["avg_lower_td_loss"], window)
+                plt.plot(range(window, len(self.history["avg_lower_td_loss"]) + 1), ma_l, color='olive')
         plt.yscale('log')
         plt.title("TD Loss (Log)")
         plt.xlabel("Episode")
