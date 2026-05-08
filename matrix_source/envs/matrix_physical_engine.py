@@ -69,14 +69,18 @@ class MatrixPhysicalEngine:
             max_iter=config.admm_max_iter,
             tol=config.admm_tol
         )
-        self.immediate_fails = 0
+        self.immediate_fails = torch.zeros((self.num_nodes, self.num_services), device=self.device)
+        self.arrival_counts_step = torch.zeros((self.num_nodes, self.num_services), device=self.device)
         self.placement_violations = 0
+        self.current_num_tasks = 0
 
     def reset(self):
         self.backlog_queue.zero_()
         self.backlog_counts.zero_()
         self.deadline_queue.zero_()
         self.q_deadline_queue.zero_()
+        self.immediate_fails.zero_()
+        self.arrival_counts_step.zero_()
         self.prev_placement_matrix.zero_()
         self.newly_placed_mask.zero_()
         self.reward_global_accumulator = 0.0
@@ -84,6 +88,7 @@ class MatrixPhysicalEngine:
         self.prev_node_indices.zero_()
         self.prev_model_indices.zero_()
         self.current_task_reqs.zero_()
+        self.current_num_tasks = 0
         
         obs_upper = {
             "actions": self.placement_matrix.clone(),
@@ -106,6 +111,9 @@ class MatrixPhysicalEngine:
         }
         self.phi_accumulator.zero_()
         self.reward_global_accumulator = 0.0
+        self.current_num_tasks = 0
+        self.immediate_fails.zero_()
+        self.arrival_counts_step.zero_()
         return res
 
     def get_lower_obs(self):
@@ -161,11 +169,18 @@ class MatrixPhysicalEngine:
         num_tasks = len(svc_indices)
         node_arrival_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
         f_min_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
-        self.immediate_fails = 0
+        self.immediate_fails.zero_()
+        self.arrival_counts_step.zero_()
+        self.arrival_counts_step.index_put_((node_indices, svc_indices), torch.ones_like(svc_indices, dtype=torch.float), accumulate=True)
         self.current_task_reqs.zero_()
 
         if num_tasks == 0:
+            self.current_num_tasks = 0
             return node_arrival_matrix, 0.0, torch.tensor([], device=self.device), f_min_matrix
+
+        self.current_num_tasks = num_tasks
+        
+        # Transmission metrics
 
         # Transmission metrics
         src_node_indices = torch.argmax(self.terminal_to_node_map[terminal_indices], dim=1)
@@ -198,7 +213,10 @@ class MatrixPhysicalEngine:
         t_q_rem = t_rem_raw - task_max_queue
         
         valid_mask = t_rem_raw >= 1e-4
-        self.immediate_fails = int((~valid_mask).sum().item())
+        # Initialize immediate fails with tasks failing initial checks
+        fails_idx = (~valid_mask)
+        if fails_idx.any():
+            self.immediate_fails.index_put_((node_indices[fails_idx], svc_indices[fails_idx]), torch.ones_like(svc_indices[fails_idx], dtype=torch.float), accumulate=True)
         
         if valid_mask.any():
             vn = node_indices[valid_mask]
@@ -225,9 +243,9 @@ class MatrixPhysicalEngine:
                         self.backlog_counts[p_node, p_svc] += 1
                         f_min_matrix[p_node, p_svc] = max(f_min_matrix[p_node, p_svc], p_f_min)
                     else:
-                        self.immediate_fails += 1
+                        self.immediate_fails[p_node, p_svc] += 1
                 else:
-                    self.immediate_fails += 1
+                    self.immediate_fails[p_node, p_svc] += 1
             
             node_arrival_matrix.index_put_((vn, vs), vw, accumulate=True)
             
@@ -243,20 +261,28 @@ class MatrixPhysicalEngine:
 
     def execute_and_collect_metrics(self, node_arrival_matrix, trans_energy_total, cold_delays):
         current_backlog_total = self.backlog_queue.sum(dim=-1)
+        count_before = self.backlog_counts.clone()
         prev_cpu_alloc = self.cpu_alloc_matrix.clone()
         
         self.backlog_queue, actual_processed, in_slot_violation_mask = ops.deplete_float_queue(
             self.backlog_queue, self.deadline_queue, self.cpu_alloc_matrix, self.slot_duration
         )
         
-        self.backlog_queue, self.deadline_queue, self.q_deadline_queue, expired_count = ops.age_and_clean_dual_queue(
+        self.backlog_queue, self.deadline_queue, self.q_deadline_queue, expired_counts_tensor = ops.age_and_clean_dual_queue(
             self.backlog_queue, self.deadline_queue, self.q_deadline_queue, in_slot_violation_mask, self.slot_duration
         )
         
         # Update counts
         self.backlog_counts = (self.backlog_queue > 1e-6).sum(dim=-1)
         
-        num_violations = int(expired_count) + self.immediate_fails
+        violate_step_tensor = expired_counts_tensor + self.immediate_fails
+        num_violations = int(violate_step_tensor.sum().item())
+        
+        # Success count calculation: before + arrivals - current - failed
+        # Careful: arrivals_counts_step only includes those that ENTERED or were IMMEDIATELY FAILED.
+        # So count_before + arrivals_counts_step is the total tasks we dealt with.
+        success_qos_tensor = (count_before + self.arrival_counts_step - self.backlog_counts - violate_step_tensor).clamp(min=0)
+        
         total_drift = ops.calculate_lyapunov_drift(current_backlog_total, node_arrival_matrix, self.cpu_alloc_matrix * self.slot_duration)
         comp_energy = ops.compute_batch_energy(
             self.cpu_alloc_matrix, actual_processed, self.energy_coef, 
@@ -274,11 +300,20 @@ class MatrixPhysicalEngine:
             "backlog": self.backlog_queue.sum(dim=-1).clone(),
             "cpu_alloc": self.cpu_alloc_matrix.clone()
         }
+        info = {
+            "num_tasks": self.current_num_tasks,
+            "immediate_fails": int(self.immediate_fails.sum().item()),
+            "expired_count": int(violate_step_tensor.sum().item() - self.immediate_fails.sum().item()),
+            "remaining": int(self.backlog_counts.sum().item()),
+            "success_qos": {i: success_qos_tensor[i].cpu().numpy() for i in range(self.num_nodes)},
+            "violate_qos": {i: violate_step_tensor[i].cpu().numpy() for i in range(self.num_nodes)}
+        }
         return {
             "reward": reward,
             "energy": total_energy,
             "violations": num_violations,
             "obs": obs,
+            "info": info,
             "mean_field": self._calc_terminal_mean_field(),
             "prev_actions": {
                 "node_selection": self.prev_node_indices.clone(),

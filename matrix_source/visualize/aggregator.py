@@ -26,6 +26,11 @@ class MetricsAggregator:
         self.episode_success_qos = []
         self.episode_violate_qos = []
 
+        # Task Statistics Counters
+        self.eps_assigned = 0
+        self.eps_failed = 0
+        self.last_remaining = 0
+
         # Training Losses
         self.episode_upper_mf_losses = []
         self.episode_lower_mf_losses = []
@@ -78,9 +83,9 @@ class MetricsAggregator:
         if f1_dist:
             self.episode_f1.append(sum(f1_dist.values()))
             
-        energy_dist = info.get("energy", {})
+        energy_dist = step_output.get("energy", {})
         if energy_dist:
-            self.episode_energy.append(sum(energy_dist.values()))
+            self.episode_energy.append(energy_dist)
 
         # Violations count
         violations = step_output.get("violations", 0)
@@ -106,6 +111,11 @@ class MetricsAggregator:
         violate_qos = info.get("violate_qos", {})
         if violate_qos:
             self.episode_violate_qos.append(sum(np.sum(v) for v in violate_qos.values()))
+            
+        # Accumulate task stats
+        self.eps_assigned += info.get("num_tasks", 0)
+        self.eps_failed += info.get("immediate_fails", 0) + info.get("expired_count", 0)
+        self.last_remaining = info.get("remaining", 0)
 
     def record_td_losses(self, upper_losses, lower_losses):
         """Records TD losses at the end of an episode."""
@@ -151,8 +161,8 @@ class MetricsAggregator:
         
         self.episode_count += 1
 
-        # Auto-plot every 100 episodes
-        if self.episode_count % 100 == 0:
+        # Auto-plot every 50 episodes
+        if self.episode_count % 50 == 0:
             self.plot_history(ep=self.episode_count)
             self.plot_state_distributions(ep=self.episode_count)
 
@@ -209,6 +219,28 @@ class MetricsAggregator:
         if self.episode_offloading_matrix:
             print("\n--- Offloading Traffic Matrix (Source -> Target) ---")
             self._print_traffic_matrix()
+
+        # Task Completion Summary
+        if self.eps_assigned > 0:
+            total_completed = self.eps_assigned - self.eps_failed - self.last_remaining
+            completion_rate = (total_completed / self.eps_assigned) * 100
+            
+            # QoS Success Rate from actual success/violation counts
+            success_total = np.sum(self.episode_success_qos) if self.episode_success_qos else 0
+            violate_total = np.sum(self.episode_violate_qos) if self.episode_violate_qos else 0
+            qos_rate = (success_total / (success_total + violate_total) * 100) if (success_total + violate_total) > 0 else 0
+
+            print("\n" + "="*50)
+            print("         EPISODE EXECUTION SUMMARY")
+            print("="*50)
+            print(f" Total Tasks Assigned   : {self.eps_assigned}")
+            print(f" Total Tasks Failed     : {self.eps_failed}")
+            print(f" Tasks Remaining (Queue): {self.last_remaining}")
+            print(f" Total Tasks Completed  : {total_completed}")
+            print("-" * 50)
+            print(f" Completion Rate (vs Assigned): {completion_rate:.2f}%")
+            print(f" QoS Success Rate (vs Proc):   {qos_rate:.2f}%")
+            print("="*50 + "\n")
 
         print("---------------------------\n")
 

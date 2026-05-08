@@ -73,7 +73,7 @@ def age_and_clean_dual_queue(backlog, deadline, q_deadline, in_slot_violation_ma
     # Vi phạm cũ (từ bước deplete) + Vi phạm mới (do vừa trừ slot_duration xong bị âm)
     # Lưu ý: backlog > 0 đảm bảo ta không đếm lại các task đã xử lý xong
     total_violation_mask = in_slot_violation_mask | ((deadline <= 0) & (backlog > 0))
-    violation_count = total_violation_mask.sum().item()
+    violation_counts = total_violation_mask.sum(dim=-1) # (M, S)
     
     # 3. Xóa Task vi phạm
     backlog[total_violation_mask] = 0
@@ -86,7 +86,7 @@ def age_and_clean_dual_queue(backlog, deadline, q_deadline, in_slot_violation_ma
     deadline = torch.gather(deadline, dim=-1, index=indices)
     q_deadline = torch.gather(q_deadline, dim=-1, index=indices)
     
-    return backlog, deadline, q_deadline, violation_count
+    return backlog, deadline, q_deadline, violation_counts
 
 # ==========================================
 # 3. LYAPUNOV & ENERGY

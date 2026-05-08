@@ -75,7 +75,7 @@ def init_static_matrices(config, device="cpu"):
     # 6. Max Queue Delay Matrix
     max_queue_delay = torch.zeros((num_comp_nodes, len(config.services)), device=device)
     delay_data = config.delay_queue_max
-    for node_id, delays in delay_data.get('nodes', {}).items():
+    for node_id, delays in delay_data.items():
         if node_id in comp_node_id_to_idx:
             max_queue_delay[comp_node_id_to_idx[node_id]] = torch.tensor(delays).float()
 
