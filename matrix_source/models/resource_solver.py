@@ -42,7 +42,7 @@ class KKTSolverADMM:
 
         return torch.clamp(v - chosen_theta, min=0.0)
 
-    def solve(self, G, Z, f_min, f_max):
+    def solve(self, G, Z, f_min, f_max, debug=False):
         """
         Vectorized ADMM solver for all nodes simultaneously.
         G: (M, S) - Backlog weights
@@ -65,137 +65,37 @@ class KKTSolverADMM:
 
         # Pre-calculate denominator for f-update
         denom = rho + 2 * Z
+        
+        checkpoints = [15, 30, 50, 70, 100] if debug else []
+        max_it = 100 if debug else self.max_iter
 
-        for _ in range(self.max_iter):
+        for i in range(max_it):
             z_prev = z.clone()
 
-            # 1. f-update
+            # 1. f-update (KKT of local subproblem)
             f = (G + rho * (z - u)) / denom
 
-            # 2. z-update: Simplex projection
+            # 2. z-update: Simplex projection (Consensus and constraints)
             z_proj = self.project_simplex(f + u - f_min, budgets)
             z = torch.clamp(z_proj + f_min, max=f_max)
 
-            # 3. u-update: Dual update
+            # 3. u-update: Dual variable (Lagrange multipliers)
             u = u + (f - z)
 
-            # 4. Residual check for convergence
-            res_r = torch.norm(f - z, dim=1)
-            res_s = torch.norm(rho * (z - z_prev), dim=1)
+            # 4. Residual and Objective Tracking
+            res_r = torch.norm(f - z, dim=1).max().item()
+            res_s = torch.norm(rho * (z - z_prev), dim=1).max().item()
+            
+            if debug and (i + 1 in checkpoints):
+                # Calculate Current Objective: Maximize sum(G*z - Z*z^2)
+                obj_val = (G * z - Z * (z**2)).sum().item()
+                print(f"  [Checkpoint {i+1:3d}] Objective: {obj_val:12.4f} | Prim Res: {res_r:.2e} | Dual Res: {res_s:.2e}")
 
-            if res_r.max() < self.tol and res_s.max() < self.tol:
+            if not debug and (res_r < self.tol and res_s < self.tol):
                 break
+        
+        if debug:
+            final_obj = (G * z - Z * (z**2)).sum().item()
+            print(f"ADMM Final (Iter {i+1}): Objective: {final_obj:12.4f}")
 
         return z
-# import torch
-#
-#
-# class KKTSolverADMM:
-#     def __init__(self, f_max_node, rho=1.0, max_iter=100, tol=1e-4):
-#         self.f_max_node = f_max_node
-#         self.rho_base = rho
-#         self.max_iter = max_iter
-#         self.tol = tol
-#
-#     def project_simplex(self, v: torch.Tensor, budgets: torch.Tensor) -> torch.Tensor:
-#         """
-#         Project rows of v onto:
-#             x >= 0, sum(x) <= budget
-#         v: (B, S)
-#         budgets: (B, 1)
-#         """
-#         v = torch.clamp(v, min=0.0)
-#         row_sum = v.sum(dim=1, keepdim=True)
-#
-#         # Rows already feasible: return directly
-#         feasible = row_sum <= budgets
-#         if feasible.all():
-#             return v
-#
-#         out = v.clone()
-#         idx = (~feasible).squeeze(1)
-#         v_bad = v[idx]
-#         b_bad = budgets[idx]
-#
-#         # Duchi projection onto simplex / L1 ball
-#         u, _ = torch.sort(v_bad, dim=1, descending=True)
-#         cssv = torch.cumsum(u, dim=1) - b_bad
-#
-#         j = torch.arange(
-#             1,
-#             u.shape[1] + 1,
-#             device=v.device,
-#             dtype=v.dtype
-#         ).view(1, -1)
-#
-#         cond = u - cssv / j > 0
-#
-#         rho = cond.sum(dim=1).sub(1).clamp(min=0)
-#
-#         theta_num = cssv.gather(1, rho.unsqueeze(1))
-#
-#         theta_den = (rho + 1).to(v.dtype).unsqueeze(1)
-#
-#         theta = theta_num / theta_den
-#         out[idx] = torch.clamp(v_bad - theta, min=0.0)
-#
-#         return out
-#
-#     @torch.no_grad()
-#     def solve(self, G, Z, f_min, f_max):
-#         """
-#         G: (M, S)
-#         Z: (M, S)
-#         f_min, f_max: (M, S)
-#         """
-#         M, S = G.shape
-#         device = G.device
-#         dtype = G.dtype
-#
-#         f = torch.empty_like(G)
-#         z = torch.zeros_like(G)
-#         u = torch.zeros_like(G)
-#
-#         z_prev = torch.empty_like(G)
-#         tmp = torch.empty_like(G)
-#
-#         rho = torch.full((M, 1), self.rho_base, device=device, dtype=dtype)
-#         denom = rho + 2.0 * Z
-#
-#         budgets = (self.f_max_node - f_min.sum(dim=1, keepdim=True)).clamp_min(0.0)
-#
-#         tol_sq = self.tol * self.tol
-#         rho_sq = rho.square()
-#
-#         for _ in range(self.max_iter):
-#             z_prev.copy_(z)
-#
-#             # f-update
-#             tmp.copy_(z)
-#             tmp.sub_(u)
-#             tmp.mul_(rho)
-#             tmp.add_(G)
-#             f.copy_(tmp)
-#             f.div_(denom)
-#
-#             # z-update
-#             tmp.copy_(f)
-#             tmp.add_(u)
-#             tmp.sub_(f_min)
-#
-#             z_proj = self.project_simplex(tmp, budgets)
-#             z.copy_(z_proj)
-#             z.add_(f_min)
-#             z.clamp_(max=f_max)
-#
-#             # dual update
-#             u.add_(f - z)
-#
-#             # residuals (squared norm, no sqrt)
-#             res_r = (f - z).square().sum(dim=1)
-#             res_s = ((z - z_prev) * rho_sq.sqrt()).square().sum(dim=1)
-#
-#             if res_r.max() <= tol_sq and res_s.max() <= tol_sq:
-#                 break
-#
-#         return z

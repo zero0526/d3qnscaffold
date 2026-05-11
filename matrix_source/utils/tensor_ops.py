@@ -20,7 +20,8 @@ def compute_transmission_metrics(src_nodes, dst_nodes, delay_matrix, data_sizes,
 
 def deplete_float_queue(backlog, deadline, cpu_alloc, slot_duration):
     """
-    Xử lý hàng đợi với định thời gian chính xác (Precise Timing).
+    Xử lý hàng đợi các tasks thành công trong timeslot và thât bại trong timeslot.
+    trả về backlog mới đã clean success và fail, khối lượng công việc thực sự đã triển khai, số tasks fail
     backlog: (M, S, K)
     deadline: (M, S, K)
     cpu_alloc: (M, S) - Tần số CPU cấp cho cặp (Node, Service)
@@ -61,7 +62,7 @@ def deplete_float_queue(backlog, deadline, cpu_alloc, slot_duration):
     
     return new_backlog, actual_processed_total, violation_mask
 
-def age_and_clean_dual_queue(backlog, deadline, q_deadline, in_slot_violation_mask, slot_duration):
+def age_and_clean_dual_queue(backlog, deadline, aux_queue, in_slot_violation_mask, slot_duration):
     """
     Trừ deadline và dọn dẹp hàng đợi.
     in_slot_violation_mask: Mask các task đã fail ngay trong bước deplete
@@ -75,18 +76,26 @@ def age_and_clean_dual_queue(backlog, deadline, q_deadline, in_slot_violation_ma
     total_violation_mask = in_slot_violation_mask | ((deadline <= 0) & (backlog > 0))
     violation_counts = total_violation_mask.sum(dim=-1) # (M, S)
     
-    # 3. Xóa Task vi phạm
+    # 3. Xóa Task vi phạm và làm sạch dữ liệu cũ (Xử lý cả task đã xong từ bước deplete)
     backlog[total_violation_mask] = 0
     
+    empty_mask = (backlog <= 1e-7)
+    backlog[empty_mask] = 0
+    deadline[empty_mask] = 0
+    if aux_queue is not None:
+        aux_queue[empty_mask] = 0
+
     # 4. DỒN HÀNG (Compaction)
     mask = (backlog > 0).float()
     _, indices = torch.sort(mask, dim=-1, descending=True, stable=True)
     
     backlog = torch.gather(backlog, dim=-1, index=indices)
     deadline = torch.gather(deadline, dim=-1, index=indices)
-    q_deadline = torch.gather(q_deadline, dim=-1, index=indices)
+    if aux_queue is not None:
+        aux_queue = torch.gather(aux_queue, dim=-1, index=indices)
     
-    return backlog, deadline, q_deadline, violation_counts
+    return backlog, deadline, aux_queue, violation_counts
+
 
 # ==========================================
 # 3. LYAPUNOV & ENERGY

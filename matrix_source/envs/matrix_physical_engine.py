@@ -44,7 +44,7 @@ class MatrixPhysicalEngine:
         self.backlog_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), device=self.device)
         self.backlog_counts = torch.zeros((self.num_nodes, self.num_services), dtype=torch.long, device=self.device)
         self.deadline_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), device=self.device)
-        self.q_deadline_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), device=self.device)
+        self.f_min_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), device=self.device)
         
         self.cpu_alloc_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
         self.placement_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
@@ -78,7 +78,7 @@ class MatrixPhysicalEngine:
         self.backlog_queue.zero_()
         self.backlog_counts.zero_()
         self.deadline_queue.zero_()
-        self.q_deadline_queue.zero_()
+        self.f_min_queue.zero_()
         self.immediate_fails.zero_()
         self.arrival_counts_step.zero_()
         self.prev_placement_matrix.zero_()
@@ -234,14 +234,13 @@ class MatrixPhysicalEngine:
                 p_f_min = p_work / (p_q_time + 1e-9)
                 
                 # Check hardware limits
-                if p_f_min <= (node_max_f[p_node] * self.slot_duration):
+                if p_f_min <= node_max_f[p_node]:
                     ptr = int(self.backlog_counts[p_node, p_svc].item())
                     if ptr < self.max_K:
                         self.backlog_queue[p_node, p_svc, ptr] = p_work
                         self.deadline_queue[p_node, p_svc, ptr] = p_time
-                        self.q_deadline_queue[p_node, p_svc, ptr] = p_q_time
+                        self.f_min_queue[p_node, p_svc, ptr] = p_f_min
                         self.backlog_counts[p_node, p_svc] += 1
-                        f_min_matrix[p_node, p_svc] = max(f_min_matrix[p_node, p_svc], p_f_min)
                     else:
                         self.immediate_fails[p_node, p_svc] += 1
                 else:
@@ -249,6 +248,7 @@ class MatrixPhysicalEngine:
             
             node_arrival_matrix.index_put_((vn, vs), vw, accumulate=True)
             
+        f_min_matrix = self.f_min_queue.max(dim=-1)[0]
         return node_arrival_matrix, trans_energy_total, cold_delays, f_min_matrix
 
     def optimize_allocation(self, node_arrival_matrix, f_min_matrix):
@@ -257,7 +257,7 @@ class MatrixPhysicalEngine:
         Z = self.lypa_coef * self.energy_coef * self.placement_matrix * node_arrival_matrix
         f_max = (self.resource_specs[:, 0:1] * self.placement_matrix).to(self.device)
         f_min = f_min_matrix.clamp(max=f_max)
-        self.cpu_alloc_matrix = self.solver.solve(G, Z, f_min, f_max)
+        self.cpu_alloc_matrix = self.solver.solve(G, Z, f_min, f_max, debug=True)
 
     def execute_and_collect_metrics(self, node_arrival_matrix, trans_energy_total, cold_delays):
         current_backlog_total = self.backlog_queue.sum(dim=-1)
@@ -268,8 +268,8 @@ class MatrixPhysicalEngine:
             self.backlog_queue, self.deadline_queue, self.cpu_alloc_matrix, self.slot_duration
         )
         
-        self.backlog_queue, self.deadline_queue, self.q_deadline_queue, expired_counts_tensor = ops.age_and_clean_dual_queue(
-            self.backlog_queue, self.deadline_queue, self.q_deadline_queue, in_slot_violation_mask, self.slot_duration
+        self.backlog_queue, self.deadline_queue, self.f_min_queue, expired_counts_tensor = ops.age_and_clean_dual_queue(
+            self.backlog_queue, self.deadline_queue, self.f_min_queue, in_slot_violation_mask, self.slot_duration
         )
         
         # Update counts
