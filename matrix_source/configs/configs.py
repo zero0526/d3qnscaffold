@@ -49,6 +49,8 @@ class BaseConfig(BaseSettings):
     results: str= Field(default=str(PROJECT_ROOT / "data" / "results"))
     node_type_path: str= Field(default=str(PROJECT_ROOT / "data" / "distribute_node" / "nodes.yaml"))
     node_config_path: str= Field(default=str(PROJECT_ROOT / "data"  /"distribute_node" / "node_spec.yaml"))
+
+    # training param
     neural_cfg_path: str= Field(default=str(PROJECT_ROOT / "data" / "training_cfg.yaml"))
     service_path: str= Field(default=str(PROJECT_ROOT / "data" / "ai_services.yaml"))
     delay_path: str = Field(default=str(PROJECT_ROOT / "data" / "delay.yaml"))

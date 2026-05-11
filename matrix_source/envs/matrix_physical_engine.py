@@ -229,22 +229,64 @@ class MatrixPhysicalEngine:
             self.phi_accumulator.index_put_((vn, vs), vb, accumulate=True)
             node_max_f = self.resource_specs[:, 0]
             
-            # Explicitly name loop variables to avoid any shadowing
-            for p_node, p_svc, p_work, p_time, p_q_time in zip(vn, vs, vw, vt, vq):
-                p_f_min = p_work / (p_q_time + 1e-9)
+            p_f_min_all = vw / (vq + 1e-9)
+            hw_mask = p_f_min_all <= node_max_f[vn]
+            
+            # 1. Các task không đủ phần cứng
+            fail_hw_mask = ~hw_mask
+            if fail_hw_mask.any():
+                self.immediate_fails.index_put_(
+                    (vn[fail_hw_mask], vs[fail_hw_mask]), 
+                    torch.ones_like(vs[fail_hw_mask], dtype=torch.float), 
+                    accumulate=True
+                )
+
+            # 2. Xử lý các task hợp lệ bằng Batching trên CPU (Bỏ qua sync GPU chậm)
+            valid_hw_mask = hw_mask
+            if valid_hw_mask.any():
+                # Chuyển dữ liệu sang List của Python (chạy trên RAM)
+                sv_n = vn[valid_hw_mask].tolist()
+                sv_s = vs[valid_hw_mask].tolist()
+                sv_w = vw[valid_hw_mask].tolist()
+                sv_t = vt[valid_hw_mask].tolist()
+                sv_fmin = p_f_min_all[valid_hw_mask].tolist()
                 
-                # Check hardware limits
-                if p_f_min <= node_max_f[p_node]:
-                    ptr = int(self.backlog_counts[p_node, p_svc].item())
+                # Fetch pointers về RAM 1 lần duy nhất thay vì item() mỗi vòng
+                local_counts = self.backlog_counts.cpu().numpy()
+                
+                batch_n, batch_s, batch_k = [], [], []
+                batch_w, batch_t, batch_fmin = [], [], []
+                fail_n, fail_s = [], []
+                
+                for n, s, w, t, fmin in zip(sv_n, sv_s, sv_w, sv_t, sv_fmin):
+                    ptr = local_counts[n, s]
                     if ptr < self.max_K:
-                        self.backlog_queue[p_node, p_svc, ptr] = p_work
-                        self.deadline_queue[p_node, p_svc, ptr] = p_time
-                        self.f_min_queue[p_node, p_svc, ptr] = p_f_min
-                        self.backlog_counts[p_node, p_svc] += 1
+                        batch_n.append(n)
+                        batch_s.append(s)
+                        batch_k.append(ptr)
+                        batch_w.append(w)
+                        batch_t.append(t)
+                        batch_fmin.append(fmin)
+                        local_counts[n, s] += 1
                     else:
-                        self.immediate_fails[p_node, p_svc] += 1
-                else:
-                    self.immediate_fails[p_node, p_svc] += 1
+                        fail_n.append(n)
+                        fail_s.append(s)
+                
+                # Cập nhật hàng loạt (Bulk update) vào GPU
+                if batch_n:
+                    b_n = torch.tensor(batch_n, device=self.device)
+                    b_s = torch.tensor(batch_s, device=self.device)
+                    b_k = torch.tensor(batch_k, device=self.device)
+                    
+                    self.backlog_queue[b_n, b_s, b_k] = torch.tensor(batch_w, dtype=self.backlog_queue.dtype, device=self.device)
+                    self.deadline_queue[b_n, b_s, b_k] = torch.tensor(batch_t, dtype=self.deadline_queue.dtype, device=self.device)
+                    self.f_min_queue[b_n, b_s, b_k] = torch.tensor(batch_fmin, dtype=self.f_min_queue.dtype, device=self.device)
+                    self.backlog_counts.copy_(torch.from_numpy(local_counts).to(self.device))
+                
+                if fail_n:
+                    f_n = torch.tensor(fail_n, device=self.device)
+                    f_s = torch.tensor(fail_s, device=self.device)
+                    self.immediate_fails.index_put_((f_n, f_s), torch.ones_like(f_s, dtype=torch.float), accumulate=True)
             
             node_arrival_matrix.index_put_((vn, vs), vw, accumulate=True)
             

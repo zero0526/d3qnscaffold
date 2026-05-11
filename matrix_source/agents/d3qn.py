@@ -84,7 +84,6 @@ class DuelingNetwork(nn.Module):
 
         # Shared representation
         features = self.base(x)
-        features = self.res_block(features)
 
         # Dueling heads
         V = self.value_stream(features)
@@ -287,7 +286,7 @@ class D3QNAgent:
         loss = self.loss_fn(pred_mf, gt_mf)
         self.mf_optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.mf_net.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.mf_net.parameters(), max_norm=10.0)
         self.mf_optimizer.step()
         return loss.item()
 
