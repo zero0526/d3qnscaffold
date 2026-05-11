@@ -80,6 +80,8 @@ class BaseConfig(BaseSettings):
     admm_max_iter:int = Field(default=25)
     admm_tol:float = Field(default=1e-2)
     normalization: Dict[str, Any] = Field(default={})
+    norm_gflop: float= Field(default=500.0)
+    norm_data_size: float= Field(default=50.0)
     class Config:
         env_file = get_env_file()
         env_file_encoding = "utf-8"

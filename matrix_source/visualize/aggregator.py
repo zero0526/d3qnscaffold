@@ -58,6 +58,11 @@ class MetricsAggregator:
         self.eps_failed = 0
         self.last_remaining = 0
 
+        # Node-Service Matrices Tracking
+        self.eps_f_alloc = []
+        self.eps_arrivals = []
+        self.eps_backlog = []
+
         # Training Losses
         self.episode_upper_mf_losses = []
         self.episode_lower_mf_losses = []
@@ -70,6 +75,11 @@ class MetricsAggregator:
         
         # Offloading flow matrix: [SourceNode][TargetNode] -> count
         self.episode_offloading_matrix = defaultdict(lambda: defaultdict(int))
+        
+        # Node-Service Matrices Tracking
+        self.eps_f_alloc = []
+        self.eps_arrivals = []
+        self.eps_backlog = []
 
     def add_upper(self, step_output, mf_loss=None, state=None):
         """Adds data from an upper-level step."""
@@ -117,6 +127,16 @@ class MetricsAggregator:
         self.eps_assigned += info.get("num_tasks", 0)
         self.eps_failed += info.get("immediate_fails", 0) + info.get("expired_count", 0)
         self.last_remaining = info.get("remaining", 0)
+
+    def add_step_matrices(self, f_alloc, arrivals, backlog):
+        """Accumulates (Node x Service) matrices for averaging at end of episode."""
+        if hasattr(f_alloc, "detach"): f_alloc = f_alloc.detach().cpu().numpy()
+        if hasattr(arrivals, "detach"): arrivals = arrivals.detach().cpu().numpy()
+        if hasattr(backlog, "detach"): backlog = backlog.detach().cpu().numpy()
+        
+        self.eps_f_alloc.append(f_alloc)
+        self.eps_arrivals.append(arrivals)
+        self.eps_backlog.append(backlog)
 
     def record_td_losses(self, upper_losses=None, lower_losses=None):
         """Records TD losses at their respective timescales (e.g. per-slot for lower, per-frame for upper)."""
@@ -186,10 +206,10 @@ class MetricsAggregator:
         self.log(f"Avg Remaining Tasks: {self.history['avg_remaining_tasks'][-1] if self.history['avg_remaining_tasks'] else 0:.2f}")
 
         # State statistics reporting
-        if self.episode_upper_states or self.episode_lower_states:
-            self.log("\n--- Input State Statistics (Mean ± Std) ---")
-            self._print_state_stats("Upper Agents", self.episode_upper_states)
-            self._print_state_stats("Lower Agents", self.episode_lower_states)
+        # if self.episode_upper_states or self.episode_lower_states:
+        #     self.log("\n--- Input State Statistics (Mean ± Std) ---")
+        #     self._print_state_stats("Upper Agents", self.episode_upper_states)
+        #     self._print_state_stats("Lower Agents", self.episode_lower_states)
 
         if success_counts:
             self.log("\n--- Successful Tasks count per Node and Service ---")
@@ -202,6 +222,19 @@ class MetricsAggregator:
         if self.episode_offloading_matrix:
             self.log("\n--- Offloading Traffic Matrix (Source -> Target) ---")
             self._print_traffic_matrix()
+
+        # Added Combined Node-Service Average Matrix Log
+        if self.eps_f_alloc:
+            self.log("\n" + "="*120)
+            self.log("         NODE-SERVICE RESOURCE ATTRIBUTION (Avg: f_alloc | Arrival | Backlog)")
+            self.log("="*120)
+            
+            avg_f = np.mean(self.eps_f_alloc, axis=0)
+            avg_arr = np.mean(self.eps_arrivals, axis=0)
+            avg_back = np.mean(self.eps_backlog, axis=0)
+            
+            self._print_combined_node_service_matrix(avg_f, avg_arr, avg_back)
+            self.log("="*120 + "\n")
 
         # Task Completion Summary
         if self.eps_assigned > 0:
@@ -253,6 +286,23 @@ class MetricsAggregator:
                     val = values[sid]
                     fmt_values.append(f"{int(val):7}")
             self.log(row + " | ".join(fmt_values))
+
+    def _print_combined_node_service_matrix(self, f_matrix, arr_matrix, back_matrix):
+        """Prints a Node x Service matrix where each cell is f_alloc | Arrival | Backlog."""
+        num_nodes, num_services = f_matrix.shape
+        # Header with service IDs
+        header = "Node | " + "             | ".join([f"Svc {i:<2}" for i in range(num_services)])
+        self.log(header)
+        self.log("-" * len(header))
+        
+        for n in range(num_nodes):
+            row = f"N{n:<3} | "
+            fmt_cells = []
+            for s in range(num_services):
+                # Format: f_alloc | Arrival | Backlog
+                cell = f"{f_matrix[n, s]:5.1f}|{arr_matrix[n, s]:4.1f}|{back_matrix[n, s]:5.1f}"
+                fmt_cells.append(cell)
+            self.log(row + " | ".join(fmt_cells))
 
     def _print_state_stats(self, label, states):
         """Calculates and prints mean/std per feature from a list of flattened states."""

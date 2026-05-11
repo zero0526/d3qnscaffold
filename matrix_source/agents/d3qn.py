@@ -1,361 +1,281 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from typing import Tuple
-from matrix_source.agents.ReplayBuffer import ReplayBuffer
+from matrix_source.agents.ReplayBuffer import ReplayBuffer, MultiAgentReplayBuffer
 from matrix_source.configs.configs import cfg
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-8):
+class MultiInstanceLinear(nn.Module):
+    """
+    Parallel linear layer for multiple independent agent models.
+    Supports batched inference where each sample in the batch can 
+    use a specific agent's weights.
+    """
+    def __init__(self, num_instances, in_features, out_features, bias=True):
         super().__init__()
-        self.eps = eps
-        self.scale = nn.Parameter(torch.ones(dim))
+        self.num_instances = num_instances
+        self.in_features = in_features
+        self.out_features = out_features
+        
+        # Weights: (num_instances, in, out)
+        self.weight = nn.Parameter(torch.Tensor(num_instances, in_features, out_features))
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(num_instances, out_features))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
 
-    def forward(self, x):
-        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
-        return x / rms * self.scale
+    def reset_parameters(self):
+        # Orthogonal initialization per instance
+        for i in range(self.num_instances):
+            nn.init.orthogonal_(self.weight[i], gain=1.0)
+            if self.bias is not None:
+                nn.init.zeros_(self.bias[i])
+
+    def forward(self, x, indices=None):
+        # x: (Batch, In) or (Batch, 1, In)
+        # indices: (Batch) long tensor
+        if indices is None:
+            # If no indices, default to shared (instance 0)
+            indices = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+            
+        # Select weights and biases for the batch
+        # w: (Batch, In, Out), b: (Batch, Out)
+        w = self.weight[indices]
+        
+        # x.unsqueeze(1): (Batch, 1, In)
+        # torch.bmm( (Batch, 1, In), (Batch, In, Out) ) -> (Batch, 1, Out)
+        out = torch.bmm(x.unsqueeze(1), w).squeeze(1)
+        
+        if self.bias is not None:
+            out += self.bias[indices]
+        return out
 
 class DuelingNetwork(nn.Module):
-
-    def __init__(
-        self,
-        state_dim: int,
-        mf_dim: int,
-        action_dim: int,
-        hidden_sizes: Tuple[int, int]
-    ):
+    def __init__(self, state_dim, mf_dim, action_dim, hidden_sizes, num_instances=1):
         super().__init__()
-
         h1, h2 = hidden_sizes
+        self.num_instances = num_instances
 
-        self.base = nn.Sequential(
-            nn.Linear(state_dim + mf_dim, h1),
-            nn.LayerNorm(h1),
-            nn.SiLU(),
+        # Base shared representation
+        self.l1 = MultiInstanceLinear(num_instances, state_dim + mf_dim, h1)
+        self.ln1 = nn.LayerNorm(h1)
+        self.l2 = MultiInstanceLinear(num_instances, h1, h2)
+        self.ln2 = nn.LayerNorm(h2)
 
-            nn.Linear(h1, h2),
-            nn.LayerNorm(h2),
-            nn.SiLU()
-        )
+        # Value stream
+        self.v1 = MultiInstanceLinear(num_instances, h2, h2)
+        self.v2 = MultiInstanceLinear(num_instances, h2, 1)
 
-        self.value_stream = nn.Sequential(
-            nn.Linear(h2, h2),
-            nn.LayerNorm(h2),
-            nn.SiLU(),
+        # Advantage stream
+        self.a1 = MultiInstanceLinear(num_instances, h2, h2)
+        self.a2 = MultiInstanceLinear(num_instances, h2, action_dim)
 
-            nn.Linear(h2, 1)
-        )
-
-        self.advantage_stream = nn.Sequential(
-            nn.Linear(h2, h2),
-            nn.LayerNorm(h2),
-            nn.SiLU(),
-
-            nn.Linear(h2, action_dim)
-        )
-
-        self._init_weights()
-
-    def _init_weights(self):
-
-        for m in self.modules():
-
-            if isinstance(m, nn.Linear):
-
-                nn.init.orthogonal_(m.weight, gain=1.0)
-
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0.0)
-
-        # Smaller final layer init for stable Q at start
-
-        nn.init.orthogonal_(
-            self.value_stream[-1].weight,
-            gain=0.01
-        )
-
-        nn.init.orthogonal_(
-            self.advantage_stream[-1].weight,
-            gain=0.01
-        )
-
-    def forward(self, state, pred_mf):
+    def forward(self, state, pred_mf, indices=None):
         x = torch.cat([state, pred_mf], dim=-1)
-
-        # Shared representation
-        features = self.base(x)
-
-        # Dueling heads
-        V = self.value_stream(features)
-        A = self.advantage_stream(features)
-
-        # Dueling aggregation
-        Q = V + (A - A.mean(dim=-1, keepdim=True))
-
-        return Q
+        
+        # Hidden Layers
+        x = F.silu(self.ln1(self.l1(x, indices)))
+        x = F.silu(self.ln2(self.l2(x, indices)))
+        
+        # Heads
+        V = self.v2(F.silu(self.v1(x, indices)), indices)
+        A = self.a2(F.silu(self.a1(x, indices)), indices)
+        
+        return V + (A - A.mean(dim=-1, keepdim=True))
 
     def get_base_params(self):
-
-        return list(self.base.parameters())
-
+        # Used for SCAFFOLD or weight access
+        return list(self.parameters())
 
 class MF(nn.Module):
-
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int,
-        hidden_sizes: Tuple[int, ...]
-    ):
-
+    def __init__(self, input_size, output_size, hidden_sizes, num_instances=1):
         super().__init__()
-        layers = []
-        in_features = input_size
+        h = hidden_sizes[0]
+        self.num_instances = num_instances
+        
+        self.l1 = MultiInstanceLinear(num_instances, input_size, h)
+        self.ln = nn.LayerNorm(h)
+        self.l2 = MultiInstanceLinear(num_instances, h, output_size)
 
-        for h_dim in hidden_sizes:
-            layers.extend([
-                nn.Linear(in_features, h_dim),
-                nn.LayerNorm(h_dim),
-                nn.SiLU()
-            ])
-            in_features = h_dim
+    def forward(self, x, indices=None):
+        x = F.silu(self.ln(self.l1(x, indices)))
+        return torch.sigmoid(self.l2(x, indices))
 
-        layers.append(
-            nn.Linear(in_features, output_size)
-        )
-        self.network = nn.Sequential(*layers)
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        linear_layers = []
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                linear_layers.append(m)
-                nn.init.orthogonal_(
-                    m.weight,
-                    gain=1.0
-                )
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-        # Small final layer init
-        # Helps stabilize early MF predictions
-        nn.init.orthogonal_(
-            linear_layers[-1].weight,
-            gain=0.01
-        )
-
-    def forward(self, x):
-
-        x = self.network(x)
-        # Constrain MF to [0,1]
-        x = torch.sigmoid(x)
-        return x
-
-# ---D3QN AGENT ---
 class D3QNAgent:
-    def __init__(self, node_id:int, node_type: str, state_dim, action_dim, u_action_dim: int, mf_hidden_sizes: Tuple[int, ...],mf_lr:float, hidden_sizes=(128, 64),
-                 lr=1e-4, gamma=0.99, alpha=0.005, buffer_size=cfg.hyper_neural["MEMORY_SIZE"], buffer_min_size=cfg.hyper_neural["BUFFER_MIN_SIZE"], batch_size=64, exclude_zero=False):
-        self.action_dim = action_dim
-        self.u_action_dim = u_action_dim # Store u_action_dim
-        self.exclude_zero = exclude_zero
-        self.gamma = gamma
-        self.alpha = float(alpha)  # Ensure it is a scalar float
-        self.batch_size = batch_size
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.node_id: int= node_id
+    def __init__(self, node_id, node_type, state_dim, action_dim, u_action_dim, mf_hidden_sizes, mf_lr, buffer_min_size,
+                 hidden_sizes=(128, 64), lr=1e-4, gamma=0.99, alpha=0.005, buffer_size=100000, batch_size=64,
+                 exclude_zero=False, num_instances=1):
+        self.node_id = node_id
         self.node_type = node_type
-        self.min_batch_size= buffer_min_size[0] if node_type!="Terminal" else buffer_min_size[1]
-        # Evaluation Network, Target Network
-        input_dim = state_dim + action_dim
-        self.eval_net = DuelingNetwork(state_dim,action_dim , u_action_dim, hidden_sizes).to(self.device)
-        self.target_net = DuelingNetwork(state_dim,action_dim , u_action_dim, hidden_sizes).to(self.device)
+        self.action_dim = action_dim
+        self.u_action_dim = u_action_dim
+        self.gamma = gamma
+        self.alpha = float(alpha)
+        self.batch_size = batch_size
+        self.exclude_zero = exclude_zero
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.num_instances = num_instances
+        
+        self.min_batch_size = buffer_min_size
 
+        # Use num_instances to create parallel independent internal models
+        self.eval_net = DuelingNetwork(state_dim, action_dim, u_action_dim, hidden_sizes, num_instances).to(self.device)
+        self.target_net = DuelingNetwork(state_dim, action_dim, u_action_dim, hidden_sizes, num_instances).to(self.device)
         self.target_net.load_state_dict(self.eval_net.state_dict())
         self.target_net.eval()
 
-        self.mf_net = MF(input_size=state_dim + action_dim, output_size=action_dim, hidden_sizes=mf_hidden_sizes).to(self.device)
-        self.mf_optimizer = optim.Adam(self.mf_net.parameters(), lr=mf_lr)
+        self.mf_net = MF(state_dim + action_dim, action_dim, mf_hidden_sizes, num_instances).to(self.device)
+        
         self.optimizer = optim.Adam(self.eval_net.parameters(), lr=lr)
+        self.mf_optimizer = optim.Adam(self.mf_net.parameters(), lr=mf_lr)
         self.loss_fn = nn.MSELoss()
+        
+        # Each agent instance gets its own partitioned buffer to prevent "noise" and ensure fair training
+        self.memory = MultiAgentReplayBuffer(num_instances, buffer_size // num_instances, state_dim, action_dim, self.device)
 
-        self.memory = ReplayBuffer(buffer_size, state_dim, action_dim, self.device)
-        
-        # SCAFFOLD Control Variates
-        self.c_i = [torch.zeros_like(p).to(self.device) for p in self.eval_net.get_base_params()]
-        self.c_edge = [torch.zeros_like(p).to(self.device) for p in self.eval_net.get_base_params()]
-        self.grad_sum = [torch.zeros_like(p).to(self.device) for p in self.eval_net.get_base_params()]
-        self.initial_base_params = []
-        self.steps_in_round = 0
-        self.save_base_initial()
-        
-        # Logging state
+        # Logging
         self.prev_loss = 0.0
         self.learn_step_counter = 0
 
-    def save_base_initial(self):
-        """Save base weights at the start of a local round for SCAFFOLD."""
-        self.initial_base_params = [p.data.clone() for p in self.eval_net.get_base_params()]
-        for g in self.grad_sum:
-            g.zero_()
-        self.steps_in_round = 0
+    def choose_action(self, state, prev_mf, epsilon, zeta, mask=None, agent_idx=0):
+        # Single agent usage (fallback or legacy)
+        idx_tensor = torch.tensor([agent_idx], device=self.device)
+        actions = self.choose_action_batch(
+            state.unsqueeze(0) if not torch.is_tensor(state) else state.detach().unsqueeze(0),
+            prev_mf.unsqueeze(0) if not torch.is_tensor(prev_mf) else prev_mf.detach().unsqueeze(0),
+            zeta, 
+            masks_batch=mask.unsqueeze(0) if mask is not None else None,
+            agent_indices=idx_tensor
+        )
+        return int(actions[0])
 
-    def choose_action(self, state, prev_mf, epsilon, zeta, mask=None):
-        # 1. Handle Masking (convert to tensor early for both random and Q-based choice)
-        mask_tensor = None
-        if mask is not None:
-            if not torch.is_tensor(mask):
-                mask_tensor = torch.tensor(mask, device=self.device).float()
-            else:
-                mask_tensor = mask.detach().to(self.device).float()
-            mask_tensor = mask_tensor.view(-1) # Flatten for easy indexing
-
-        # 2. Cold-Start Logic: Use Random policy when memory is sparse
-        if len(self.memory)==self.min_batch_size:
-            print("Memory collect enough change to train " + str(self.min_batch_size))
-        if len(self.memory) < self.min_batch_size:
-            if mask_tensor is not None:
-                # Pick a random action from the set of unmasked (valid) actions
-                # mask_tensor == 1 indicates valid, 0 indicates invalid
-                valid_indices = torch.where(mask_tensor > 0.5)[0]
-                if len(valid_indices) > 0:
-                    action_idx = valid_indices[torch.randint(0, len(valid_indices), (1,))].item()
-                else:
-                    # Fallback if everything is masked (should not happen in valid env)
-                    action_idx = torch.randint(0, self.u_action_dim, (1,)).item()
-            else:
-                action_idx = torch.randint(0, self.u_action_dim, (1,)).item()
-            return int(action_idx)
-
-        # 3. Standard D3QN Policy (Q-values + Boltzmann + Masking)
-        if not torch.is_tensor(state):
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+    def choose_action_batch(self, states_batch, prev_mfs_batch, zeta, masks_batch=None, agent_indices=None):
+        batch_size = states_batch.shape[0]
+        if agent_indices is None:
+            agent_indices = torch.zeros(batch_size, dtype=torch.long, device=self.device)
         else:
-            state_tensor = state.detach().unsqueeze(0).to(self.device)
+            agent_indices = agent_indices.to(self.device).view(-1)
 
-        if not torch.is_tensor(prev_mf):
-            mf_tensor = torch.FloatTensor(prev_mf).unsqueeze(0).to(self.device)
-        else:
-            mf_tensor = prev_mf.detach().unsqueeze(0).to(self.device)
-
-        with torch.no_grad():
-            mf_input = torch.cat([state_tensor, mf_tensor], dim=-1)
-            pred_mf = self.mf_net(mf_input)
-            
-            # Predict Q-values
-            q_values = self.eval_net(state_tensor, pred_mf)
-
-            # Apply masking penalty
-            if mask_tensor is not None:
-                q_values = q_values + (mask_tensor.unsqueeze(0) - 1.0) * 1e10
-            
-            if self.exclude_zero and self.u_action_dim > 1:
-                q_values[:, 0] -= 1e10
-            
-            # Boltzmann Selection (Softmax with temperature parameter zeta)
-            scaled_q = q_values * zeta
-            probs = torch.softmax(scaled_q, dim=1)
-            
-            # Sample action index
-            action = torch.multinomial(probs, 1).item()
-            
-        return int(action)
-
-    def learn_mf(self, state, prev_mf, ground_truth_mf):
-        # Convert to tensors
-        if not torch.is_tensor(state):
-            s = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-        else:
-            s = state.detach().unsqueeze(0).to(self.device)
-            
-        if not torch.is_tensor(prev_mf):
-            pmf = torch.FloatTensor(prev_mf).unsqueeze(0).to(self.device)
-        else:
-            pmf = prev_mf.detach().unsqueeze(0).to(self.device)
-            
-        if not torch.is_tensor(ground_truth_mf):
-            gt_mf = torch.FloatTensor(ground_truth_mf).unsqueeze(0).to(self.device)
-        else:
-            gt_mf = ground_truth_mf.detach().unsqueeze(0).to(self.device)
-            
-        # Prediction
-        mf_input = torch.cat([s, pmf], dim=-1)
-        pred_mf = self.mf_net(mf_input)
+        # 1. Per-Agent Cold-Start Check
+        is_policy_agent = torch.tensor([
+            self.memory.get_len(aid.item()) >= self.min_batch_size 
+            for aid in agent_indices
+        ], device=self.device)
         
-        # Optimization
+        final_actions = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+
+        # 2. Handle Cold-Start Agents (Random Exploration)
+        cold_mask = ~is_policy_agent
+        if cold_mask.any():
+            indices = cold_mask.nonzero(as_tuple=True)[0]
+            if masks_batch is not None:
+                # Random choice within valid mask
+                m = masks_batch[indices].to(self.device)
+                probs = m / m.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                final_actions[indices] = torch.multinomial(probs, 1).squeeze(1)
+            else:
+                final_actions[indices] = torch.randint(0, self.u_action_dim, (len(indices),), device=self.device)
+
+        # 3. Handle Policy Agents (Neural Network)
+        policy_mask = is_policy_agent
+        if policy_mask.any():
+            indices = policy_mask.nonzero(as_tuple=True)[0]
+            s_subset = states_batch[indices].to(self.device) if torch.is_tensor(states_batch) else torch.FloatTensor(states_batch[indices]).to(self.device)
+            mf_subset = prev_mfs_batch[indices].to(self.device) if torch.is_tensor(prev_mfs_batch) else torch.FloatTensor(prev_mfs_batch[indices]).to(self.device)
+            aid_subset = agent_indices[indices]
+
+            with torch.no_grad():
+                pred_mf = self.mf_net(torch.cat([s_subset, mf_subset], dim=-1), indices=aid_subset)
+                q_values = self.eval_net(s_subset, pred_mf, indices=aid_subset)
+
+                if masks_batch is not None:
+                    m = masks_batch[indices].to(self.device)
+                    q_values = q_values + (m - 1.0) * 1e10
+                
+                if self.exclude_zero and self.u_action_dim > 1:
+                    q_values[:, 0] -= 1e10
+                
+                # zeta factor controls the exploration temperature
+                probs = torch.softmax(q_values * zeta, dim=1)
+                final_actions[indices] = torch.multinomial(probs, 1).squeeze(1)
+
+        return final_actions.tolist()
+
+    def store_transition_train_mf_batch(self, states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids):
+        # MF learning update
+        loss = self.learn_mf_batch(states, prev_mfs, curr_mfs, agent_ids)
+        # Store in buffer
+        self.memory.add_batch(states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids)
+        return loss
+
+    def learn_mf_batch(self, states_batch, prev_mf_batch, ground_truth_mf_batch, agent_ids):
+        s = states_batch.to(self.device) if torch.is_tensor(states_batch) else torch.FloatTensor(states_batch).to(self.device)
+        pmf = prev_mf_batch.to(self.device) if torch.is_tensor(prev_mf_batch) else torch.FloatTensor(prev_mf_batch).to(self.device)
+        gt_mf = ground_truth_mf_batch.to(self.device) if torch.is_tensor(ground_truth_mf_batch) else torch.FloatTensor(ground_truth_mf_batch).to(self.device)
+        
+        pred_mf = self.mf_net(torch.cat([s, pmf], dim=-1), indices=agent_ids)
         loss = self.loss_fn(pred_mf, gt_mf)
+        
         self.mf_optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.mf_net.parameters(), max_norm=10.0)
+        torch.nn.utils.clip_grad_norm_(self.mf_net.parameters(), max_norm=5.0)
         self.mf_optimizer.step()
         return loss.item()
 
-    def store_transition_train_mf(self, state, prev_mf, curr_mf, action, reward, next_state, done):
-        mf_loss = self.learn_mf(state, prev_mf, curr_mf)
-        self.memory.add(state, prev_mf, curr_mf, action, reward, next_state, done)
-        return mf_loss
+    def learn(self, agents_ids: torch.Tensor = None):
+        # 1. Identify the pool of agents that have enough data
+        ready_pool = (self.memory.buffer_sizes >= self.min_batch_size).nonzero(as_tuple=True)[0]
+        
+        if agents_ids is not None:
+            # Filter specifically for the requested agents that are also ready
+            if not isinstance(agents_ids, torch.Tensor):
+                agents_ids = torch.tensor(agents_ids, device=self.device)
+            
+            # Move to correct device for comparison
+            agents_ids = agents_ids.to(self.device).view(-1)
+            mask = torch.isin(agents_ids, ready_pool)
+            target_agents = agents_ids[mask]
+        else:
+            # Default to all ready agents
+            target_agents = ready_pool
 
-    def learn(self):
-        if len(self.memory) < self.min_batch_size:
-            return None  # don't enough data
+        if len(target_agents) == 0:
+            return None
 
-        # Sample data
-        states, prev_mfs, curr_mfs, actions, rewards, next_states, dones = self.memory.sample(self.batch_size)
+        # 2. Sample data from a diverse set of target agents (avoiding duplicates)
+        states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids = \
+            self.memory.sample(self.batch_size, agent_ids=target_agents)
 
-        # ---------------- TRAIN MF NETWORK ----------------
-        mf_input = torch.cat([states, prev_mfs], dim=-1)
-        pred_curr_mfs = self.mf_net(mf_input)
+        # 1. Train MF (prediction and current state)
+        pred_curr_mfs = self.mf_net(torch.cat([states, prev_mfs], dim=-1), indices=agent_ids)
 
-        # ---------------- DOUBLE DQN LOGIC ----------------
-        pred_mfs_detached = pred_curr_mfs.detach()
-        q_eval = self.eval_net(states, pred_mfs_detached).gather(1, actions)
+        # 2. DQN update
+        q_eval = self.eval_net(states, pred_curr_mfs.detach(), indices=agent_ids).gather(1, actions)
 
         with torch.no_grad():
-            next_mf_input = torch.cat([next_states, curr_mfs], dim=-1)
-            next_pred_mfs = self.mf_net(next_mf_input)
-
-            next_actions = self.eval_net(next_states, next_pred_mfs).argmax(dim=1, keepdim=True)
-
-            # Bước 2: Đánh giá action đó bằng Target Network (Phương trình 47)
-            q_next = self.target_net(next_states, next_pred_mfs).gather(1, next_actions)
-
-            # y = r + gamma * Q_target(s', argmax Q_eval(s', a'))
+            next_pred_mfs = self.mf_net(torch.cat([next_states, curr_mfs], dim=-1), indices=agent_ids)
+            next_actions = self.eval_net(next_states, next_pred_mfs, indices=agent_ids).argmax(dim=1, keepdim=True)
+            q_next = self.target_net(next_states, next_pred_mfs, indices=agent_ids).gather(1, next_actions)
             q_target = rewards + self.gamma * q_next * (1 - dones)
 
-        # ---------------- LOSS & BACKPROP ----------------
-        # Phương trình (48): L = MSE(Q_eval, y)
         loss = self.loss_fn(q_eval, q_target)
-
         self.optimizer.zero_grad()
         loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(self.eval_net.parameters(), max_norm=1.0)
-        self.steps_in_round += 1
+        torch.nn.utils.clip_grad_norm_(self.eval_net.parameters(), max_norm=10.0)
         self.optimizer.step()
-        
-        # ---------------- LOGGING ----------------
-        loss_val = loss.item()
-        avg_q = q_eval.mean().item()
-        loss_change = loss_val - self.prev_loss
-        self.prev_loss = loss_val
+
+        # Update logging/target
         self.learn_step_counter += 1
-
-        # Log every 100 learning steps to avoid console flooding
-        if self.learn_step_counter % 50 == 0:
-            print(f"[Agent {self.node_id} ({self.node_type})] Update {self.learn_step_counter:5d} | "
-                  f"Avg Q: {avg_q:8.3f} | TD Loss: {loss_val:8.5f} | ΔLoss: {loss_change:9.5f}")
-
-        # ---------------- SOFT UPDATE ----------------
+        if self.learn_step_counter % 100 == 0:
+            avg_q = q_eval.mean().item()
+            print(f"[{self.node_type} Group] Step {self.learn_step_counter:5d} | TD Loss: {loss.item():.5f} | Avg Q: {avg_q:.3f}")
+        
         self._soft_update()
-
         return loss.item()
 
     def _soft_update(self):
-        """
-        theta_target = alpha * theta_eval + (1 - alpha) * theta_target
-        """
         with torch.no_grad():
             for target_param, eval_param in zip(self.target_net.parameters(), self.eval_net.parameters()):
-                target_param.data.copy_(
-                    self.alpha * eval_param.data + (1.0 - self.alpha) * target_param.data
-                )
+                target_param.data.copy_(self.alpha * eval_param.data + (1.0 - self.alpha) * target_param.data)

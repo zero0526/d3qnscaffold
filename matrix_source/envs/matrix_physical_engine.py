@@ -93,7 +93,8 @@ class MatrixPhysicalEngine:
         obs_upper = {
             "actions": self.placement_matrix.clone(),
             "phi_prob": torch.zeros_like(self.phi_accumulator),
-            'mean_fields': torch.zeros((self.num_nodes, self.num_services), device=self.device)
+            'mean_fields': torch.zeros((self.num_nodes, self.num_services), device=self.device),
+            "resources": torch.zeros((self.num_nodes, 3), device=self.device)
         }
         obs_lower = self.get_lower_obs()
         return {"upper": obs_upper, "lower": obs_lower}
@@ -103,10 +104,20 @@ class MatrixPhysicalEngine:
         mean_fields = (self.adj_matrix @ self.placement_matrix) / neighbor_count
         phi_prob = ops.transform2prob(self.phi_accumulator)
         
+        # Resource utilization: CPU, RAM, HDD (3 dimensions)
+        # Assuming resource_specs columns: 0=CPU, 1=RAM, 2=HDD, 3=Price?
+        # we skip price and take 3. Normalized by total capacity.
+        # used_resources: (N, 4)
+        cpu_util = self.used_resources[:, 0] / self.resource_specs[:, 0].clamp(min=1.0)
+        ram_util = self.used_resources[:, 1] / self.resource_specs[:, 1].clamp(min=1.0)
+        hdd_util = self.used_resources[:, 2] / self.resource_specs[:, 2].clamp(min=1.0)
+        resources = torch.stack([cpu_util, ram_util, hdd_util], dim=1) # (N, 3)
+
         res = {
             "actions": self.placement_matrix.clone(),
             "phi_prob": phi_prob,
             "mean_fields": mean_fields,
+            "resources": resources,
             "reward_global": -float(self.reward_global_accumulator)
         }
         self.phi_accumulator.zero_()
@@ -349,7 +360,8 @@ class MatrixPhysicalEngine:
             "expired_count": int(violate_step_tensor.sum().item() - self.immediate_fails.sum().item()),
             "remaining": int(self.backlog_counts.sum().item()),
             "success_qos": {i: success_qos_tensor[i].cpu().numpy() for i in range(self.num_nodes)},
-            "violate_qos": {i: violate_step_tensor[i].cpu().numpy() for i in range(self.num_nodes)}
+            "violate_qos": {i: violate_step_tensor[i].cpu().numpy() for i in range(self.num_nodes)},
+            "arrival_matrix": self.arrival_counts_step.clone() # Return snapshot
         }
         return {
             "reward": reward,
