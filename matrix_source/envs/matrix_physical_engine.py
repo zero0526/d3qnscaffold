@@ -212,7 +212,7 @@ class MatrixPhysicalEngine:
         t_rem_raw = task_deadlines - trans_delays - cold_delays
         t_q_rem = t_rem_raw - task_max_queue
         
-        valid_mask = t_rem_raw >= 1e-4
+        valid_mask = t_q_rem >= 1e-4
         # Initialize immediate fails with tasks failing initial checks
         fails_idx = (~valid_mask)
         if fails_idx.any():
@@ -254,10 +254,11 @@ class MatrixPhysicalEngine:
     def optimize_allocation(self, node_arrival_matrix, f_min_matrix):
         current_backlog_total = self.backlog_queue.sum(dim=-1)
         G = current_backlog_total * self.placement_matrix
+        G[G < 1e-3] = 0
         Z = self.lypa_coef * self.energy_coef * self.placement_matrix * node_arrival_matrix
         f_max = (self.resource_specs[:, 0:1] * self.placement_matrix).to(self.device)
         f_min = f_min_matrix.clamp(max=f_max)
-        self.cpu_alloc_matrix = self.solver.solve(G, Z, f_min, f_max, debug=True)
+        self.cpu_alloc_matrix = self.solver.solve(G, Z, f_min, f_max, debug=False)
 
     def execute_and_collect_metrics(self, node_arrival_matrix, trans_energy_total, cold_delays):
         current_backlog_total = self.backlog_queue.sum(dim=-1)

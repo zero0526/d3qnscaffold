@@ -73,10 +73,10 @@ class BaseConfig(BaseSettings):
     services: Dict[str,Dict[str, Any]]= Field(default={})
     delay_coef:float= Field(default=0.9)
     delay_queue_max: Dict[str, np.ndarray]= Field(default={})
-    max_queue_size: int = Field(default=100)
+    max_queue_size: int = Field(default=50)
     admm_rho: float= Field(default=0.5)
-    admm_max_iter:int = Field(default=15)
-    admm_tol:float = Field(default=1e-3)
+    admm_max_iter:int = Field(default=25)
+    admm_tol:float = Field(default=1e-2)
     normalization: Dict[str, Any] = Field(default={})
     class Config:
         env_file = get_env_file()

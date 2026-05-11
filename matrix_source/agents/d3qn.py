@@ -2,36 +2,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from typing import Tuple
-
 from matrix_source.agents.ReplayBuffer import ReplayBuffer
 from matrix_source.configs.configs import cfg
-
-class RunningNorm:
-    def __init__(self, shape):
-        self.mean = torch.zeros(shape)
-        self.var = torch.ones(shape)
-        self.count = 1e-4
-
-    def update(self, x):
-        batch_mean = x.mean(0)
-        batch_var = x.var(0, unbiased=False)
-        batch_count = x.size(0)
-
-        delta = batch_mean - self.mean
-        total_count = self.count + batch_count
-
-        new_mean = self.mean + delta * batch_count / total_count
-        m_a = self.var * self.count
-        m_b = batch_var * batch_count
-        M2 = m_a + m_b + delta**2 * self.count * batch_count / total_count
-        new_var = M2 / total_count
-
-        self.mean = new_mean
-        self.var = new_var
-        self.count = total_count
-
-    def normalize(self, x):
-        return (x - self.mean) / (torch.sqrt(self.var) + 1e-8)
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-8):
@@ -42,23 +14,6 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
         return x / rms * self.scale
-
-class ResidualBlock(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-
-        self.block = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
-            nn.SiLU(),
-
-            nn.Linear(dim, dim)
-        )
-
-        self.norm = nn.LayerNorm(dim)
-
-    def forward(self, x):
-        return self.norm(x + self.block(x))
 
 class DuelingNetwork(nn.Module):
 
@@ -73,28 +28,8 @@ class DuelingNetwork(nn.Module):
 
         h1, h2 = hidden_sizes
 
-        # =========================
-        # Separate projections
-        # =========================
-
-        self.state_proj = nn.Sequential(
-            nn.Linear(state_dim, h1 // 2),
-            nn.LayerNorm(h1 // 2),
-            nn.SiLU()
-        )
-
-        self.mf_proj = nn.Sequential(
-            nn.Linear(mf_dim, h1 // 2),
-            nn.LayerNorm(h1 // 2),
-            nn.SiLU()
-        )
-
-        # =========================
-        # Shared backbone (FedRep base)
-        # =========================
-
         self.base = nn.Sequential(
-            nn.Linear(h1, h1),
+            nn.Linear(state_dim + mf_dim, h1),
             nn.LayerNorm(h1),
             nn.SiLU(),
 
@@ -103,16 +38,6 @@ class DuelingNetwork(nn.Module):
             nn.SiLU()
         )
 
-        # =========================
-        # Residual stabilization
-        # =========================
-
-        self.res_block = ResidualBlock(h2)
-
-        # =========================
-        # Value stream
-        # =========================
-
         self.value_stream = nn.Sequential(
             nn.Linear(h2, h2),
             nn.LayerNorm(h2),
@@ -120,10 +45,6 @@ class DuelingNetwork(nn.Module):
 
             nn.Linear(h2, 1)
         )
-
-        # =========================
-        # Advantage stream
-        # =========================
 
         self.advantage_stream = nn.Sequential(
             nn.Linear(h2, h2),
@@ -159,10 +80,7 @@ class DuelingNetwork(nn.Module):
         )
 
     def forward(self, state, pred_mf):
-        # Input projections
-        s = self.state_proj(state)
-        m = self.mf_proj(pred_mf)
-        x = torch.cat([s, m], dim=-1)
+        x = torch.cat([state, pred_mf], dim=-1)
 
         # Shared representation
         features = self.base(x)
@@ -179,12 +97,8 @@ class DuelingNetwork(nn.Module):
 
     def get_base_params(self):
 
-        return (
-            list(self.state_proj.parameters()) +
-            list(self.mf_proj.parameters()) +
-            list(self.base.parameters()) +
-            list(self.res_block.parameters())
-        )
+        return list(self.base.parameters())
+
 
 class MF(nn.Module):
 
@@ -415,14 +329,6 @@ class D3QNAgent:
 
         self.optimizer.zero_grad()
         loss.backward()
-        
-        # SCAFFOLD Gradient Correction ONLY on Base Params
-        # with torch.no_grad():
-        #     for p, g_sum, cp_i, cp_edge in zip(self.eval_net.get_base_params(), self.grad_sum, self.c_i, self.c_edge):
-        #         if p.grad is not None:
-        #             raw_g = p.grad.data.clone()
-        #             p.grad.data = raw_g - cp_i + cp_edge
-        #             g_sum += raw_g
 
         torch.nn.utils.clip_grad_norm_(self.eval_net.parameters(), max_norm=1.0)
         self.steps_in_round += 1
@@ -454,210 +360,3 @@ class D3QNAgent:
                 target_param.data.copy_(
                     self.alpha * eval_param.data + (1.0 - self.alpha) * target_param.data
                 )
-
-
-
-# class ResidualBlock(nn.Module):
-#     def __init__(self, dim: int):
-#         super().__init__()
-#
-#         self.block = nn.Sequential(
-#             nn.Linear(dim, dim),
-#             RMSNorm(dim),
-#             nn.SiLU(),
-#
-#             nn.Linear(dim, dim)
-#         )
-#
-#         self.norm = RMSNorm(dim)
-#
-#     def forward(self, x):
-#         return self.norm(x + self.block(x))
-
-
-# class DuelingNetwork(nn.Module):
-#
-#     def __init__(
-#         self,
-#         state_dim: int,
-#         mf_dim: int,
-#         action_dim: int,
-#         hidden_sizes: Tuple[int, int]
-#     ):
-#         super().__init__()
-#
-#         h1, h2 = hidden_sizes
-#
-#         # =========================
-#         # Separate projections
-#         # =========================
-#
-#         self.state_proj = nn.Sequential(
-#             nn.Linear(state_dim, h1 // 2),
-#             RMSNorm(h1 // 2),
-#             nn.SiLU()
-#         )
-#
-#         self.mf_proj = nn.Sequential(
-#             nn.Linear(mf_dim, h1 // 2),
-#             RMSNorm(h1 // 2),
-#             nn.SiLU()
-#         )
-#
-#         # =========================
-#         # Shared backbone
-#         # =========================
-#
-#         self.base = nn.Sequential(
-#             nn.Linear(h1, h1),
-#             RMSNorm(h1),
-#             nn.SiLU(),
-#
-#             nn.Linear(h1, h2),
-#             RMSNorm(h2),
-#             nn.SiLU()
-#         )
-#
-#         # =========================
-#         # Residual stabilization
-#         # =========================
-#
-#         self.res_block = ResidualBlock(h2)
-#
-#         # =========================
-#         # Value stream
-#         # =========================
-#
-#         self.value_stream = nn.Sequential(
-#             nn.Linear(h2, h2),
-#             RMSNorm(h2),
-#             nn.SiLU(),
-#
-#             nn.Linear(h2, 1)
-#         )
-#
-#         # =========================
-#         # Advantage stream
-#         # =========================
-#
-#         self.advantage_stream = nn.Sequential(
-#             nn.Linear(h2, h2),
-#             RMSNorm(h2),
-#             nn.SiLU(),
-#
-#             nn.Linear(h2, action_dim)
-#         )
-#
-#         self._init_weights()
-#
-#     def _init_weights(self):
-#
-#         for m in self.modules():
-#
-#             if isinstance(m, nn.Linear):
-#
-#                 nn.init.orthogonal_(m.weight, gain=1.0)
-#
-#                 if m.bias is not None:
-#                     nn.init.constant_(m.bias, 0.0)
-#
-#         nn.init.orthogonal_(
-#             self.value_stream[-1].weight,
-#             gain=0.01
-#         )
-#
-#         nn.init.orthogonal_(
-#             self.advantage_stream[-1].weight,
-#             gain=0.01
-#         )
-#
-#     def forward(self, state, pred_mf):
-#
-#         s = self.state_proj(state)
-#         m = self.mf_proj(pred_mf)
-#
-#         x = torch.cat([s, m], dim=-1)
-#
-#         features = self.base(x)
-#         features = self.res_block(features)
-#
-#         V = self.value_stream(features)
-#         A = self.advantage_stream(features)
-#
-#         Q = V + (A - A.mean(dim=-1, keepdim=True))
-#
-#         return Q
-#
-#     def get_base_params(self):
-#
-#         return (
-#             list(self.state_proj.parameters()) +
-#             list(self.mf_proj.parameters()) +
-#             list(self.base.parameters()) +
-#             list(self.res_block.parameters())
-#         )
-#
-#
-# class MF(nn.Module):
-#
-#     def __init__(
-#         self,
-#         input_size: int,
-#         output_size: int,
-#         hidden_sizes: Tuple[int, ...]
-#     ):
-#
-#         super().__init__()
-#
-#         layers = []
-#         in_features = input_size
-#
-#         for h_dim in hidden_sizes:
-#
-#             layers.extend([
-#                 nn.Linear(in_features, h_dim),
-#                 RMSNorm(h_dim),
-#                 nn.SiLU()
-#             ])
-#
-#             in_features = h_dim
-#
-#         layers.append(
-#             nn.Linear(in_features, output_size)
-#         )
-#
-#         self.network = nn.Sequential(*layers)
-#
-#         self._initialize_weights()
-#
-#     def _initialize_weights(self):
-#
-#         linear_layers = []
-#
-#         for m in self.modules():
-#
-#             if isinstance(m, nn.Linear):
-#
-#                 linear_layers.append(m)
-#
-#                 nn.init.orthogonal_(
-#                     m.weight,
-#                     gain=1.0
-#                 )
-#
-#                 if m.bias is not None:
-#                     nn.init.zeros_(m.bias)
-#
-#         nn.init.orthogonal_(
-#             linear_layers[-1].weight,
-#             gain=0.01
-#         )
-#
-#     def forward(self, x):
-#
-#         x = self.network(x)
-#
-#         # constrain to [0,1]
-#         x = torch.sigmoid(x)
-#
-#         return x
