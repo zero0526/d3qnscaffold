@@ -187,7 +187,6 @@ class MetricsAggregator:
         # Auto-plot every 50 episodes
         if self.episode_count % 50 == 0:
             self.plot_history(ep=self.episode_count)
-            self.plot_state_distributions(ep=self.episode_count)
 
     def report_episode(self, ep, success_counts=None, failure_counts=None):
         """Prints a summary of the current episode."""

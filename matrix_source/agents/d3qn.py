@@ -157,6 +157,9 @@ class D3QNAgent:
             agent_indices = torch.zeros(batch_size, dtype=torch.long, device=self.device)
         else:
             agent_indices = agent_indices.to(self.device).view(-1)
+            
+        if masks_batch is not None:
+            masks_batch = masks_batch.to(self.device)
 
         # 1. Per-Agent Cold-Start Check
         is_policy_agent = torch.tensor([
@@ -172,7 +175,7 @@ class D3QNAgent:
             indices = cold_mask.nonzero(as_tuple=True)[0]
             if masks_batch is not None:
                 # Random choice within valid mask
-                m = masks_batch[indices].to(self.device)
+                m = masks_batch[indices]
                 probs = m / m.sum(dim=1, keepdim=True).clamp(min=1e-8)
                 final_actions[indices] = torch.multinomial(probs, 1).squeeze(1)
             else:
@@ -191,7 +194,7 @@ class D3QNAgent:
                 q_values = self.eval_net(s_subset, pred_mf, indices=aid_subset)
 
                 if masks_batch is not None:
-                    m = masks_batch[indices].to(self.device)
+                    m = masks_batch[indices]
                     q_values = q_values + (m - 1.0) * 1e10
                 
                 if self.exclude_zero and self.u_action_dim > 1:

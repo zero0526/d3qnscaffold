@@ -253,7 +253,7 @@ class Trainer:
         
         # 4. Batch Inference
         batch_actions = self.shared_lower_agent.choose_action_batch(
-            states, mfs, self.zeta_lower, masks_batch=masks, agent_indices=torch.arange(self.num_terminals, device=self.device)
+            states, mfs, self.zeta_lower, masks_batch=masks.to(self.device), agent_indices=torch.arange(self.num_terminals, device=self.device)
         )
         
         a_ids = torch.tensor(batch_actions, device=self.device)
