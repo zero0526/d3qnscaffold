@@ -2,11 +2,12 @@ import torch
 import numpy as np
 
 class ReplayBuffer:
-    def __init__(self, max_size, state_dim, action_dim, device="cpu"):
+    def __init__(self, max_size,node_type, state_dim, action_dim, device="cpu"):
         self.max_size = max_size
         self.ptr = 0
         self.size = 0
         self.device = device
+        self.node_type = node_type
 
         # Pre-allocate with torch tensors on the specified device
         self.state = torch.zeros((max_size, state_dim), dtype=torch.float32, device=device)
@@ -79,15 +80,18 @@ class ReplayBuffer:
         return self.size
 
 class MultiAgentReplayBuffer:
-    def __init__(self, num_agents, max_size_per_agent, state_dim, action_dim, device="cpu"):
+    def __init__(self, num_agents, node_type, max_size_per_agent, state_dim, action_dim, device="cpu"):
         self.num_agents = num_agents
         self.device = device
+        self.node_type = node_type
         self.buffers = [
-            ReplayBuffer(max_size_per_agent, state_dim, action_dim, device)
+            ReplayBuffer(max_size_per_agent, node_type, state_dim, action_dim, device)
             for _ in range(num_agents)
         ]
         self.buffer_sizes = torch.zeros(num_agents, dtype=torch.long, device=device)
         self.total_size = 0
+        self.total_adds = 0
+        self.log_interval = 5000*num_agents if node_type=="Terminal_Group" else 500*num_agents
 
     def add_batch(self, states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids):
         # Maintain everything in tensor form
@@ -101,6 +105,39 @@ class MultiAgentReplayBuffer:
             self.buffer_sizes[a_id] = self.buffers[a_id].size
             
         self.total_size = self.buffer_sizes.sum().item()
+        self.total_adds += len(a_ids)
+        
+        # Periodic logic logging
+        if self.total_adds >= self.log_interval:
+            self.total_adds = 0
+            self.print_reward()
+            # if self.node_type=="Terminal_Group":
+            #     self.print_stats()
+
+    def print_stats(self):
+        all_s_list = [b.state[:b.size] for b in self.buffers if b.size > 0]
+        if all_s_list:
+            combined_s = torch.cat(all_s_list).view(-1)
+            sq = torch.quantile(combined_s, torch.tensor([0.25, 0.5, 0.75], device=self.device))
+            print(f"[Terminal State Metrics]  Mean: {combined_s.mean().item():.3f} | Std: {combined_s.std().item():.3f}")
+            print(f"                       | Range: [{combined_s.min().item():.3f}, {combined_s.max().item():.3f}]")
+            print(f"                       | Q25:{sq[0].item():.3f} Q50:{sq[1].item():.3f} Q75:{sq[2].item():.3f}")
+
+        print(f"----------------------------------------------------\n")
+
+    def print_reward(self):
+        if self.total_size == 0: return
+        
+        print(f"\n--- Multi-Agent Buffer Detailed Stats (Total: {self.total_size}) ---")
+        
+        # 1. Reward: Focus on the first agent as a representative sample
+        sample_buf = self.buffers[0]
+        if sample_buf.size > 0:
+            r = sample_buf.reward[:sample_buf.size].view(-1)
+            rq = torch.quantile(r, torch.tensor([0.25, 0.5, 0.75], device=self.device))
+            print(f"[{self.node_type} Agent 0 Reward] Mean: {r.mean().item():.3f} | Std: {r.std().item():.3f}")
+            print(f"                       | Min: {r.min().item():.3f} | Max: {r.max().item():.3f}")
+            print(f"                       | Q25:{rq[0].item():.3f} Q50:{rq[1].item():.3f} Q75:{rq[2].item():.3f}")
 
     def sample(self, batch_sizes, agent_ids=None):
         # 1. Determine which agents to sample from

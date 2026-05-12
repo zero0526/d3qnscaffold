@@ -223,17 +223,17 @@ class MetricsAggregator:
             self._print_traffic_matrix()
 
         # Added Combined Node-Service Average Matrix Log
-        if self.eps_f_alloc:
-            self.log("\n" + "="*120)
-            self.log("         NODE-SERVICE RESOURCE ATTRIBUTION (Avg: f_alloc | Arrival | Backlog)")
-            self.log("="*120)
-            
-            avg_f = np.mean(self.eps_f_alloc, axis=0)
-            avg_arr = np.mean(self.eps_arrivals, axis=0)
-            avg_back = np.mean(self.eps_backlog, axis=0)
-            
-            self._print_combined_node_service_matrix(avg_f, avg_arr, avg_back)
-            self.log("="*120 + "\n")
+        # if self.eps_f_alloc:
+        #     self.log("\n" + "="*120)
+        #     self.log("         NODE-SERVICE RESOURCE ATTRIBUTION (Avg: f_alloc | Arrival | Backlog)")
+        #     self.log("="*120)
+        #
+        #     avg_f = np.mean(self.eps_f_alloc, axis=0)
+        #     avg_arr = np.mean(self.eps_arrivals, axis=0)
+        #     avg_back = np.mean(self.eps_backlog, axis=0)
+        #
+        #     self._print_combined_node_service_matrix(avg_f, avg_arr, avg_back)
+        #     self.log("="*120 + "\n")
 
         # Task Completion Summary
         if self.eps_assigned > 0:

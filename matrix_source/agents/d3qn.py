@@ -52,17 +52,40 @@ class MultiInstanceLinear(nn.Module):
             out += self.bias[indices]
         return out
 
+class MultiInstanceRMSNorm(nn.Module):
+    """
+    Instance-specific Root Mean Square Layer Normalization.
+    Each agent instance has its own learnable weight (gamma).
+    """
+    def __init__(self, num_instances, normalized_shape, eps=1e-6):
+        super().__init__()
+        self.num_instances = num_instances
+        self.normalized_shape = normalized_shape
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(num_instances, normalized_shape))
+
+    def forward(self, x, indices):
+        # x: (Batch, normalized_shape)
+        # indices: (Batch)
+        # RMS = sqrt(mean(x^2) + eps)
+        rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
+        x_norm = x / rms
+        
+        # Select gamma for each instance in the batch
+        gamma = self.weight[indices]
+        return x_norm * gamma
+
 class DuelingNetwork(nn.Module):
     def __init__(self, state_dim, mf_dim, action_dim, hidden_sizes, num_instances=1):
         super().__init__()
         h1, h2 = hidden_sizes
         self.num_instances = num_instances
 
-        # Base shared representation
+        # Independent normalized representation for each agent
         self.l1 = MultiInstanceLinear(num_instances, state_dim + mf_dim, h1)
-        self.ln1 = nn.LayerNorm(h1)
+        self.norm1 = MultiInstanceRMSNorm(num_instances, h1)
         self.l2 = MultiInstanceLinear(num_instances, h1, h2)
-        self.ln2 = nn.LayerNorm(h2)
+        self.norm2 = MultiInstanceRMSNorm(num_instances, h2)
 
         # Value stream
         self.v1 = MultiInstanceLinear(num_instances, h2, h2)
@@ -75,9 +98,9 @@ class DuelingNetwork(nn.Module):
     def forward(self, state, pred_mf, indices=None):
         x = torch.cat([state, pred_mf], dim=-1)
         
-        # Hidden Layers
-        x = F.silu(self.ln1(self.l1(x, indices)))
-        x = F.silu(self.ln2(self.l2(x, indices)))
+        # Independent normalization and activation
+        x = F.silu(self.norm1(self.l1(x, indices), indices))
+        x = F.silu(self.norm2(self.l2(x, indices), indices))
         
         # Heads
         V = self.v2(F.silu(self.v1(x, indices)), indices)
@@ -96,12 +119,12 @@ class MF(nn.Module):
         self.num_instances = num_instances
         
         self.l1 = MultiInstanceLinear(num_instances, input_size, h)
-        self.ln = nn.LayerNorm(h)
+        self.norm = MultiInstanceRMSNorm(num_instances, h)
         self.l2 = MultiInstanceLinear(num_instances, h, output_size)
 
     def forward(self, x, indices=None):
-        x = F.silu(self.ln(self.l1(x, indices)))
-        return torch.sigmoid(self.l2(x, indices))
+        x = F.silu(self.norm(self.l1(x, indices), indices))
+        return torch.sigmoid(self.l2(x, indices)) # Constrain MF to [0, 1] range
 
 class D3QNAgent:
     def __init__(self, node_id, node_type, state_dim, action_dim, u_action_dim, mf_hidden_sizes, mf_lr, buffer_min_size,
@@ -130,10 +153,10 @@ class D3QNAgent:
         
         self.optimizer = optim.Adam(self.eval_net.parameters(), lr=lr)
         self.mf_optimizer = optim.Adam(self.mf_net.parameters(), lr=mf_lr)
-        self.loss_fn = nn.MSELoss()
+        self.loss_fn = nn.SmoothL1Loss() # Huber Loss is more robust to large reward scales
         
         # Each agent instance gets its own partitioned buffer to prevent "noise" and ensure fair training
-        self.memory = MultiAgentReplayBuffer(num_instances, buffer_size // num_instances, state_dim, action_dim, self.device)
+        self.memory = MultiAgentReplayBuffer(num_instances,node_type, buffer_size, state_dim, action_dim, self.device)
 
         # Logging
         self.prev_loss = 0.0
@@ -266,12 +289,14 @@ class D3QNAgent:
         loss = self.loss_fn(q_eval, q_target)
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.eval_net.parameters(), max_norm=10.0)
+        torch.nn.utils.clip_grad_norm_(self.eval_net.parameters(), max_norm=1.0)
         self.optimizer.step()
 
         # Update logging/target
         self.learn_step_counter += 1
-        if self.learn_step_counter % 100 == 0:
+        step=10
+        if self.node_type=="Terminal_Group":step=100
+        if self.learn_step_counter % step == 0:
             avg_q = q_eval.mean().item()
             print(f"[{self.node_type} Group] Step {self.learn_step_counter:5d} | TD Loss: {loss.item():.5f} | Avg Q: {avg_q:.3f}")
         
@@ -282,3 +307,6 @@ class D3QNAgent:
         with torch.no_grad():
             for target_param, eval_param in zip(self.target_net.parameters(), self.eval_net.parameters()):
                 target_param.data.copy_(self.alpha * eval_param.data + (1.0 - self.alpha) * target_param.data)
+
+
+

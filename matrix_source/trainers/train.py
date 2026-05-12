@@ -46,8 +46,8 @@ class Trainer:
         # Training control variables
         self.total_lower_steps = 0
         self.total_upper_steps = 0
-        self.lower_stable_threshold = 50000
-        self.lower_start_threshold = 20000
+        self.lower_stable_threshold = 500
+        self.lower_start_threshold = self.config.hyper_neural["BUFFER_MIN_SIZE"][1]
         
         self.aggregator = MetricsAggregator()
         self.shared_upper_agent: D3QNAgent = None
@@ -145,7 +145,7 @@ class Trainer:
                     is_ep_done = (slot == max_slots - 1)
                     
                     # Phased Curriculum: Only collect and train Upper after Lower is stable
-                    if self.total_lower_steps >= self.lower_stable_threshold:
+                    if self.total_lower_steps >= self.lower_stable_threshold/10:
                         self.store_upper_transitions(current_upper_state, next_upper_state, obs_upper, res_upper, u_acts_matrix, is_ep_done)
                         self.total_upper_steps += 1 # Approximate upper samples
 
@@ -231,22 +231,23 @@ class Trainer:
         
         # datasize, min_accuracy, deadline, service_omega
         states[:, 0] /= self.config.norm_data_size
-        # states[:, 1] /= float(norm_factors.get("1", 1.0))
+        states[:, 1] /= 100.0
         # states[:, 2] /= float(norm_factors.get("2", 1.0))
         # states[:, 3] /= float(norm_factors.get("3", 1.0))
         
         # Broadcast normalization for all unknown topology dimensions
         if states.shape[1] > 4:
             states[:, 4:4+2*self.num_nodes] /= self.config.norm_gflop # Standard Backlog Divisor
-        
-        # 2. Vectorized Masks
-        p_mask = placement_matrix[:, s_idx].T > 0 # (Batch, num_nodes)
-        a_mask = model_accs[s_idx, :] >= tasks_min_accuracy.unsqueeze(1) # (Batch, max_models)
-        masks = (p_mask.unsqueeze(2) & a_mask.unsqueeze(1)).flatten(start_dim=1).float() # (Batch, action_dim)
-        
-        # Fallback if entirely masked
-        invalid_mask_rows = (masks.sum(dim=1) == 0)
-        masks[invalid_mask_rows] = 1.0
+        # p_mask = torch.zeros_like(placement_matrix[:, s_idx])
+        # # placement_matrix[:, s_idx].T > 0 # (Batch, num_nodes)
+        # a_mask = model_accs[s_idx, :] >= tasks_min_accuracy.unsqueeze(1)  # (Batch, max_models)
+        # masks = (p_mask.unsqueeze(2) & a_mask.unsqueeze(1)).flatten(start_dim=1).float()  # (Batch, action_dim)
+        #
+        # # Fallback if entirely masked
+        # invalid_mask_rows = (masks.sum(dim=1) == 0)
+        # masks[invalid_mask_rows] = 1.0
+        # 2. Vectorized Masks - DISABLED (Agent must learn topology independently)
+        masks = torch.ones((len(t_idx), self.num_nodes * self.max_models), device=self.device)
         
         # 3. Vectorized mean fields
         mfs = mf_terminals[t_idx]
@@ -284,12 +285,12 @@ class Trainer:
         
 
         states[:, 0] /= self.config.norm_data_size
-        # states[:, 1] /= float(norm_factors.get("1", 1.0))
+        states[:, 1] /= 100.0
         # states[:, 2] /= float(norm_factors.get("2", 1.0))
         # states[:, 3] /= float(norm_factors.get("3", 1.0))
         
         next_states[:, 0] /= self.config.norm_data_size
-        # next_states[:, 1] /= float(norm_factors.get("1", 1.0))
+        next_states[:, 1] /= 100.0
         # next_states[:, 2] /= float(norm_factors.get("2", 1.0))
         # next_states[:, 3] /= float(norm_factors.get("3", 1.0))
         
@@ -298,8 +299,8 @@ class Trainer:
             next_states[:, 4:4+2*self.num_nodes] /= self.config.norm_gflop
      
         # Normalize reward
-        rew_divisor = self.config.normalization.get("rewards", {}).get("lower_divisor", 1.0)
-        normalized_reward = reward / (rew_divisor if rew_divisor != 0 else 1.0)
+        rew_divisor = self.config.norm_lower_rw
+        normalized_reward = log_transform(reward / (rew_divisor if rew_divisor != 0 else 1.0))
         rewards = torch.full((len(t_idx),), normalized_reward, dtype=torch.float32, device=self.device)
         
         a_ids = (n_idx * self.max_models + m_idx).long()
@@ -334,8 +335,8 @@ class Trainer:
         edge_a_ids = (edge_acts * powers_of_2).sum(dim=1).long()
 
         # Normalize global reward
-        rew_divisor = self.config.normalization.get("rewards", {}).get("upper_divisor", 1.0)
-        normalized_reward = reward / (rew_divisor if rew_divisor != 0 else 1.0)
+        rew_divisor = self.config.norm_upper_rw
+        normalized_reward = log_transform(reward / (rew_divisor if rew_divisor != 0 else 1.0))
         rewards = torch.full((self.num_edge_agents,), normalized_reward, dtype=torch.float32, device=self.device)
 
         # Map edge node IDs to instance indices
@@ -379,6 +380,9 @@ class Trainer:
             self.zeta_upper = self.zeta_initial + (self.zeta_max - self.zeta_initial) * upper_fraction
         else:
             self.zeta_upper = self.zeta_initial # Remains low (exploration mode)
+
+def log_transform(reward: float) -> float:
+    return reward
 
 if __name__ == "__main__":
     Trainer().train()

@@ -223,7 +223,7 @@ class MatrixPhysicalEngine:
         t_rem_raw = task_deadlines - trans_delays - cold_delays
         t_q_rem = t_rem_raw - task_max_queue
         
-        valid_mask = t_q_rem >= 1e-4
+        valid_mask = t_rem_raw >= 1e-4
         # Initialize immediate fails with tasks failing initial checks
         fails_idx = (~valid_mask)
         if fails_idx.any():
