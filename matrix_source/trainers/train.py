@@ -46,7 +46,7 @@ class Trainer:
         # Training control variables
         self.total_lower_steps = 0
         self.total_upper_steps = 0
-        self.lower_stable_threshold = 500
+        self.lower_stable_threshold = self.config.hyper_neural["BUFFER_MIN_SIZE"][0]*10
         self.lower_start_threshold = self.config.hyper_neural["BUFFER_MIN_SIZE"][1]
         
         self.aggregator = MetricsAggregator()
@@ -363,8 +363,8 @@ class Trainer:
         # 2. Phased Zeta Annealing
         num_eps = self.config.hyper_neural.get('NUMOF_TRAIN_EP', 3000)
         
-        # Lower Zeta: Increases from 20k to 50k samples
-        fraction = min(1.0, ep / num_eps)
+        # Lower Zeta:
+        fraction = min(1.0, ep / self.config.hyper_neural["ANNEALING_LENGTH"])
         if self.total_lower_steps < self.lower_start_threshold:
             self.zeta_lower = self.zeta_initial
         elif self.total_lower_steps < self.lower_stable_threshold:
@@ -373,13 +373,11 @@ class Trainer:
             target = self.zeta_initial + (self.zeta_max * 0.5 - self.zeta_initial) * bump_factor
             self.zeta_lower = max(self.zeta_lower, target)
         else:
-            # Slow increase afterwards
             self.zeta_lower = self.zeta_initial + (self.zeta_max - self.zeta_initial) * fraction
             
         # Upper Zeta: Only increases AFTER lower is stable and upper has enough valid samples
-        if self.total_lower_steps >= self.lower_stable_threshold and self.total_upper_steps > self.lower_stable_threshold/self.env.time_manager.max_steps:
-            upper_fraction = min(1.0, (ep) / num_eps) # Simplify scaling
-            self.zeta_upper = self.zeta_initial + (self.zeta_max - self.zeta_initial) * upper_fraction
+        if self.total_lower_steps >= self.lower_stable_threshold:
+            self.zeta_upper = self.zeta_initial + (self.zeta_max - self.zeta_initial) * fraction
         else:
             self.zeta_upper = self.zeta_initial # Remains low (exploration mode)
 
