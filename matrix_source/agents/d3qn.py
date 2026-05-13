@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import numpy as np
 import torch.nn.functional as F
 import torch.optim as optim
 from typing import Tuple
@@ -129,7 +130,7 @@ class MF(nn.Module):
 class D3QNAgent:
     def __init__(self, node_id, node_type, state_dim, action_dim, u_action_dim, mf_hidden_sizes, mf_lr, buffer_min_size,
                  hidden_sizes=(128, 64), lr=1e-4, gamma=0.99, alpha=0.005, buffer_size=100000, batch_size=64,
-                 exclude_zero=False, num_instances=1):
+                 exclude_zero=False, num_instances=1, device=None):
         self.node_id = node_id
         self.node_type = node_type
         self.action_dim = action_dim
@@ -138,7 +139,10 @@ class D3QNAgent:
         self.alpha = float(alpha)
         self.batch_size = batch_size
         self.exclude_zero = exclude_zero
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
         self.num_instances = num_instances
         
         self.min_batch_size = buffer_min_size
@@ -183,6 +187,17 @@ class D3QNAgent:
             
         if masks_batch is not None:
             masks_batch = masks_batch.to(self.device)
+            
+        # Ensure states and mfs are on the correct device
+        if not torch.is_tensor(states_batch):
+            states_batch = torch.as_tensor(states_batch, dtype=torch.float32, device=self.device)
+        else:
+            states_batch = states_batch.to(self.device)
+            
+        if not torch.is_tensor(prev_mfs_batch):
+            prev_mfs_batch = torch.as_tensor(prev_mfs_batch, dtype=torch.float32, device=self.device)
+        else:
+            prev_mfs_batch = prev_mfs_batch.to(self.device)
 
         # 1. Per-Agent Cold-Start Check
         is_policy_agent = torch.tensor([
@@ -208,8 +223,8 @@ class D3QNAgent:
         policy_mask = is_policy_agent
         if policy_mask.any():
             indices = policy_mask.nonzero(as_tuple=True)[0]
-            s_subset = states_batch[indices].to(self.device) if torch.is_tensor(states_batch) else torch.FloatTensor(states_batch[indices]).to(self.device)
-            mf_subset = prev_mfs_batch[indices].to(self.device) if torch.is_tensor(prev_mfs_batch) else torch.FloatTensor(prev_mfs_batch[indices]).to(self.device)
+            s_subset = states_batch[indices]
+            mf_subset = prev_mfs_batch[indices]
             aid_subset = agent_indices[indices]
 
             with torch.no_grad():

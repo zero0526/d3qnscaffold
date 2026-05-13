@@ -77,7 +77,8 @@ class Trainer:
             alpha=float(self.config.hyper_neural['UPDATE_TARGET_COEF']),
             buffer_size=self.config.hyper_neural['MEMORY_SIZE'],
             batch_size=self.config.hyper_neural['BATCH_SIZE'],
-            num_instances=self.num_edge_agents # Unified independent parameters for all edge nodes
+            num_instances=self.num_edge_agents, # Unified independent parameters for all edge nodes
+            device=self.device
         )
 
         self.shared_lower_agent = D3QNAgent(
@@ -94,7 +95,8 @@ class Trainer:
             alpha=float(self.config.hyper_neural['UPDATE_TARGET_COEF']),
             buffer_size=self.config.hyper_neural['MEMORY_SIZE'],
             batch_size=self.config.hyper_neural['BATCH_SIZE'],
-            num_instances=self.num_terminals # Independent weights for every terminal
+            num_instances=self.num_terminals, # Independent weights for every terminal
+            device=self.device
         )
 
     def train(self):
