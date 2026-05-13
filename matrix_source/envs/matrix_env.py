@@ -1,4 +1,6 @@
 import torch
+import time
+from collections import defaultdict
 from matrix_source.envs.time_manager import TimeManager
 from matrix_source.envs.matrix_physical_engine import MatrixPhysicalEngine
 from matrix_source.envs.init_matrices import init_static_matrices, init_metadata_tensors
@@ -25,36 +27,37 @@ class MatrixSixGEnvironment:
             timeframe_size=config.hyper_neural["TIME_SLOT_PER_TIMEFRAME"] ,
             max_steps=config.hyper_neural["NUMOF_TF_EP"]*config.hyper_neural["TIME_SLOT_PER_TIMEFRAME"]
         )
+        self.prof = defaultdict(float)
+        self.prof_counts = defaultdict(int)
+        self.step_count = 0
 
     def reset(self):
+        t0 = time.perf_counter()
         self.time_manager.reset()
-        return self.engine.reset()
+        res = self.engine.reset()
+        self.prof['reset'] += time.perf_counter() - t0
+        return res
 
     def step_upper(self, placement_matrix):
-        """
-        Upper-level decision: Update service placement internally.
-        """
+        t0 = time.perf_counter()
         self.engine.set_upper_action(placement_matrix)
+        self.prof['step_upper'] += time.perf_counter() - t0
         
     def collect_upper_metrics(self):
-        """
-        Collect results for the timeframe that just finished.
-        """
+        t0 = time.perf_counter()
         metrics = self.engine.collect_upper_metrics()
         metrics["is_done"] = self.time_manager.current_step >= self.time_manager.max_steps
+        self.prof['collect_upper'] += time.perf_counter() - t0
         return metrics
 
     def step_lower(self, terminal_indices, svc_indices, task_batch_sizes, node_indices, model_indices, task_deadlines, tasks_min_accuracy):
-        """
-        Execute the lower-level step via the physical engine.
-        """
+        t0 = time.perf_counter()
         # 1. Process Arrivals
         node_arrival_matrix, trans_energy_total, cold_delays, f_min_matrix = self.engine.process_arrivals(
             terminal_indices, svc_indices, node_indices, model_indices, task_batch_sizes, task_deadlines, tasks_min_accuracy
         )
         
         # 2. Solver Optimization
-        # f_min_matrix = self.engine.get_f_min_matrix()
         self.engine.optimize_allocation(node_arrival_matrix, f_min_matrix)
         
         # 3. Execution & Metrics
@@ -62,6 +65,14 @@ class MatrixSixGEnvironment:
         
         # 4. Finalize Slot
         self.time_manager.tick()
+        self.prof['step_lower'] += time.perf_counter() - t0
+        self.step_count += 1
+        
+        if self.step_count % 1000 == 0:
+            print(f"\n<<< Env Profiling (Step {self.step_count}) >>>")
+            for k, v in sorted(self.prof.items()):
+                print(f"  {k:20s}: {v*1000/1000:8.3f} ms/call")
+            self.prof.clear()
 
         return {
             "reward": results['reward'].item(),
