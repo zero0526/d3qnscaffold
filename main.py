@@ -1,6 +1,10 @@
-from matrix_source.trainers.train import  Trainer
-if __name__ == '__main__':
-    trainer= Trainer()
-    trainer.train()
+from matrix_source.trainers.train import Trainer
+from matrix_source.trainers.ppo_stategy import PPOStrategy
+from matrix_source.trainers.d3qn_strategy import D3QNStrategy
 
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
+if __name__ == '__main__':
+    # Pick the algorithm strategy: PPOStrategy() or D3QNStrategy()
+    strategy = PPOStrategy() 
+    
+    trainer = Trainer(strategy=strategy)
+    trainer.train()

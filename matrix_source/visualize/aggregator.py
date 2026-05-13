@@ -10,6 +10,8 @@ class MetricsAggregator:
         self.history = defaultdict(list)
         self.episode_count = 0
         self._setup_logger()
+        self.history["zeta_lower"] = []
+        self.history["zeta_upper"] = []
         self.reset_episode()
 
     def _setup_logger(self):
@@ -72,6 +74,9 @@ class MetricsAggregator:
         # State Tracking for Normalization Analysis
         self.episode_upper_states = []
         self.episode_lower_states = []
+        
+        self.curr_zeta_lower = 1.0
+        self.curr_zeta_upper = 1.0
         
         # Offloading flow matrix: [SourceNode][TargetNode] -> count
         self.episode_offloading_matrix = defaultdict(lambda: defaultdict(int))
@@ -152,6 +157,10 @@ class MetricsAggregator:
             elif isinstance(lower_losses, (float, int)):
                 self.episode_lower_td_losses.append(float(lower_losses))
 
+    def record_zeta(self, lower, upper):
+        self.curr_zeta_lower = lower
+        self.curr_zeta_upper = upper
+
     def store_history(self):
         """Saves episode averages to history and RESETS intra-episode data."""
         self.history["upper_reward"].append(np.sum(self.episode_upper_rewards))
@@ -165,10 +174,19 @@ class MetricsAggregator:
         self.history["total_violate_qos"].append(np.sum(self.episode_violate_qos) if self.episode_violate_qos else 0)
         
         # Training Losses
+        def get_avg_or_last(current_list, history_key):
+            if current_list:
+                return np.mean(current_list)
+            return self.history[history_key][-1] if self.history[history_key] else 0
+
         self.history["avg_upper_mf_loss"].append(np.mean(self.episode_upper_mf_losses) if self.episode_upper_mf_losses else 0)
         self.history["avg_lower_mf_loss"].append(np.mean(self.episode_lower_mf_losses) if self.episode_lower_mf_losses else 0)
-        self.history["avg_upper_td_loss"].append(np.mean(self.episode_upper_td_losses) if self.episode_upper_td_losses else 0)
-        self.history["avg_lower_td_loss"].append(np.mean(self.episode_lower_td_losses) if self.episode_lower_td_losses else 0)
+        
+        self.history["avg_upper_td_loss"].append(get_avg_or_last(self.episode_upper_td_losses, "avg_upper_td_loss"))
+        self.history["avg_lower_td_loss"].append(get_avg_or_last(self.episode_lower_td_losses, "avg_lower_td_loss"))
+
+        self.history["zeta_lower"].append(self.curr_zeta_lower)
+        self.history["zeta_upper"].append(self.curr_zeta_upper)
 
         # QoS Success Rate
         success = np.sum(self.episode_success_qos) if self.episode_success_qos else 0
