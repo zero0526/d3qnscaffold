@@ -35,9 +35,9 @@ class PPOStrategy(AlgorithmStrategy):
         # Hyperparams from user
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
         self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 5}
-        self.lower_warmup_steps = 20
-        self.upper_warmup_steps = 10
-        self.alt_steps = 10
+        self.lower_warmup_steps = 5
+        self.upper_warmup_steps = 5
+        self.alt_steps = 5
 
     def initialize_agents(self, trainer):
         # 1. Upper Agent
@@ -101,7 +101,7 @@ class PPOStrategy(AlgorithmStrategy):
         is_det = (self.phase == 'ALTERNATING' and self.alt_next == 'LOWER')
         
         batch_a_ids = trainer.shared_upper_agent.choose_action_batch(
-            edge_states, edge_mfs, trainer.zeta_upper, agent_indices=instance_indices, deterministic=is_det
+            edge_states, edge_mfs, agent_indices=instance_indices, deterministic=is_det
         )
         
         for i, nid in enumerate(trainer.edge_node_ids):
@@ -134,7 +134,7 @@ class PPOStrategy(AlgorithmStrategy):
         is_det = (self.phase == 'UPPER_ONLY' or (self.phase == 'ALTERNATING' and self.alt_next == 'UPPER'))
         
         batch_actions = trainer.shared_lower_agent.choose_action_batch(
-            states, mfs, trainer.zeta_lower, masks_batch=masks, 
+            states, mfs, masks_batch=masks, 
             agent_indices=torch.arange(trainer.num_terminals, device=trainer.device),
             deterministic=is_det
         )
@@ -203,38 +203,14 @@ class PPOStrategy(AlgorithmStrategy):
         )
         trainer.aggregator.add_upper(next_res, mf_loss=avg_mf_loss, state=edge_states[0] if len(edge_states) > 0 else None)
 
-    def update_curriculum_rates(self, trainer):
-        # 1. Fetch config values
-        target_zeta = trainer.config.hyper_neural.get("ZETA_MAX", 10.0)
-        initial_zeta = trainer.config.hyper_neural.get("ZETA", 1.0)
-        delta = target_zeta - initial_zeta
-
-        # 2. Anneal based on Phase
-        if self.phase == 'LOWER_ONLY':
-            progress = min(1.0, self.lower_train_num / self.lower_warmup_steps)
-            trainer.zeta_lower = initial_zeta + delta * progress
-            trainer.zeta_upper = initial_zeta
-        elif self.phase == 'UPPER_ONLY':
-            # progress_lower = 1.0 (keep target_zeta)
-            progress_upper = min(1.0, self.upper_train_num / self.upper_warmup_steps)
-            trainer.zeta_lower = target_zeta
-            trainer.zeta_upper = initial_zeta + delta * progress_upper
-        else: # ALTERNATING
-            trainer.zeta_lower = target_zeta
-            trainer.zeta_upper = target_zeta
-            
-        # Optional: update epsilons for logging consistency if needed, 
-        # but PPO doesn't use them for exploration.
-        trainer.aggregator.record_zeta(trainer.zeta_lower, trainer.zeta_upper)
-
     def run_training(self, trainer):
         max_slots = trainer.env.time_manager.max_steps
         ep = 0
 
-        pbar = tqdm(total=300+100+100, desc="Overall Training Progress")
+        pbar = tqdm(total=self.lower_warmup_steps + self.upper_warmup_steps + self.alt_steps, desc="Overall Training Progress")
         
         while True:
-            if self.phase == 'ALTERNATING' and self.alt_train_num >= 100:
+            if self.phase == 'ALTERNATING' and self.alt_train_num >= self.alt_steps:
                 print(f"\n[Curriculum] Phase 3 Complete. Training Finished.")
                 break
                 
@@ -242,7 +218,6 @@ class PPOStrategy(AlgorithmStrategy):
             obs_upper = obs['upper']
             prev_lower_res = obs['lower']
             current_upper_state = self.build_upper_state(trainer, obs_upper) 
-            # self.update_curriculum_rates(trainer) -- Updated only after train+collect as per user request
             
             for slot in range(max_slots):
                 if trainer.env.time_manager.is_new_frame():
@@ -287,7 +262,6 @@ class PPOStrategy(AlgorithmStrategy):
                                     self.phase = 'UPPER_ONLY'
                                     print(f"\n[Curriculum] Phase 1 Complete. Switching to {self.phase}")
                                 
-                                self.update_curriculum_rates(trainer)
                                 pbar.update(1)
                                 if self.phase == 'ALTERNATING' and self.alt_train_num >= self.alt_steps: break
                 else:
@@ -325,7 +299,6 @@ class PPOStrategy(AlgorithmStrategy):
                                     self.phase = 'ALTERNATING'
                                     print(f"\n[Curriculum] Phase 2 Complete. Switching to {self.phase}")
                                 
-                                self.update_curriculum_rates(trainer)
                                 pbar.update(1)
                                 if self.phase == 'ALTERNATING' and self.alt_train_num >= self.alt_steps: break
 
@@ -335,6 +308,6 @@ class PPOStrategy(AlgorithmStrategy):
             trainer.aggregator.store_history()
             trainer.aggregator.report_episode(ep)
             print(f"--- Curriculum Status ---")
-            print(f"Phase: {self.phase} | Lower: {self.lower_train_num}/300 | Upper: {self.upper_train_num}/100 | Alt: {self.alt_train_num}/100")
+            print(f"Phase: {self.phase} | Lower: {self.lower_train_num}/{self.lower_warmup_steps} | Upper: {self.upper_train_num}/{self.upper_warmup_steps} | Alt: {self.alt_train_num}/{self.alt_steps}")
             ep += 1
         pbar.close()

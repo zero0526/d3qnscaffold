@@ -173,19 +173,18 @@ class PPOAgent:
         self._cached_log_probs = {}
         self._cached_values = {}
 
-    def choose_action(self, state, prev_mf, epsilon, zeta, mask=None, agent_idx=0):
+    def choose_action(self, state, prev_mf, epsilon, mask=None, agent_idx=0):
         # Single agent usage
         idx_tensor = torch.tensor([agent_idx], device=self.device)
         actions = self.choose_action_batch(
             state.unsqueeze(0) if not torch.is_tensor(state) else state.detach().unsqueeze(0),
             prev_mf.unsqueeze(0) if not torch.is_tensor(prev_mf) else prev_mf.detach().unsqueeze(0),
-            zeta, 
             masks_batch=mask.unsqueeze(0) if mask is not None else None,
             agent_indices=idx_tensor
         )
         return int(actions[0])
 
-    def choose_action_batch(self, states, mfs, zeta=1.0, masks_batch=None, agent_indices=None, deterministic=False):
+    def choose_action_batch(self, states, mfs, masks_batch=None, agent_indices=None, deterministic=False):
         batch_size = states.shape[0]
         if agent_indices is None:
             agent_indices = torch.zeros(batch_size, dtype=torch.long, device=self.device)
@@ -206,7 +205,7 @@ class PPOAgent:
             logits = self.actor(states, pred_mfs, indices=agent_indices)
             values = self.critic(states, pred_mfs, indices=agent_indices)
             
-            # 3. Apply masks and temperature (zeta)
+            # 3. Apply masks
             if masks_batch is not None:
                 logits = logits + (masks_batch - 1.0) * 1e10
                 
@@ -218,13 +217,11 @@ class PPOAgent:
                 actions = logits.argmax(dim=-1)
                 log_probs = torch.zeros_like(actions, dtype=torch.float32) # Log prob not typically used for deterministic actions but kept for compatibility
             else:
-                probs = torch.softmax(logits * zeta, dim=-1)
+                probs = torch.softmax(logits, dim=-1)
                 dist = Categorical(probs)
                 actions = dist.sample()
                 
                 # In PPO we need log_prob and value of the sampled action.
-                # Using logits before applying temperature for actual log_prob calculation is theoretically sound
-                # but since dist is instantiated with temp-adjusted probs, log_prob will reflect exploration profile.
                 log_probs = dist.log_prob(actions)
 
         # Cache values securely mapped to agent_index to use in storage stage (to keep API compatible)

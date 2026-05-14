@@ -71,22 +71,6 @@ class Trainer:
             self.epsilons[nid] = max(self.min_epsilon, self.epsilons[nid] * self.epsilon_decay)
         for tid in self.lower_epsilons: 
             self.lower_epsilons[tid] = max(self.min_epsilon, self.lower_epsilons[tid] * self.epsilon_decay)
-            
-        # 2. Phased Zeta Annealing
-        fraction = min(1.0, ep / self.config.hyper_neural["ANNEALING_LENGTH"])
-        if self.total_lower_steps < self.lower_start_threshold:
-            self.zeta_lower = self.zeta_initial
-        elif self.total_lower_steps < self.lower_stable_threshold:
-            bump_factor = min(1.0, (self.total_lower_steps - self.lower_start_threshold) / (self.lower_stable_threshold - self.lower_start_threshold))
-            target = self.zeta_initial + (self.zeta_max * 0.5 - self.zeta_initial) * bump_factor
-            self.zeta_lower = max(self.zeta_lower, target)
-        else:
-            self.zeta_lower = self.zeta_initial + (self.zeta_max - self.zeta_initial) * fraction
-            
-        if self.total_lower_steps >= self.lower_stable_threshold:
-            self.zeta_upper = self.zeta_initial + (self.zeta_max - self.zeta_initial) * fraction
-        else:
-            self.zeta_upper = self.zeta_initial
 
 def log_transform(reward: float) -> float:
     return reward
