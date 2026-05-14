@@ -186,10 +186,6 @@ class DirichletActor(nn.Module):
 
         return action, log_prob
 
-
-# -----------------------------
-# SAC Agent
-# -----------------------------
 class SACAgent:
     def __init__(
         self,

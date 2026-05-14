@@ -143,16 +143,9 @@ class PPOStrategy(AlgorithmStrategy):
         return a_ids // trainer.max_models, a_ids % trainer.max_models
 
     def store_lower_transitions(self, trainer, current_res, next_res, t_idx, s_idx, n_idx, m_idx):
-        # Only store transitions if Lower is NOT frozen
-        if self.phase == 'UPPER_ONLY': return
-        if self.phase == 'ALTERNATING' and self.alt_next != 'LOWER': return
-
         from matrix_source.trainers.train import log_transform
-        reward = next_res['reward']
-        done = torch.tensor([next_res["new_frame"]]*len(t_idx), dtype=torch.float32, device=trainer.device)
-        c_obs, n_obs = current_res['obs'], next_res['obs']
-        c_mf, n_mf = current_res['mean_field'], next_res['mean_field']
         
+        # 1. Build states for MF network training (even if frozen, we might want to track MF loss)
         def build_state(obs, tidx, sidx):
             st = torch.cat([obs['task_reqs'][tidx], obs['backlog'][:, sidx].T, obs['cpu_alloc'][:, sidx].T], dim=1)
             st[:, 0] /= trainer.config.norm_data_size
@@ -160,47 +153,67 @@ class PPOStrategy(AlgorithmStrategy):
             if st.shape[1] > 4: st[:, 4:4+2*trainer.num_nodes] /= trainer.config.norm_gflop
             return st
 
+        c_obs, n_obs = current_res['obs'], next_res['obs']
         states = build_state(c_obs, t_idx, s_idx)
         next_states = build_state(n_obs, t_idx, s_idx)
         
+        # 2. Extract metrics and rewards
+        reward = next_res['reward']
         rew_divisor = trainer.config.norm_lower_rw
         norm_rew = log_transform(reward / (rew_divisor if rew_divisor != 0 else 1.0))
-        rewards = torch.full((len(t_idx),), norm_rew, dtype=torch.float32, device=trainer.device)
-        a_ids = (n_idx * trainer.max_models + m_idx).long()
         
-        avg_mf_loss = trainer.shared_lower_agent.store_transition_train_mf_batch(
-            states, c_mf[t_idx], n_mf[t_idx], a_ids, rewards, next_states, done, agent_ids=t_idx
-        )
+        # 3. Handle MF training and transition storage (only if NOT frozen)
+        avg_mf_loss = None
+        is_frozen = (self.phase == 'UPPER_ONLY' or (self.phase == 'ALTERNATING' and self.alt_next != 'LOWER'))
+        
+        if not is_frozen:
+            done = torch.tensor([next_res["new_frame"]]*len(t_idx), dtype=torch.float32, device=trainer.device)
+            c_mf, n_mf = current_res['mean_field'], next_res['mean_field']
+            rewards = torch.full((len(t_idx),), norm_rew, dtype=torch.float32, device=trainer.device)
+            a_ids = (n_idx * trainer.max_models + m_idx).long()
+            
+            avg_mf_loss = trainer.shared_lower_agent.store_transition_train_mf_batch(
+                states, c_mf[t_idx], n_mf[t_idx], a_ids, rewards, next_states, done, agent_ids=t_idx
+            )
+            
+        # 4. ALWAYS record metrics!
         trainer.aggregator.add_lower(next_res, mf_loss=avg_mf_loss, state=states[0] if len(states) > 0 else None)
 
     def store_upper_transitions(self, trainer, s_all, ns_all, current_res, next_res, acts_matrix, is_done):
-        # Only store transitions if Upper is NOT frozen
-        if self.phase == 'LOWER_ONLY': return
-        if self.phase == 'ALTERNATING' and self.alt_next != 'UPPER': return
-
         from matrix_source.trainers.train import log_transform
+        
+        # 1. Extract global metrics
         reward = next_res['reward_global']
-        c_mf = current_res.get('mean_fields', torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device))
-        n_mf = next_res['mean_fields']
-        dones = torch.full((trainer.num_edge_agents,), 1.0 if is_done else 0.0, dtype=torch.float32, device=trainer.device)
-        
-        edge_states = s_all[trainer.edge_node_ids]
-        edge_next_states = ns_all[trainer.edge_node_ids]
-        edge_c_mfs = c_mf[trainer.edge_node_ids]
-        edge_n_mfs = n_mf[trainer.edge_node_ids]
-        edge_acts = acts_matrix[trainer.edge_node_ids]
-        
-        pw2 = 2 ** torch.arange(trainer.num_services - 1, -1, -1, device=trainer.device).float()
-        edge_a_ids = (edge_acts * pw2).sum(dim=1).long()
-        
         rew_divisor = trainer.config.norm_upper_rw
         norm_rew = log_transform(reward / (rew_divisor if rew_divisor != 0 else 1.0))
-        rewards = torch.full((trainer.num_edge_agents,), norm_rew, dtype=torch.float32, device=trainer.device)
-        instance_indices = torch.tensor([trainer.node_to_instance[nid] for nid in trainer.edge_node_ids], device=trainer.device)
+        
+        # 2. Handle MF training and transition storage (if NOT frozen)
+        avg_mf_loss = None
+        is_frozen = (self.phase == 'LOWER_ONLY' or (self.phase == 'ALTERNATING' and self.alt_next != 'UPPER'))
+        
+        edge_states = s_all[trainer.edge_node_ids]
+        
+        if not is_frozen:
+            c_mf = current_res.get('mean_fields', torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device))
+            n_mf = next_res['mean_fields']
+            dones = torch.full((trainer.num_edge_agents,), 1.0 if is_done else 0.0, dtype=torch.float32, device=trainer.device)
+            
+            edge_next_states = ns_all[trainer.edge_node_ids]
+            edge_c_mfs = c_mf[trainer.edge_node_ids]
+            edge_n_mfs = n_mf[trainer.edge_node_ids]
+            edge_acts = acts_matrix[trainer.edge_node_ids]
+            
+            pw2 = 2 ** torch.arange(trainer.num_services - 1, -1, -1, device=trainer.device).float()
+            edge_a_ids = (edge_acts * pw2).sum(dim=1).long()
+            
+            rewards = torch.full((trainer.num_edge_agents,), norm_rew, dtype=torch.float32, device=trainer.device)
+            instance_indices = torch.tensor([trainer.node_to_instance[nid] for nid in trainer.edge_node_ids], device=trainer.device)
 
-        avg_mf_loss = trainer.shared_upper_agent.store_transition_train_mf_batch(
-            edge_states, edge_c_mfs, edge_n_mfs, edge_a_ids, rewards, edge_next_states, dones, agent_ids=instance_indices
-        )
+            avg_mf_loss = trainer.shared_upper_agent.store_transition_train_mf_batch(
+                edge_states, edge_c_mfs, edge_n_mfs, edge_a_ids, rewards, edge_next_states, dones, agent_ids=instance_indices
+            )
+            
+        # 3. ALWAYS record metrics!
         trainer.aggregator.add_upper(next_res, mf_loss=avg_mf_loss, state=edge_states[0] if len(edge_states) > 0 else None)
 
     def run_training(self, trainer):
