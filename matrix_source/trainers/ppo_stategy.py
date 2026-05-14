@@ -37,9 +37,9 @@ class PPOStrategy(AlgorithmStrategy):
         # Hyperparams from user
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
         self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 5}
-        self.lower_warmup_steps = 25
-        self.upper_warmup_steps = 15
-        self.alt_steps = 50
+        self.lower_warmup_steps = 1
+        self.upper_warmup_steps = 1
+        self.alt_steps = 1
 
     def initialize_agents(self, trainer):
         # 1. Upper Agent
@@ -206,6 +206,8 @@ class PPOStrategy(AlgorithmStrategy):
 
             # Use same EMA consistency logic for storage
             next_raw_mf = next_res['mean_fields']
+            if self.upper_mf_ema is None:
+                self.upper_mf_ema = next_raw_mf
             next_ema = (1 - self.mf_ema_alpha) * self.upper_mf_ema + self.mf_ema_alpha * next_raw_mf
             
             edge_c_mfs = self.upper_mf_ema[trainer.edge_node_ids]
@@ -295,6 +297,7 @@ class PPOStrategy(AlgorithmStrategy):
                     if self.phase == 'UPPER_ONLY':
                         loss = trainer.shared_upper_agent.learn(torch.arange(trainer.num_edge_agents, device=trainer.device))
                         if loss is not None:
+                            print("trainning uppper")
                             self.upper_train_num += 1
                             trainer.aggregator.record_td_losses(upper_losses=loss)
                             
@@ -319,8 +322,8 @@ class PPOStrategy(AlgorithmStrategy):
                     # 3. Concurrent Joint Training (Phase 3)
                     if self.phase == 'ALTERNATING':
                         # Gated update: wait until both have collected enough Phase 3 samples
-                        if (trainer.shared_lower_agent.memory.total_size >= 8000 and 
-                            trainer.shared_upper_agent.memory.total_size >= 800):
+                        if (all(s.size >= 8000 for s in trainer.shared_lower_agent.memory.buffers) and
+                            all(s.size >= 800 for s in trainer.shared_upper_agent.memory.buffers)):
                             
                             print(f"\n[Phase 3] Concurrent Update Triggered (L: {trainer.shared_lower_agent.memory.total_size}, U: {trainer.shared_upper_agent.memory.total_size})")
                             loss_l = trainer.shared_lower_agent.learn(torch.arange(trainer.num_terminals, device=trainer.device))
