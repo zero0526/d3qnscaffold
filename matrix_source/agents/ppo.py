@@ -185,7 +185,7 @@ class PPOAgent:
         )
         return int(actions[0])
 
-    def choose_action_batch(self, states, mfs, zeta=1.0, masks_batch=None, agent_indices=None):
+    def choose_action_batch(self, states, mfs, zeta=1.0, masks_batch=None, agent_indices=None, deterministic=False):
         batch_size = states.shape[0]
         if agent_indices is None:
             agent_indices = torch.zeros(batch_size, dtype=torch.long, device=self.device)
@@ -214,14 +214,18 @@ class PPOAgent:
                 logits[:, 0] -= 1e10
             
             # 4. Sample actions
-            probs = torch.softmax(logits * zeta, dim=-1)
-            dist = Categorical(probs)
-            actions = dist.sample()
-            
-            # In PPO we need log_prob and value of the sampled action.
-            # Using logits before applying temperature for actual log_prob calculation is theoretically sound
-            # but since dist is instantiated with temp-adjusted probs, log_prob will reflect exploration profile.
-            log_probs = dist.log_prob(actions)
+            if deterministic:
+                actions = logits.argmax(dim=-1)
+                log_probs = torch.zeros_like(actions, dtype=torch.float32) # Log prob not typically used for deterministic actions but kept for compatibility
+            else:
+                probs = torch.softmax(logits * zeta, dim=-1)
+                dist = Categorical(probs)
+                actions = dist.sample()
+                
+                # In PPO we need log_prob and value of the sampled action.
+                # Using logits before applying temperature for actual log_prob calculation is theoretically sound
+                # but since dist is instantiated with temp-adjusted probs, log_prob will reflect exploration profile.
+                log_probs = dist.log_prob(actions)
 
         # Cache values securely mapped to agent_index to use in storage stage (to keep API compatible)
         for i, aid in enumerate(agent_indices.tolist()):

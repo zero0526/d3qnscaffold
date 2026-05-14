@@ -29,11 +29,15 @@ class PPOStrategy(AlgorithmStrategy):
         self.phase = 'LOWER_ONLY' # 'LOWER_ONLY', 'UPPER_ONLY', 'ALTERNATING'
         self.lower_train_num = 0
         self.upper_train_num = 0
+        self.alt_train_num = 0
         self.alt_next = 'UPPER'
         
         # Hyperparams from user
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
         self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 5}
+        self.lower_warmup_steps = 20
+        self.upper_warmup_steps = 10
+        self.alt_steps = 10
 
     def initialize_agents(self, trainer):
         # 1. Upper Agent
@@ -78,14 +82,26 @@ class PPOStrategy(AlgorithmStrategy):
 
     def get_upper_actions(self, trainer, current_upper_state, obs_upper):
         act_matrix = torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device)
-        mf_global = obs_upper.get('mean_fields', torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device))
         
+        # 1. Random actions in Lower-Only phase
+        if self.phase == 'LOWER_ONLY':
+            act_matrix[trainer.edge_node_ids] = torch.randint(0, 2, (len(trainer.edge_node_ids), trainer.num_services), device=trainer.device).float()
+            for nid in trainer.env.static_matrices.get("cloud_ids", []):
+                act_matrix[nid] = torch.ones(trainer.num_services, device=trainer.device)
+            return act_matrix
+            
+        # 2. Model-based actions (Deterministic if taking Lower's turn in Alternating phase)
+        mf_global = obs_upper.get('mean_fields', torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device))
         edge_states = current_upper_state[trainer.edge_node_ids]
         edge_mfs = mf_global[trainer.edge_node_ids]
         instance_indices = torch.tensor([trainer.node_to_instance[nid] for nid in trainer.edge_node_ids], device=trainer.device)
         
+        # Use stochastic (det=False) in UPPER_ONLY phase.
+        # In ALTERNATING phase, use argmax (det=True) only when it's Lower's turn to train.
+        is_det = (self.phase == 'ALTERNATING' and self.alt_next == 'LOWER')
+        
         batch_a_ids = trainer.shared_upper_agent.choose_action_batch(
-            edge_states, edge_mfs, trainer.zeta_upper, agent_indices=instance_indices
+            edge_states, edge_mfs, trainer.zeta_upper, agent_indices=instance_indices, deterministic=is_det
         )
         
         for i, nid in enumerate(trainer.edge_node_ids):
@@ -114,8 +130,13 @@ class PPOStrategy(AlgorithmStrategy):
         masks = torch.ones((len(t_idx), trainer.num_nodes * trainer.max_models), device=trainer.device)
         mfs = mf_terminals[t_idx]
         
+        # "Freeze" lower (argmax) during Upper-Only phase or when it's Upper's turn in Alternating phase
+        is_det = (self.phase == 'UPPER_ONLY' or (self.phase == 'ALTERNATING' and self.alt_next == 'UPPER'))
+        
         batch_actions = trainer.shared_lower_agent.choose_action_batch(
-            states, mfs, trainer.zeta_lower, masks_batch=masks, agent_indices=torch.arange(trainer.num_terminals, device=trainer.device)
+            states, mfs, trainer.zeta_lower, masks_batch=masks, 
+            agent_indices=torch.arange(trainer.num_terminals, device=trainer.device),
+            deterministic=is_det
         )
         
         a_ids = torch.tensor(batch_actions, device=trainer.device)
@@ -190,14 +211,15 @@ class PPOStrategy(AlgorithmStrategy):
 
         # 2. Anneal based on Phase
         if self.phase == 'LOWER_ONLY':
-            progress = min(1.0, self.lower_train_num / 300)
+            progress = min(1.0, self.lower_train_num / self.lower_warmup_steps)
             trainer.zeta_lower = initial_zeta + delta * progress
             trainer.zeta_upper = initial_zeta
         elif self.phase == 'UPPER_ONLY':
-            progress = min(1.0, self.upper_train_num / 100)
+            # progress_lower = 1.0 (keep target_zeta)
+            progress_upper = min(1.0, self.upper_train_num / self.upper_warmup_steps)
             trainer.zeta_lower = target_zeta
-            trainer.zeta_upper = initial_zeta + delta * progress
-        else: # ALTERNATING or other
+            trainer.zeta_upper = initial_zeta + delta * progress_upper
+        else: # ALTERNATING
             trainer.zeta_lower = target_zeta
             trainer.zeta_upper = target_zeta
             
@@ -206,15 +228,21 @@ class PPOStrategy(AlgorithmStrategy):
         trainer.aggregator.record_zeta(trainer.zeta_lower, trainer.zeta_upper)
 
     def run_training(self, trainer):
-        num_eps = trainer.config.hyper_neural['NUMOF_TRAIN_EP']
         max_slots = trainer.env.time_manager.max_steps
+        ep = 0
 
-        for ep in tqdm(range(num_eps), desc="Training"):
+        pbar = tqdm(total=300+100+100, desc="Overall Training Progress")
+        
+        while True:
+            if self.phase == 'ALTERNATING' and self.alt_train_num >= 100:
+                print(f"\n[Curriculum] Phase 3 Complete. Training Finished.")
+                break
+                
             obs = trainer.env.reset()
             obs_upper = obs['upper']
             prev_lower_res = obs['lower']
             current_upper_state = self.build_upper_state(trainer, obs_upper) 
-            self.update_curriculum_rates(trainer)
+            # self.update_curriculum_rates(trainer) -- Updated only after train+collect as per user request
             
             for slot in range(max_slots):
                 if trainer.env.time_manager.is_new_frame():
@@ -250,12 +278,18 @@ class PPOStrategy(AlgorithmStrategy):
                                     trainer.shared_lower_agent.save(f'checkpoints/ppo_lower_{self.lower_train_num}.pth')
                                     print(f"Checkpoint saved: checkpoints/ppo_lower_{self.lower_train_num}.pth")
 
-                                if self.phase == 'ALTERNATING': self.alt_next = 'UPPER'
+                                if self.phase == 'ALTERNATING': 
+                                    self.alt_next = 'UPPER'
+                                    self.alt_train_num += 1
+                                    
                                 # Phase Transition
-                                if self.phase == 'LOWER_ONLY' and self.lower_train_num >= 300:
+                                if self.phase == 'LOWER_ONLY' and self.lower_train_num >= self.lower_warmup_steps:
                                     self.phase = 'UPPER_ONLY'
                                     print(f"\n[Curriculum] Phase 1 Complete. Switching to {self.phase}")
+                                
                                 self.update_curriculum_rates(trainer)
+                                pbar.update(1)
+                                if self.phase == 'ALTERNATING' and self.alt_train_num >= self.alt_steps: break
                 else:
                     trainer.env.time_manager.tick()
 
@@ -282,12 +316,18 @@ class PPOStrategy(AlgorithmStrategy):
                                     trainer.shared_upper_agent.save(f'checkpoints/ppo_upper_{self.upper_train_num}.pth')
                                     print(f"Checkpoint saved: checkpoints/ppo_upper_{self.upper_train_num}.pth")
 
-                                if self.phase == 'ALTERNATING': self.alt_next = 'LOWER'
+                                if self.phase == 'ALTERNATING': 
+                                    self.alt_next = 'LOWER'
+                                    self.alt_train_num += 1
+                                    
                                 # Phase Transition
-                                if self.phase == 'UPPER_ONLY' and self.upper_train_num >= 100:
+                                if self.phase == 'UPPER_ONLY' and self.upper_train_num >= self.upper_warmup_steps:
                                     self.phase = 'ALTERNATING'
                                     print(f"\n[Curriculum] Phase 2 Complete. Switching to {self.phase}")
+                                
                                 self.update_curriculum_rates(trainer)
+                                pbar.update(1)
+                                if self.phase == 'ALTERNATING' and self.alt_train_num >= self.alt_steps: break
 
                     current_upper_state = next_upper_state
                     obs_upper = res_upper
@@ -295,4 +335,6 @@ class PPOStrategy(AlgorithmStrategy):
             trainer.aggregator.store_history()
             trainer.aggregator.report_episode(ep)
             print(f"--- Curriculum Status ---")
-            print(f"Phase: {self.phase} | Lower Trains: {self.lower_train_num}/300 | Upper Trains: {self.upper_train_num}/100")
+            print(f"Phase: {self.phase} | Lower: {self.lower_train_num}/300 | Upper: {self.upper_train_num}/100 | Alt: {self.alt_train_num}/100")
+            ep += 1
+        pbar.close()
