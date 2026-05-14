@@ -219,7 +219,7 @@ class PPOStrategy(AlgorithmStrategy):
             instance_indices = torch.tensor([trainer.node_to_instance[nid] for nid in trainer.edge_node_ids], device=trainer.device)
 
             avg_mf_loss = trainer.shared_upper_agent.store_transition_train_mf_batch(
-                edge_states, edge_c_mfs, edge_n_mfs, edge_a_ids, rewards, edge_next_states, dones, agent_ids=instance_indices
+                edge_states, edge_c_mfs, next_raw_mf[trainer.edge_node_ids], edge_a_ids, rewards, edge_next_states, dones, agent_ids=instance_indices
             )
             
         # 3. ALWAYS record metrics!
