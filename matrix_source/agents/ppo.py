@@ -371,3 +371,12 @@ class PPOAgent:
         self.optimizer_critic.load_state_dict(checkpoint['critic_opt'])
         self.mf_optimizer.load_state_dict(checkpoint['mf_opt'])
         self.learn_step_counter = checkpoint.get('learn_step', 0)
+
+    def set_lr_factor(self, factor):
+        """
+        Scales the learning rate of all optimizers by the given factor.
+        """
+        for opt in [self.optimizer_actor, self.optimizer_critic, self.mf_optimizer]:
+            for param_group in opt.param_groups:
+                param_group['lr'] *= factor
+        print(f"[{self.node_type}] Learning rate scaled by {factor}. New Actor LR: {self.optimizer_actor.param_groups[0]['lr']:.6f}")

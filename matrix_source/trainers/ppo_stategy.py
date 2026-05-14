@@ -31,13 +31,15 @@ class PPOStrategy(AlgorithmStrategy):
         self.upper_train_num = 0
         self.alt_train_num = 0
         self.alt_next = 'UPPER'
+        self.upper_mf_ema = None
+        self.mf_ema_alpha = 0.7
         
         # Hyperparams from user
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
         self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 5}
-        self.lower_warmup_steps = 40
-        self.upper_warmup_steps = 20
-        self.alt_steps = 20
+        self.lower_warmup_steps = 25
+        self.upper_warmup_steps = 15
+        self.alt_steps = 50
 
     def initialize_agents(self, trainer):
         # 1. Upper Agent
@@ -90,15 +92,20 @@ class PPOStrategy(AlgorithmStrategy):
                 act_matrix[nid] = torch.ones(trainer.num_services, device=trainer.device)
             return act_matrix
             
-        # 2. Model-based actions (Deterministic if taking Lower's turn in Alternating phase)
+        # 2. Get Observed Mean Field and Update EMA (Upper only)
         mf_global = obs_upper.get('mean_fields', torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device))
+        if self.upper_mf_ema is None:
+            self.upper_mf_ema = mf_global.clone()
+        else:
+            self.upper_mf_ema = (1 - self.mf_ema_alpha) * self.upper_mf_ema + self.mf_ema_alpha * mf_global
+            
         edge_states = current_upper_state[trainer.edge_node_ids]
-        edge_mfs = mf_global[trainer.edge_node_ids]
+        edge_mfs = self.upper_mf_ema[trainer.edge_node_ids]
         instance_indices = torch.tensor([trainer.node_to_instance[nid] for nid in trainer.edge_node_ids], device=trainer.device)
         
         # Use stochastic (det=False) in UPPER_ONLY phase.
-        # In ALTERNATING phase, use argmax (det=True) only when it's Lower's turn to train.
-        is_det = (self.phase == 'ALTERNATING' and self.alt_next == 'LOWER')
+        # In ALTERNATING phase, both are stochastic (joint training).
+        is_det = False
         
         batch_a_ids = trainer.shared_upper_agent.choose_action_batch(
             edge_states, edge_mfs, agent_indices=instance_indices, deterministic=is_det
@@ -130,8 +137,8 @@ class PPOStrategy(AlgorithmStrategy):
         masks = torch.ones((len(t_idx), trainer.num_nodes * trainer.max_models), device=trainer.device)
         mfs = mf_terminals[t_idx]
         
-        # "Freeze" lower (argmax) during Upper-Only phase or when it's Upper's turn in Alternating phase
-        is_det = (self.phase == 'UPPER_ONLY' or (self.phase == 'ALTERNATING' and self.alt_next == 'UPPER'))
+        # "Freeze" lower (argmax) only during Upper-Only phase. In Alternating, both are stochastic.
+        is_det = (self.phase == 'UPPER_ONLY')
         
         batch_actions = trainer.shared_lower_agent.choose_action_batch(
             states, mfs, masks_batch=masks, 
@@ -164,7 +171,7 @@ class PPOStrategy(AlgorithmStrategy):
         
         # 3. Handle MF training and transition storage (only if NOT frozen)
         avg_mf_loss = None
-        is_frozen = (self.phase == 'UPPER_ONLY' or (self.phase == 'ALTERNATING' and self.alt_next != 'LOWER'))
+        is_frozen = (self.phase == 'UPPER_ONLY')
         
         if not is_frozen:
             done = torch.tensor([next_res["new_frame"]]*len(t_idx), dtype=torch.float32, device=trainer.device)
@@ -189,18 +196,20 @@ class PPOStrategy(AlgorithmStrategy):
         
         # 2. Handle MF training and transition storage (if NOT frozen)
         avg_mf_loss = None
-        is_frozen = (self.phase == 'LOWER_ONLY' or (self.phase == 'ALTERNATING' and self.alt_next != 'UPPER'))
+        is_frozen = (self.phase == 'LOWER_ONLY')
         
         edge_states = s_all[trainer.edge_node_ids]
         
         if not is_frozen:
-            c_mf = current_res.get('mean_fields', torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device))
-            n_mf = next_res['mean_fields']
-            dones = torch.full((trainer.num_edge_agents,), 1.0 if is_done else 0.0, dtype=torch.float32, device=trainer.device)
-            
             edge_next_states = ns_all[trainer.edge_node_ids]
-            edge_c_mfs = c_mf[trainer.edge_node_ids]
-            edge_n_mfs = n_mf[trainer.edge_node_ids]
+            dones = torch.full((trainer.num_edge_agents,), 1.0 if is_done else 0.0, dtype=torch.float32, device=trainer.device)
+
+            # Use same EMA consistency logic for storage
+            next_raw_mf = next_res['mean_fields']
+            next_ema = (1 - self.mf_ema_alpha) * self.upper_mf_ema + self.mf_ema_alpha * next_raw_mf
+            
+            edge_c_mfs = self.upper_mf_ema[trainer.edge_node_ids]
+            edge_n_mfs = next_ema[trainer.edge_node_ids]
             edge_acts = acts_matrix[trainer.edge_node_ids]
             
             pw2 = 2 ** torch.arange(trainer.num_services - 1, -1, -1, device=trainer.device).float()
@@ -230,6 +239,7 @@ class PPOStrategy(AlgorithmStrategy):
             obs = trainer.env.reset()
             obs_upper = obs['upper']
             prev_lower_res = obs['lower']
+            self.upper_mf_ema = None # Reset EMA for new episode
             current_upper_state = self.build_upper_state(trainer, obs_upper) 
             
             for slot in range(max_slots):
@@ -252,31 +262,23 @@ class PPOStrategy(AlgorithmStrategy):
                     prev_lower_res = results
                     trainer.total_lower_steps += 1 
                     
-                    # 1. Train Lower Level (if active)
-                    if self.phase in ['LOWER_ONLY', 'ALTERNATING']:
-                        if self.phase != 'ALTERNATING' or self.alt_next == 'LOWER':
-                            loss = trainer.shared_lower_agent.learn(torch.arange(trainer.num_terminals, device=trainer.device))
-                            if loss is not None:
-                                self.lower_train_num += 1
-                                trainer.aggregator.record_td_losses(lower_losses=loss)
-                                
-                                # Checkpoint
-                                if self.lower_train_num % 10 == 0:
-                                    os.makedirs('checkpoints', exist_ok=True)
-                                    trainer.shared_lower_agent.save(f'checkpoints/ppo_lower_{self.lower_train_num}.pth')
-                                    print(f"Checkpoint saved: checkpoints/ppo_lower_{self.lower_train_num}.pth")
+                    # 1. Train Lower Level (ONLY in Phase 1)
+                    if self.phase == 'LOWER_ONLY':
+                        loss = trainer.shared_lower_agent.learn(torch.arange(trainer.num_terminals, device=trainer.device))
+                        if loss is not None:
+                            self.lower_train_num += 1
+                            trainer.aggregator.record_td_losses(lower_losses=loss)
+                            
+                            # Checkpoint
+                            if self.lower_train_num % 10 == 0:
+                                os.makedirs('checkpoints', exist_ok=True)
+                                trainer.shared_lower_agent.save(f'checkpoints/ppo_lower_{self.lower_train_num}.pth')
 
-                                if self.phase == 'ALTERNATING': 
-                                    self.alt_next = 'UPPER'
-                                    self.alt_train_num += 1
-                                    
-                                # Phase Transition
-                                if self.phase == 'LOWER_ONLY' and self.lower_train_num >= self.lower_warmup_steps:
-                                    self.phase = 'UPPER_ONLY'
-                                    print(f"\n[Curriculum] Phase 1 Complete. Switching to {self.phase}")
-                                
-                                pbar.update(1)
-                                if self.phase == 'ALTERNATING' and self.alt_train_num >= self.alt_steps: break
+                            # Phase Transition
+                            if self.phase == 'LOWER_ONLY' and self.lower_train_num >= self.lower_warmup_steps:
+                                self.phase = 'UPPER_ONLY'
+                                print(f"\n[Curriculum] Phase 1 Complete. Switching to {self.phase}")
+                            pbar.update(1)
                 else:
                     trainer.env.time_manager.tick()
 
@@ -289,31 +291,46 @@ class PPOStrategy(AlgorithmStrategy):
                     self.store_upper_transitions(trainer, current_upper_state, next_upper_state, obs_upper, res_upper, u_acts_matrix, is_ep_done)
                     trainer.total_upper_steps += 1 
 
-                    # 2. Train Upper Level (if active)
-                    if self.phase in ['UPPER_ONLY', 'ALTERNATING']:
-                        if self.phase != 'ALTERNATING' or self.alt_next == 'UPPER':
-                            loss = trainer.shared_upper_agent.learn(torch.arange(trainer.num_edge_agents, device=trainer.device))
-                            if loss is not None:
-                                self.upper_train_num += 1
-                                trainer.aggregator.record_td_losses(upper_losses=loss)
-                                
-                                # Checkpoint
-                                if self.upper_train_num % 10 == 0:
-                                    os.makedirs('checkpoints', exist_ok=True)
-                                    trainer.shared_upper_agent.save(f'checkpoints/ppo_upper_{self.upper_train_num}.pth')
-                                    print(f"Checkpoint saved: checkpoints/ppo_upper_{self.upper_train_num}.pth")
+                    # 2. Train Upper Level (ONLY in Phase 2)
+                    if self.phase == 'UPPER_ONLY':
+                        loss = trainer.shared_upper_agent.learn(torch.arange(trainer.num_edge_agents, device=trainer.device))
+                        if loss is not None:
+                            self.upper_train_num += 1
+                            trainer.aggregator.record_td_losses(upper_losses=loss)
+                            
+                            # Checkpoint
+                            if self.upper_train_num % 10 == 0:
+                                os.makedirs('checkpoints', exist_ok=True)
+                                trainer.shared_upper_agent.save(f'checkpoints/ppo_upper_{self.upper_train_num}.pth')
 
-                                if self.phase == 'ALTERNATING': 
-                                    self.alt_next = 'LOWER'
-                                    self.alt_train_num += 1
-                                    
-                                # Phase Transition
-                                if self.phase == 'UPPER_ONLY' and self.upper_train_num >= self.upper_warmup_steps:
-                                    self.phase = 'ALTERNATING'
-                                    print(f"\n[Curriculum] Phase 2 Complete. Switching to {self.phase}")
-                                
+                            # Phase Transition
+                            if self.phase == 'UPPER_ONLY' and self.upper_train_num >= self.upper_warmup_steps:
+                                self.phase = 'ALTERNATING'
+                                print(f"\n[Curriculum] Phase 2 Complete. Switching to {self.phase}")
+                                # Apply Phase 3 overrides: 0.5x LR, 8000/800 buffers, 8/6 epochs
+                                trainer.shared_lower_agent.set_lr_factor(0.5)
+                                trainer.shared_upper_agent.set_lr_factor(0.5)
+                                trainer.shared_lower_agent.k_epochs = 8
+                                trainer.shared_upper_agent.k_epochs = 6
+                                trainer.shared_lower_agent.min_batch_size = 8000
+                                trainer.shared_upper_agent.min_batch_size = 800
+                            pbar.update(1)
+
+                    # 3. Concurrent Joint Training (Phase 3)
+                    if self.phase == 'ALTERNATING':
+                        # Gated update: wait until both have collected enough Phase 3 samples
+                        if (trainer.shared_lower_agent.memory.total_size >= 8000 and 
+                            trainer.shared_upper_agent.memory.total_size >= 800):
+                            
+                            print(f"\n[Phase 3] Concurrent Update Triggered (L: {trainer.shared_lower_agent.memory.total_size}, U: {trainer.shared_upper_agent.memory.total_size})")
+                            loss_l = trainer.shared_lower_agent.learn(torch.arange(trainer.num_terminals, device=trainer.device))
+                            loss_u = trainer.shared_upper_agent.learn(torch.arange(trainer.num_edge_agents, device=trainer.device))
+                            
+                            if loss_l is not None and loss_u is not None:
+                                self.alt_train_num += 1
+                                trainer.aggregator.record_td_losses(lower_losses=loss_l, upper_losses=loss_u)
                                 pbar.update(1)
-                                if self.phase == 'ALTERNATING' and self.alt_train_num >= self.alt_steps: break
+                                if self.alt_train_num >= self.alt_steps: break
 
                     current_upper_state = next_upper_state
                     obs_upper = res_upper
