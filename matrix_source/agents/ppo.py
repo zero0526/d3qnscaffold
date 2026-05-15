@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
 import numpy as np
-from matrix_source.agents.policy_replay_buffer import MultiAgentPolicyBuffer
+from matrix_source.agents.buffer.policy_replay_buffer import MultiAgentPolicyBuffer
 
 class MultiInstanceLinear(nn.Module):
     """

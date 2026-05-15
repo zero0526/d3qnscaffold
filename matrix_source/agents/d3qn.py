@@ -1,11 +1,10 @@
 import torch
 import torch.nn as nn
-import numpy as np
 import torch.nn.functional as F
 import torch.optim as optim
-from typing import Tuple
-from matrix_source.agents.ReplayBuffer import ReplayBuffer, MultiAgentReplayBuffer
-from matrix_source.configs.configs import cfg
+from matrix_source.agents.buffer.ReplayBuffer import MultiAgentReplayBuffer
+from matrix_source.agents.buffer.PrioritizedReplayBuffer import MultiAgentPrioritizedReplayBuffer
+
 
 class MultiInstanceLinear(nn.Module):
     """
@@ -130,7 +129,7 @@ class MF(nn.Module):
 class D3QNAgent:
     def __init__(self, node_id, node_type, state_dim, action_dim, u_action_dim, mf_hidden_sizes, mf_lr, buffer_min_size,
                  hidden_sizes=(128, 64), lr=1e-4, gamma=0.99, alpha=0.005, buffer_size=100000, batch_size=64,
-                 exclude_zero=False, num_instances=1, device=None):
+                 exclude_zero=False, num_instances=1, device=None, use_per=False, n_step=1):
         self.node_id = node_id
         self.node_type = node_type
         self.action_dim = action_dim
@@ -157,10 +156,14 @@ class D3QNAgent:
         
         self.optimizer = optim.Adam(self.eval_net.parameters(), lr=lr)
         self.mf_optimizer = optim.Adam(self.mf_net.parameters(), lr=mf_lr)
-        self.loss_fn = nn.SmoothL1Loss() # Huber Loss is more robust to large reward scales
+        self.loss_fn = nn.SmoothL1Loss(reduction='none') # Huber Loss is more robust to large reward scales
         
         # Each agent instance gets its own partitioned buffer to prevent "noise" and ensure fair training
-        self.memory = MultiAgentReplayBuffer(num_instances,node_type, buffer_size, state_dim, action_dim, self.device)
+        self.use_per = use_per
+        if use_per:
+            self.memory = MultiAgentPrioritizedReplayBuffer(num_instances, node_type, buffer_size, state_dim, action_dim, self.device, n_step=n_step)
+        else:
+            self.memory = MultiAgentReplayBuffer(num_instances, node_type, buffer_size, state_dim, action_dim, self.device)
 
         # Logging
         self.prev_loss = 0.0
@@ -245,11 +248,13 @@ class D3QNAgent:
         return final_actions.tolist()
 
     def store_transition_train_mf_batch(self, states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids):
-        # MF learning update
-        loss = self.learn_mf_batch(states, prev_mfs, curr_mfs, agent_ids)
-        # Store in buffer
-        self.memory.add_batch(states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids)
-        return loss
+        # res: (states, prev_mfs, curr_mfs, agent_ids) of finalized N-step transitions
+        res = self.memory.add_batch(states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids)
+        if res is not None:
+            # Train MF on finalized N-step transitions
+            loss = self.learn_mf_batch(res[0], res[1], res[2], res[3])
+            return loss
+        return 0.0
 
     def learn_mf_batch(self, states_batch, prev_mf_batch, ground_truth_mf_batch, agent_ids):
         s = states_batch.to(self.device) if torch.is_tensor(states_batch) else torch.FloatTensor(states_batch).to(self.device)
@@ -285,15 +290,18 @@ class D3QNAgent:
         if len(target_agents) == 0:
             return None
 
-        # 2. Sample data from a diverse set of target agents (avoiding duplicates)
-        states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids = \
-            self.memory.sample(self.batch_size, agent_ids=target_agents)
+        # 2. Sample data from a diverse set of target agents
+        if self.use_per:
+            states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids, indices, weights = \
+                self.memory.sample(self.batch_size, agent_ids=target_agents)
+        else:
+            states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids = \
+                self.memory.sample(self.batch_size, agent_ids=target_agents)
+            weights = torch.ones_like(rewards).view(-1)
 
         # 1. Train MF (prediction and current state)
-        pred_curr_mfs = self.mf_net(torch.cat([states, prev_mfs], dim=-1), indices=agent_ids)
-
         # 2. DQN update
-        q_eval = self.eval_net(states, pred_curr_mfs.detach(), indices=agent_ids).gather(1, actions)
+        q_eval = self.eval_net(states, curr_mfs, indices=agent_ids).gather(1, actions)
 
         with torch.no_grad():
             next_pred_mfs = self.mf_net(torch.cat([next_states, curr_mfs], dim=-1), indices=agent_ids)
@@ -301,11 +309,22 @@ class D3QNAgent:
             q_next = self.target_net(next_states, next_pred_mfs, indices=agent_ids).gather(1, next_actions)
             q_target = rewards + self.gamma * q_next * (1 - dones)
 
-        loss = self.loss_fn(q_eval, q_target)
+        # Calculate element-wise loss for priority update
+        td_errors = torch.abs(q_eval - q_target).detach()
+        
+        # Weighted loss for backprop
+        loss = (self.loss_fn(q_eval, q_target.detach()) * weights.view(-1, 1)).mean()
+        
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.eval_net.parameters(), max_norm=1.0)
         self.optimizer.step()
+
+        # Update priorities in buffer
+        if self.use_per:
+            # priorities = (abs(td_error) + epsilon)^alpha (simplified here as abs(td_error) + 1e-6)
+            new_priorities = td_errors.view(-1) + 1e-6
+            self.memory.update_priorities(agent_ids, indices, new_priorities)
 
         # Update logging/target
         self.learn_step_counter += 1

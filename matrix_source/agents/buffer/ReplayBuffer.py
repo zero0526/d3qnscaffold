@@ -66,14 +66,14 @@ class ReplayBuffer:
         ind = torch.randint(0, self.size, (num_to_sample,), device=self.device)
             
         return (
-            self.state[ind],
-            self.prev_mf[ind],
-            self.curr_mf[ind],
-            self.action[ind],
-            self.reward[ind],
-            self.next_state[ind],
-            self.done[ind],
-            self.agent_id[ind].squeeze(1) # Return as (Batch,) for indexing
+            self.state[ind].to(self.device),
+            self.prev_mf[ind].to(self.device),
+            self.curr_mf[ind].to(self.device),
+            self.action[ind].to(self.device),
+            self.reward[ind].to(self.device),
+            self.next_state[ind].to(self.device),
+            self.done[ind].to(self.device),
+            self.agent_id[ind].squeeze(1).to(self.device)
         )
 
     def __len__(self):

@@ -48,16 +48,16 @@ class PolicyReplayBuffer:
         if self.size == 0:
             return None
         return (
-            self.state[:self.size],
-            self.prev_mf[:self.size],
-            self.curr_mf[:self.size],
-            self.action[:self.size],
-            self.reward[:self.size],
-            self.next_state[:self.size],
-            self.done[:self.size],
-            self.log_prob[:self.size],
-            self.value[:self.size],
-            self.agent_id[:self.size].squeeze(1)
+            self.state[:self.size].to(self.device),
+            self.prev_mf[:self.size].to(self.device),
+            self.curr_mf[:self.size].to(self.device),
+            self.action[:self.size].to(self.device),
+            self.reward[:self.size].to(self.device),
+            self.next_state[:self.size].to(self.device),
+            self.done[:self.size].to(self.device),
+            self.log_prob[:self.size].to(self.device),
+            self.value[:self.size].to(self.device),
+            self.agent_id[:self.size].squeeze(1).to(self.device)
         )
 
 class MultiAgentPolicyBuffer:
