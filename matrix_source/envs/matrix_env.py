@@ -20,7 +20,6 @@ class MatrixSixGEnvironment:
         
         # 2. Initialize Engine
         self.engine = MatrixPhysicalEngine(config, self.static_matrices, metadata, device)
-        
         # 3. Time Management
         self.time_manager = TimeManager(
             slot_duration=self.engine.slot_duration,

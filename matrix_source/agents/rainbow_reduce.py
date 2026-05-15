@@ -7,10 +7,9 @@ from matrix_source.agents.base import MultiInstanceLinear, MultiInstanceRMSNorm,
 from matrix_source.agents.buffer.PrioritizedReplayBuffer import MultiAgentPrioritizedReplayBuffer
 
 class RainbowNetwork(nn.Module):
-    def __init__(self, state_dim, mf_dim, action_dim, hidden_sizes, num_atoms, num_instances=1):
+    def __init__(self, state_dim, mf_dim, action_dim, hidden_sizes, num_instances=1):
         super().__init__()
         self.action_dim = action_dim
-        self.num_atoms = num_atoms
         self.num_instances = num_instances
         
         h1, h2 = hidden_sizes
@@ -24,11 +23,11 @@ class RainbowNetwork(nn.Module):
         # Dueling & Noisy Heads
         # Value stream
         self.v1 = MultiInstanceNoisyLinear(num_instances, h2, h2)
-        self.v2 = MultiInstanceNoisyLinear(num_instances, h2, num_atoms)
+        self.v2 = MultiInstanceNoisyLinear(num_instances, h2, 1)
         
         # Advantage stream
         self.a1 = MultiInstanceNoisyLinear(num_instances, h2, h2)
-        self.a2 = MultiInstanceNoisyLinear(num_instances, h2, action_dim * num_atoms)
+        self.a2 = MultiInstanceNoisyLinear(num_instances, h2, action_dim)
 
     def forward(self, state, pred_mf, indices=None):
         x = torch.cat([state, pred_mf], dim=-1)
@@ -39,16 +38,14 @@ class RainbowNetwork(nn.Module):
         
         # Heads (Noisy)
         v = F.silu(self.v1(x, indices))
-        v = self.v2(v, indices).view(-1, 1, self.num_atoms) # (Batch, 1, Atoms)
+        v = self.v2(v, indices) # (Batch, 1)
         
         a = F.silu(self.a1(x, indices))
-        a = self.a2(a, indices).view(-1, self.action_dim, self.num_atoms) # (Batch, Actions, Atoms)
+        a = self.a2(a, indices) # (Batch, Actions)
         
         # Combine Dueling: Q = V + (A - mean(A))
-        q_atoms = v + (a - a.mean(dim=1, keepdim=True))
-        
-        # Return probability distribution per action
-        return F.softmax(q_atoms, dim=-1)
+        q = v + (a - a.mean(dim=1, keepdim=True))
+        return q
 
     def reset_noise(self):
         for m in self.modules():
@@ -70,8 +67,7 @@ class MFNet(nn.Module):
 class RainbowMultiAgent:
     def __init__(self, node_id, node_type, state_dim, action_dim, u_action_dim, mf_hidden_sizes, mf_lr, buffer_min_size,
                  hidden_sizes=(128, 64), lr=1e-4, gamma=0.99, buffer_size=100000, batch_size=64,
-                 num_atoms=51, v_min=-10.0, v_max=10.0, n_step=3,
-                 num_instances=1, device=None, logs_q=False):
+                 n_step=3, num_instances=1, device=None, logs_q=False):
         self.logs_q = logs_q
         self.node_id = node_id
         self.node_type = node_type
@@ -83,16 +79,9 @@ class RainbowMultiAgent:
         self.num_instances = num_instances
         self.min_batch_size = buffer_min_size
         
-        # Categorical parameters
-        self.num_atoms = num_atoms
-        self.v_min = v_min
-        self.v_max = v_max
-        self.delta_z = (v_max - v_min) / (num_atoms - 1)
-        self.support = torch.linspace(v_min, v_max, num_atoms, device=self.device)
-        
         # Networks
-        self.eval_net = RainbowNetwork(state_dim, action_dim, u_action_dim, hidden_sizes, num_atoms, num_instances).to(self.device)
-        self.target_net = RainbowNetwork(state_dim, action_dim, u_action_dim, hidden_sizes, num_atoms, num_instances).to(self.device)
+        self.eval_net = RainbowNetwork(state_dim, action_dim, u_action_dim, hidden_sizes, num_instances).to(self.device)
+        self.target_net = RainbowNetwork(state_dim, action_dim, u_action_dim, hidden_sizes, num_instances).to(self.device)
         self.target_net.eval()
         
         self.mf_net = MF(state_dim + action_dim, action_dim, mf_hidden_sizes, num_instances).to(self.device)
@@ -127,7 +116,7 @@ class RainbowMultiAgent:
         prev_mfs_batch = prev_mfs_batch.to(self.device)
 
         is_policy_agent = torch.tensor([
-            self.memory.get_len(aid.item()) >= self.min_batch_size 
+            len(self.memory.buffers[aid.item()]) >= self.min_batch_size
             for aid in agent_indices
         ], device=self.device)
         
@@ -152,8 +141,7 @@ class RainbowMultiAgent:
             
             with torch.no_grad():
                 pred_mf = self.mf_net(torch.cat([s_sub, mf_sub], dim=-1), indices=aid_sub)
-                dist = self.eval_net(s_sub, pred_mf, indices=aid_sub)
-                q_values = (dist * self.support).sum(dim=2)
+                q_values = self.eval_net(s_sub, pred_mf, indices=aid_sub)
                 
                 if masks_batch is not None:
                     m = masks_batch[indices].to(self.device)
@@ -165,7 +153,6 @@ class RainbowMultiAgent:
         return final_actions.tolist()
 
     def store_transition_train_mf_batch(self, states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids):
-        # res: (states, prev_mfs, curr_mfs, agent_ids) of finalized N-step transitions
         res = self.memory.add_batch(states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids)
         if res is not None:
             loss = self.learn_mf_batch(res[0], res[1], res[2], res[3])
@@ -196,46 +183,35 @@ class RainbowMultiAgent:
         states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids, indices, weights = \
             self.memory.sample(self.batch_size, agent_ids=target_agents)
             
+        # Double DQN loss
         with torch.no_grad():
             next_mfs = self.mf_net(torch.cat([next_states, curr_mfs], dim=-1), indices=agent_ids)
-            next_dist = self.target_net(next_states, next_mfs, indices=agent_ids)
             
-            next_eval_dist = self.eval_net(next_states, next_mfs, indices=agent_ids)
-            next_eval_q = (next_eval_dist * self.support).sum(dim=2)
-            best_actions = next_eval_q.argmax(dim=1)
+            # Select best actions using eval_net
+            next_eval_q = self.eval_net(next_states, next_mfs, indices=agent_ids)
+            best_actions = next_eval_q.argmax(dim=1, keepdim=True)
             
-            next_best_dist = next_dist[range(self.batch_size), best_actions]
+            # Get Q-values from target_net
+            next_target_q = self.target_net(next_states, next_mfs, indices=agent_ids)
+            next_q_values = next_target_q.gather(1, best_actions).squeeze(1)
             
             n_step_gamma = self.gamma ** self.memory.buffers[0].n_step
-            tz = rewards + n_step_gamma * self.support.unsqueeze(0) * (1 - dones)
-            tz = tz.clamp(self.v_min, self.v_max)
-            
-            b = (tz - self.v_min) / self.delta_z
-            l = b.floor().long()
-            u = b.ceil().long()
-            
-            l[(u > 0) * (l == u)] -= 1
-            u[(l < (self.num_atoms - 1)) * (l == u)] += 1
-            
-            target_dist = torch.zeros((self.batch_size, self.num_atoms), device=self.device)
-            offset = torch.linspace(0, (self.batch_size - 1) * self.num_atoms, self.batch_size, device=self.device).long().unsqueeze(1)
-            
-            target_dist.view(-1).index_add_(0, (l + offset).view(-1), (next_best_dist * (u.float() - b)).view(-1))
-            target_dist.view(-1).index_add_(0, (u + offset).view(-1), (next_best_dist * (b - l.float())).view(-1))
+            target_q = rewards + n_step_gamma * next_q_values * (1 - dones)
 
         curr_mfs_pred = self.mf_net(torch.cat([states, curr_mfs], dim=-1), indices=agent_ids)
-        eval_dist = self.eval_net(states, curr_mfs_pred, indices=agent_ids)
-        eval_action_dist = eval_dist[range(self.batch_size), actions.squeeze()]
+        q_values = self.eval_net(states, curr_mfs_pred, indices=agent_ids)
+        curr_q = q_values.gather(1, actions.long()).squeeze(1)
         
-        loss_samples = -(target_dist * (eval_action_dist + 1e-8).log()).sum(dim=1)
+        td_errors = target_q - curr_q
+        loss_samples = td_errors.pow(2)
         loss = (loss_samples * weights).mean()
         
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.eval_net.parameters(), max_norm=5.0)
+        torch.nn.utils.clip_grad_norm_(self.eval_net.parameters(), max_norm=10.0)
         self.optimizer.step()
         
-        new_priorities = loss_samples.detach() + 1e-6
+        new_priorities = td_errors.abs().detach() + 1e-6
         self.memory.update_priorities(agent_ids, indices, new_priorities)
         
         self.learn_step_counter += 1
@@ -246,18 +222,15 @@ class RainbowMultiAgent:
             self._soft_update()
             
         if self.learn_step_counter % 20 == 0:
-            avg_q = (eval_action_dist * self.support).sum(dim=1).mean().item()
-            print(f"[{self.node_type} Rainbow] Step {self.learn_step_counter:5d} | Loss: {loss.item():.5f} | Avg Q: {avg_q:.3f}")
+            print(f"[{self.node_type} Rainbow] Step {self.learn_step_counter:5d} | Loss: {loss.item():.5f} | Avg Q: {curr_q.mean().item():.3f}")
             
         if self.logs_q:
-            with torch.no_grad():
-                all_q_values = (eval_dist * self.support).sum(dim=2)
-                return {
-                    "loss": loss.item(),
-                    "q_min": all_q_values.min().item(),
-                    "q_max": all_q_values.max().item(),
-                    "q_mean": all_q_values.mean().item()
-                }
+            return {
+                "loss": loss.item(),
+                "q_min": q_values.min().item(),
+                "q_max": q_values.max().item(),
+                "q_mean": q_values.mean().item()
+            }
         return loss.item()
 
     def _soft_update(self, tau=0.005):

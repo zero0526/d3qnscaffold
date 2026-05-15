@@ -22,7 +22,8 @@ class D3QNStrategy(AlgorithmStrategy):
             buffer_size=trainer.config.hyper_neural['MEMORY_SIZE'],
             batch_size=trainer.config.hyper_neural['BATCH_SIZE'],
             num_instances=trainer.num_edge_agents,
-            device=trainer.device
+            device=trainer.device,
+            logs_q=True
         )
 
         # Lower Agent
@@ -41,7 +42,8 @@ class D3QNStrategy(AlgorithmStrategy):
             buffer_size=trainer.config.hyper_neural['MEMORY_SIZE'],
             batch_size=trainer.config.hyper_neural['BATCH_SIZE'],
             num_instances=trainer.num_terminals,
-            device=trainer.device
+            device=trainer.device,
+            logs_q=False
         )
 
     def get_upper_actions(self, trainer, current_upper_state, obs_upper):
@@ -175,8 +177,13 @@ class D3QNStrategy(AlgorithmStrategy):
                     trainer.total_lower_steps += 1 
                     
                     # train lower
-                    loss = trainer.shared_lower_agent.learn(torch.arange(trainer.num_terminals, device=trainer.device))
-                    if loss is not None:
+                    res = trainer.shared_lower_agent.learn(torch.arange(trainer.num_terminals, device=trainer.device))
+                    if res is not None:
+                        if isinstance(res, dict):
+                            loss = res["loss"]
+                            trainer.aggregator.record_q_stats("Terminal_Group", res["q_min"], res["q_max"], res["q_mean"])
+                        else:
+                            loss = res
                         trainer.aggregator.record_td_losses(lower_losses=loss)
                 else:
                     trainer.env.time_manager.tick()
@@ -194,8 +201,13 @@ class D3QNStrategy(AlgorithmStrategy):
                         trainer.total_upper_steps += 1 
 
                     # train upper
-                    loss = trainer.shared_upper_agent.learn(torch.arange(trainer.num_edge_agents, device=trainer.device))
-                    if loss is not None:
+                    res = trainer.shared_upper_agent.learn(torch.arange(trainer.num_edge_agents, device=trainer.device))
+                    if res is not None:
+                        if isinstance(res, dict):
+                            loss = res["loss"]
+                            trainer.aggregator.record_q_stats("Edge_Group", res["q_min"], res["q_max"], res["q_mean"])
+                        else:
+                            loss = res
                         trainer.aggregator.record_td_losses(upper_losses=loss)
 
                     current_upper_state = next_upper_state

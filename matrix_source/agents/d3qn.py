@@ -129,7 +129,7 @@ class MF(nn.Module):
 class D3QNAgent:
     def __init__(self, node_id, node_type, state_dim, action_dim, u_action_dim, mf_hidden_sizes, mf_lr, buffer_min_size,
                  hidden_sizes=(128, 64), lr=1e-4, gamma=0.99, alpha=0.005, buffer_size=100000, batch_size=64,
-                 exclude_zero=False, num_instances=1, device=None, use_per=False, n_step=1):
+                 exclude_zero=False, num_instances=1, device=None, use_per=False, n_step=1, logs_q=False):
         self.node_id = node_id
         self.node_type = node_type
         self.action_dim = action_dim
@@ -138,6 +138,7 @@ class D3QNAgent:
         self.alpha = float(alpha)
         self.batch_size = batch_size
         self.exclude_zero = exclude_zero
+        self.logs_q = logs_q
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
@@ -301,6 +302,7 @@ class D3QNAgent:
 
         # 1. Train MF (prediction and current state)
         # 2. DQN update
+        agent_ids = agent_ids.view(-1)
         q_eval = self.eval_net(states, curr_mfs, indices=agent_ids).gather(1, actions)
 
         with torch.no_grad():
@@ -328,13 +330,25 @@ class D3QNAgent:
 
         # Update logging/target
         self.learn_step_counter += 1
+        
+        q_min = q_eval.min().item()
+        q_max = q_eval.max().item()
+        q_mean = q_eval.mean().item()
+
         step=10
         if self.node_type=="Terminal_Group":step=100
         if self.learn_step_counter % step == 0:
-            avg_q = q_eval.mean().item()
-            print(f"[{self.node_type} Group] Step {self.learn_step_counter:5d} | TD Loss: {loss.item():.5f} | Avg Q: {avg_q:.3f}")
+            print(f"[{self.node_type} Group] Step {self.learn_step_counter:5d} | TD Loss: {loss.item():.5f} | Q [Min: {q_min:.3f}, Max: {q_max:.3f}, Mean: {q_mean:.3f}]")
         
         self._soft_update()
+        
+        if self.logs_q:
+            return {
+                "loss": loss.item(),
+                "q_min": q_min,
+                "q_max": q_max,
+                "q_mean": q_mean
+            }
         return loss.item()
 
     def _soft_update(self):

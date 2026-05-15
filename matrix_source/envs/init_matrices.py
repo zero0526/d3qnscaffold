@@ -89,6 +89,17 @@ def init_static_matrices(config, device="cpu"):
                 j = comp_node_id_to_idx[target_id]
                 adj_matrix[i, j] = 1.0
 
+    edge_id_to_local_idx = {eid: idx for idx, eid in enumerate(edge_ids)}
+    edge_adj_matrix = torch.zeros((len(edge_ids), len(edge_ids)), device=device)
+    for i, edge_node in enumerate(edge_nodes):
+        # Find nodes within 2 hops in the global graph G
+        edge_id= edge_node["id"]
+        lengths = nx.single_source_shortest_path_length(G, edge_id, cutoff=2)
+        for target_id, dist in lengths.items():
+            if target_id in edge_id_to_local_idx and target_id != edge_id:
+                j = edge_id_to_local_idx[target_id]
+                edge_adj_matrix[i, j] = 1.0
+
     # 8. Terminal Adjacency Matrix
     terminal_adj_matrix = torch.zeros((num_terminals, num_terminals), device=device)
     for i in range(num_terminals):
@@ -106,7 +117,8 @@ def init_static_matrices(config, device="cpu"):
         "terminal_adj_matrix": terminal_adj_matrix,
         "terminals": terminals,
         "edge_ids": edge_ids,
-        "cloud_ids": cloud_ids
+        "cloud_ids": cloud_ids,
+        "edge_adj_matrix": edge_adj_matrix
     }
 
 def init_metadata_tensors(config, device="cpu"):

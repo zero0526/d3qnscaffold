@@ -111,3 +111,17 @@ class MultiInstanceNoisyLinear(nn.Module):
         # weight: (Batch, In, Out)
         out = torch.bmm(x.unsqueeze(1), weight).squeeze(1) + bias
         return out
+
+class MF(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, hidden_sizes, num_instances=1):
+        super().__init__()
+        h = hidden_sizes[0]
+        self.num_instances = num_instances
+        
+        self.l1 = MultiInstanceLinear(num_instances, in_dim, h)
+        self.norm = MultiInstanceRMSNorm(num_instances, h)
+        self.l2 = MultiInstanceLinear(num_instances, h, out_dim)
+
+    def forward(self, x, indices=None):
+        x = torch.nn.functional.silu(self.norm(self.l1(x, indices), indices))
+        return torch.sigmoid(self.l2(x, indices))

@@ -1,8 +1,3 @@
-import torch
-import numpy as np
-from tqdm import tqdm
-from typing import Dict
-
 from matrix_source.envs.matrix_env import MatrixSixGEnvironment
 from matrix_source.envs.workload_generator import MatrixWorkloadGenerator
 from matrix_source.configs.configs import cfg
@@ -57,7 +52,7 @@ class Trainer:
                              if nid not in self.env.static_matrices.get("cloud_ids", [])]
         self.node_to_instance = {nid: i for i, nid in enumerate(self.edge_node_ids)}
         self.num_edge_agents = len(self.edge_node_ids)
-
+        self.max_epochs= 3000
         # 2. Strategy Injection
         self.strategy = strategy if strategy is not None else PPOStrategy()
         self.strategy.initialize_agents(self)

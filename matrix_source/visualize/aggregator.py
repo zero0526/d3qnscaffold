@@ -12,6 +12,15 @@ class MetricsAggregator:
         self._setup_logger()
         self.history["zeta_lower"] = []
         self.history["zeta_upper"] = []
+        
+        # Q-Value History (Min, Max, Mean)
+        self.history["upper_q_min"] = []
+        self.history["upper_q_max"] = []
+        self.history["upper_q_mean"] = []
+        self.history["lower_q_min"] = []
+        self.history["lower_q_max"] = []
+        self.history["lower_q_mean"] = []
+        
         self.reset_episode()
 
     def _setup_logger(self):
@@ -77,6 +86,14 @@ class MetricsAggregator:
         
         self.curr_zeta_lower = 1.0
         self.curr_zeta_upper = 1.0
+        
+        # Q-Stats buffers for current episode
+        self.episode_upper_q_min = []
+        self.episode_upper_q_max = []
+        self.episode_upper_q_mean = []
+        self.episode_lower_q_min = []
+        self.episode_lower_q_max = []
+        self.episode_lower_q_mean = []
         
         # Offloading flow matrix: [SourceNode][TargetNode] -> count
         self.episode_offloading_matrix = defaultdict(lambda: defaultdict(int))
@@ -160,6 +177,17 @@ class MetricsAggregator:
     def record_zeta(self, lower, upper):
         self.curr_zeta_lower = lower
         self.curr_zeta_upper = upper
+        
+    def record_q_stats(self, node_type, q_min, q_max, q_mean):
+        """Records Q-value statistics for the specified node type."""
+        if node_type == "Edge_Group": # Upper
+            self.episode_upper_q_min.append(q_min)
+            self.episode_upper_q_max.append(q_max)
+            self.episode_upper_q_mean.append(q_mean)
+        elif node_type == "Terminal_Group": # Lower
+            self.episode_lower_q_min.append(q_min)
+            self.episode_lower_q_max.append(q_max)
+            self.episode_lower_q_mean.append(q_mean)
 
     def store_history(self):
         """Saves episode averages to history and RESETS intra-episode data."""
@@ -187,6 +215,14 @@ class MetricsAggregator:
 
         self.history["zeta_lower"].append(self.curr_zeta_lower)
         self.history["zeta_upper"].append(self.curr_zeta_upper)
+
+        # Q-Value History Averages
+        self.history["upper_q_min"].append(np.mean(self.episode_upper_q_min) if self.episode_upper_q_min else 0)
+        self.history["upper_q_max"].append(np.mean(self.episode_upper_q_max) if self.episode_upper_q_max else 0)
+        self.history["upper_q_mean"].append(np.mean(self.episode_upper_q_mean) if self.episode_upper_q_mean else 0)
+        self.history["lower_q_min"].append(np.mean(self.episode_lower_q_min) if self.episode_lower_q_min else 0)
+        self.history["lower_q_max"].append(np.mean(self.episode_lower_q_max) if self.episode_lower_q_max else 0)
+        self.history["lower_q_mean"].append(np.mean(self.episode_lower_q_mean) if self.episode_lower_q_mean else 0)
 
         # QoS Success Rate
         success = np.sum(self.episode_success_qos) if self.episode_success_qos else 0
@@ -377,11 +413,11 @@ class MetricsAggregator:
         episodes = range(1, len(self.history["total_reward"]) + 1)
         window = 10 # Window for smoothing
         
-        plt.figure(figsize=(18, 10))
+        plt.figure(figsize=(24, 12))
         plt.suptitle(f"Model Evolution Over Episodes (up to {len(episodes)})", fontsize=20)
         
         # Plot 1: Rewards
-        plt.subplot(2, 3, 1)
+        plt.subplot(2, 4, 1)
         plt.plot(episodes, self.history["total_reward"], alpha=0.3, color='blue', label="Raw Total")
         if len(episodes) >= window:
             ma = self._moving_average(self.history["total_reward"], window)
@@ -447,6 +483,24 @@ class MetricsAggregator:
                 plt.plot(range(window, len(self.history["avg_lower_td_loss"]) + 1), ma_l, color='olive')
         plt.yscale('log')
         plt.title("TD Loss (Log)")
+        plt.xlabel("Episode")
+        plt.legend()
+        
+        # Plot 7: Upper Q-Values
+        plt.subplot(2, 4, 7)
+        plt.plot(episodes, self.history["upper_q_min"], alpha=0.3, color='blue', label="Min")
+        plt.plot(episodes, self.history["upper_q_max"], alpha=0.3, color='red', label="Max")
+        plt.plot(episodes, self.history["upper_q_mean"], alpha=0.8, color='green', label="Mean")
+        plt.title("Upper Q-Value Stats")
+        plt.xlabel("Episode")
+        plt.legend()
+
+        # Plot 8: Lower Q-Values
+        plt.subplot(2, 4, 8)
+        plt.plot(episodes, self.history["lower_q_min"], alpha=0.3, color='blue', label="Min")
+        plt.plot(episodes, self.history["lower_q_max"], alpha=0.3, color='red', label="Max")
+        plt.plot(episodes, self.history["lower_q_mean"], alpha=0.8, color='green', label="Mean")
+        plt.title("Lower Q-Value Stats")
         plt.xlabel("Episode")
         plt.legend()
         
