@@ -37,9 +37,9 @@ class PPOStrategy(AlgorithmStrategy):
         # Hyperparams from user
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
         self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 5}
-        self.lower_warmup_steps = 25
-        self.upper_warmup_steps = 15
-        self.alt_steps = 50
+        self.lower_warmup_steps = 40
+        self.upper_warmup_steps = 30
+        self.alt_steps = 30
 
     def initialize_agents(self, trainer):
         # 1. Upper Agent
