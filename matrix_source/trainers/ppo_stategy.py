@@ -35,10 +35,10 @@ class PPOStrategy(AlgorithmStrategy):
         self.mf_ema_alpha = 0.7
         
         # Hyperparams from user
-        self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
-        self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 5}
-        self.lower_warmup_steps = 40
-        self.upper_warmup_steps = 30
+        self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 6}
+        self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 4}
+        self.lower_warmup_steps = 45
+        self.upper_warmup_steps = 35
         self.alt_steps = 30
 
     def initialize_agents(self, trainer):
@@ -311,8 +311,8 @@ class PPOStrategy(AlgorithmStrategy):
                                 self.phase = 'ALTERNATING'
                                 print(f"\n[Curriculum] Phase 2 Complete. Switching to {self.phase}")
                                 # Apply Phase 3 overrides: 0.5x LR, 8000/800 buffers, 8/6 epochs
-                                trainer.shared_lower_agent.set_lr_factor(0.5)
-                                trainer.shared_upper_agent.set_lr_factor(0.5)
+                                trainer.shared_lower_agent.set_lr_factor(0.2)
+                                trainer.shared_upper_agent.set_lr_factor(0.2)
                                 trainer.shared_lower_agent.k_epochs = 8
                                 trainer.shared_upper_agent.k_epochs = 6
                                 trainer.shared_lower_agent.min_batch_size = 8000
