@@ -39,7 +39,7 @@ class PPOStrategy(AlgorithmStrategy):
         self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 4}
         self.lower_warmup_steps = 45
         self.upper_warmup_steps = 35
-        self.alt_steps = 30
+        self.alt_steps = 35
 
     def initialize_agents(self, trainer):
         # 1. Upper Agent
