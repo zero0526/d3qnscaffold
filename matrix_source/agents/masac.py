@@ -16,19 +16,21 @@ DistType = Literal["gaussian", "dirichlet"]
 # Networks
 # -----------------------------
 class MFCritic(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256, num_instances=1):
+    def __init__(self, state_dim: int, action_dim: int, mf_dim:int=None, hidden_dim: int = 256, num_instances=1):
         super().__init__()
         self.num_instances = num_instances
         
         # Q1 architecture
-        self.q1_l1 = MultiInstanceLinear(num_instances, state_dim + 2 * action_dim, hidden_dim) # Action + MF Action
+        if not mf_dim:
+            mf_dim= action_dim
+        self.q1_l1 = MultiInstanceLinear(num_instances, state_dim + action_dim + mf_dim, hidden_dim) # Action + MF Action
         self.q1_norm1 = MultiInstanceRMSNorm(num_instances, hidden_dim)
         self.q1_l2 = MultiInstanceLinear(num_instances, hidden_dim, hidden_dim)
         self.q1_norm2 = MultiInstanceRMSNorm(num_instances, hidden_dim)
         self.q1_l3 = MultiInstanceLinear(num_instances, hidden_dim, 1)
 
         # Q2 architecture
-        self.q2_l1 = MultiInstanceLinear(num_instances, state_dim + 2 * action_dim, hidden_dim)
+        self.q2_l1 = MultiInstanceLinear(num_instances, state_dim + action_dim + mf_dim, hidden_dim)
         self.q2_norm1 = MultiInstanceRMSNorm(num_instances, hidden_dim)
         self.q2_l2 = MultiInstanceLinear(num_instances, hidden_dim, hidden_dim)
         self.q2_norm2 = MultiInstanceRMSNorm(num_instances, hidden_dim)
@@ -145,6 +147,7 @@ class MFSACAgent:
         node_type,
         state_dim: int,
         action_dim: int,
+        mf_dim: int= None,
         mf_hidden_sizes=(128,),
         hidden_sizes=(256, 256),
         actor_lr: float = 1e-4,
@@ -164,6 +167,8 @@ class MFSACAgent:
         logs_q: bool = False,
         dist_type: DistType = "gaussian",
     ):
+        if not mf_dim:
+            mf_dim = action_dim
         self.node_id = node_id
         self.node_type = node_type
         self.state_dim = state_dim
@@ -181,10 +186,10 @@ class MFSACAgent:
         hidden_dim = hidden_sizes[0]
 
         if dist_type == "gaussian":
-            self.actor = MFGaussianActor(state_dim, self.action_dim, hidden_dim, num_instances).to(self.device)
+            self.actor = MFGaussianActor(state_dim, mf_dim, hidden_dim, num_instances).to(self.device)
             self.target_entropy = -float(self.action_dim)
         elif dist_type == "dirichlet":
-            self.actor = MFDirichletActor(state_dim, self.action_dim, hidden_dim, num_instances).to(self.device)
+            self.actor = MFDirichletActor(state_dim, mf_dim, hidden_dim, num_instances).to(self.device)
             uniform_alpha = torch.ones(self.action_dim, device=self.device)
             uniform_dist = torch.distributions.Dirichlet(uniform_alpha)
             max_entropy = uniform_dist.entropy().item()
@@ -192,11 +197,11 @@ class MFSACAgent:
         else:
             raise ValueError(f"Unknown dist_type: {dist_type}")
 
-        self.critic = MFCritic(state_dim, self.action_dim, hidden_dim, num_instances).to(self.device)
-        self.critic_target = MFCritic(state_dim, self.action_dim, hidden_dim, num_instances).to(self.device)
+        self.critic = MFCritic(state_dim, self.action_dim, mf_dim, hidden_dim, num_instances).to(self.device)
+        self.critic_target = MFCritic(state_dim, self.action_dim, mf_dim, hidden_dim, num_instances).to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
         
-        self.mf_net = MF(state_dim, self.action_dim, mf_hidden_sizes, num_instances).to(self.device)
+        self.mf_net = MF(state_dim, mf_dim, mf_hidden_sizes, num_instances).to(self.device)
 
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=critic_lr)
@@ -208,9 +213,9 @@ class MFSACAgent:
         self.use_per = use_per
         if use_per:
             # PER not fully implemented in sac_buffer yet, fallback to normal MultiAgentSACReplayBuffer or pass.
-            self.memory = MultiAgentSACReplayBuffer(num_instances, node_type, buffer_size, state_dim, self.action_dim, self.device)
+            self.memory = MultiAgentSACReplayBuffer(num_instances, node_type, buffer_size, state_dim, self.action_dim,mf_dim, self.device)
         else:
-            self.memory = MultiAgentSACReplayBuffer(num_instances, node_type, buffer_size, state_dim, self.action_dim, self.device)
+            self.memory = MultiAgentSACReplayBuffer(num_instances, node_type, buffer_size, state_dim, self.action_dim,mf_dim, self.device)
 
         self.mf_loss_fn = nn.MSELoss(reduction='none')
         self.learn_step_counter = 0

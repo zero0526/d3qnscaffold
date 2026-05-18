@@ -2,7 +2,7 @@ import torch
 import numpy as np
 
 class SACReplayBuffer:
-    def __init__(self, max_size, node_type, state_dim, action_dim, device="cpu"):
+    def __init__(self, max_size, node_type, state_dim, action_dim,mf_dim, device="cpu"):
         self.max_size = max_size
         self.ptr = 0
         self.size = 0
@@ -11,8 +11,8 @@ class SACReplayBuffer:
 
         # Pre-allocate with torch tensors on the specified device
         self.state = torch.zeros((max_size, state_dim), dtype=torch.float32, device=device)
-        self.prev_mf = torch.zeros((max_size, action_dim), dtype=torch.float32, device=device)
-        self.curr_mf = torch.zeros((max_size, action_dim), dtype=torch.float32, device=device)
+        self.prev_mf = torch.zeros((max_size, mf_dim), dtype=torch.float32, device=device)
+        self.curr_mf = torch.zeros((max_size, mf_dim), dtype=torch.float32, device=device)
         # ACTION IS FLOAT32 IN SAC
         self.action = torch.zeros((max_size, action_dim), dtype=torch.float32, device=device)
         
@@ -91,12 +91,12 @@ class SACReplayBuffer:
         return self.size
 
 class MultiAgentSACReplayBuffer:
-    def __init__(self, num_agents, node_type, max_size_per_agent, state_dim, action_dim, device="cpu"):
+    def __init__(self, num_agents, node_type, max_size_per_agent, state_dim, action_dim,mf_dim, device="cpu"):
         self.num_agents = num_agents
         self.device = device
         self.node_type = node_type
         self.buffers = [
-            SACReplayBuffer(max_size_per_agent, node_type, state_dim, action_dim, device)
+            SACReplayBuffer(max_size_per_agent, node_type, state_dim, action_dim, mf_dim, device)
             for _ in range(num_agents)
         ]
         self.buffer_sizes = torch.zeros(num_agents, dtype=torch.long, device=device)
