@@ -128,16 +128,29 @@ class MultiAgentSACReplayBuffer:
         if not isinstance(agent_ids, torch.Tensor):
             agent_ids = torch.tensor(agent_ids, device=self.device)
 
-        num_agents_to_pick = min(batch_sizes, len(agent_ids))
+        num_agents = len(agent_ids)
+        samples_per_agent = batch_sizes // num_agents
+        remainder = batch_sizes % num_agents
         
-        perm = torch.randperm(len(agent_ids), device=self.device)[:num_agents_to_pick]
-        final_agent_ids = agent_ids[perm]
+        # Shuffle agents to distribute the remainder randomly
+        perm = torch.randperm(num_agents, device=self.device)
+        shuffled_agent_ids = agent_ids[perm]
+
+        samples = []
+        for i, a_id in enumerate(shuffled_agent_ids):
+            n = samples_per_agent + (1 if i < remainder else 0)
+            valid_n = min(n, int(self.buffer_sizes[a_id].item()))
+            if valid_n > 0:
+                agent_samples = self.buffers[int(a_id)].sample(valid_n)
+                if agent_samples is not None:
+                    samples.append(agent_samples)
         
-        samples = [self.buffers[int(a_id)].sample(1) for a_id in final_agent_ids]
-        
+        if not samples:
+            return None
+            
         collated = []
         for i in range(8):
-            collated.append(torch.cat([s[i] for s in samples if s is not None], dim=0))
+            collated.append(torch.cat([s[i] for s in samples], dim=0))
         
         return tuple(collated)
 

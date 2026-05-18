@@ -92,13 +92,15 @@ def init_static_matrices(config, device="cpu"):
     edge_id_to_agent_idx = {eid: idx for idx, eid in enumerate(edge_ids)}
     agent_adj_matrix = torch.zeros((len(edge_ids), len(edge_ids)), device=device)
     for i, edge_node in enumerate(edge_nodes):
-        # Find nodes within 2 hops in the global graph G
-        edge_id= edge_node["id"]
-        lengths = nx.single_source_shortest_path_length(G, edge_id, cutoff=2)
+        # i is the agent index for this edge node
+        node_id = edge_node["id"]
+        lengths = nx.single_source_shortest_path_length(G, node_id, cutoff=2)
         for target_id, dist in lengths.items():
-            if target_id in edge_id_to_agent_idx and target_id != edge_id:
-                j = edge_id_to_agent_idx[target_id]
-                agent_adj_matrix[i, j] = 1.0
+            if target_id in comp_node_id_to_idx and target_id != node_id:
+                comp_target_id = comp_node_id_to_idx[target_id]
+                if comp_target_id in edge_id_to_agent_idx:
+                    j = edge_id_to_agent_idx[comp_target_id]
+                    agent_adj_matrix[i, j] = 1.0
 
     # 8. Terminal Adjacency Matrix
     terminal_adj_matrix = torch.zeros((num_terminals, num_terminals), device=device)

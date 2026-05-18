@@ -46,10 +46,10 @@ class Trainer:
         self.aggregator = MetricsAggregator()
         self.shared_upper_agent = None
         self.shared_lower_agent = None
-        
-        # Track which nodes are edge agents (to map to weight indices)
-        self.edge_node_ids = [nid for nid in range(self.num_nodes) 
-                             if nid not in self.env.static_matrices.get("cloud_ids", [])]
+
+        self.edge_ids = self.env.static_matrices["edge_ids"]
+        self.edge_node_ids = [nid for nid in range(self.num_nodes)
+                              if nid not in self.env.static_matrices.get("cloud_ids", [])]
         self.node_to_instance = {nid: i for i, nid in enumerate(self.edge_node_ids)}
         self.num_edge_agents = len(self.edge_node_ids)
         self.max_epochs= 3000
@@ -61,11 +61,22 @@ class Trainer:
         self.strategy.run_training(self)
 
     def update_rates(self, ep):
-        # 1. Update Epsilons
+        # 1. Update Epsilons (Exploration decay)
         for nid in self.epsilons: 
             self.epsilons[nid] = max(self.min_epsilon, self.epsilons[nid] * self.epsilon_decay)
         for tid in self.lower_epsilons: 
             self.lower_epsilons[tid] = max(self.min_epsilon, self.lower_epsilons[tid] * self.epsilon_decay)
+            
+        # 2. Update Zeta (Inverse Temperature) - Linear Scale based on Total Steps
+        # We increase zeta to reduce exploration over time
+        zeta_increment = self.config.hyper_neural.get("ZETA_STEP", 1.001)
+        if zeta_increment > 1.0:
+            zeta_increment -= 1.0 # Convert 1.001 to 0.001 additive step
+            
+        # Linear scaling: zeta = initial + (step * increment)
+        # Lower steps occur much more frequently than upper steps
+        self.zeta_upper = min(self.zeta_max, self.zeta_initial + zeta_increment * self.total_upper_steps)
+        self.zeta_lower = min(self.zeta_max, self.zeta_initial + zeta_increment * self.total_lower_steps/10)
 
 def log_transform(reward: float) -> float:
     return reward

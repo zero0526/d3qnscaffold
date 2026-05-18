@@ -427,7 +427,7 @@ class MetricsAggregator:
         plt.legend()
         
         # Plot 2: Energy
-        plt.subplot(2, 3, 2)
+        plt.subplot(2, 4, 2)
         plt.plot(episodes, self.history["total_energy"], alpha=0.3, color='orange')
         if len(episodes) >= window:
             ma = self._moving_average(self.history["total_energy"], window)
@@ -436,7 +436,7 @@ class MetricsAggregator:
         plt.xlabel("Episode")
         
         # Plot 3: QoS Success Rate
-        plt.subplot(2, 3, 3)
+        plt.subplot(2, 4, 3)
         plt.plot(episodes, self.history["qos_success_rate"], alpha=0.3, color='purple')
         if len(episodes) >= window:
             ma = self._moving_average(self.history["qos_success_rate"], window)
@@ -446,7 +446,7 @@ class MetricsAggregator:
         plt.xlabel("Episode")
  
         # Plot 4: Remaining Tasks
-        plt.subplot(2, 3, 4)
+        plt.subplot(2, 4, 4)
         plt.plot(episodes, self.history["avg_remaining_tasks"], alpha=0.3, color='brown')
         if len(episodes) >= window:
             ma = self._moving_average(self.history["avg_remaining_tasks"], window)
@@ -455,7 +455,7 @@ class MetricsAggregator:
         plt.xlabel("Episode")
  
         # Plot 5: MF Training Losses
-        plt.subplot(2, 3, 5)
+        plt.subplot(2, 4, 5)
         plt.plot(episodes, self.history["avg_upper_mf_loss"], alpha=0.3, color='cyan', label="Upper")
         plt.plot(episodes, self.history["avg_lower_mf_loss"], alpha=0.3, color='magenta', label="Lower")
         if len(episodes) >= window:
@@ -471,7 +471,7 @@ class MetricsAggregator:
         plt.legend()
  
         # Plot 6: TD Training Losses (Q-Network)
-        plt.subplot(2, 3, 6)
+        plt.subplot(2, 4, 6)
         plt.plot(episodes, self.history["avg_upper_td_loss"], alpha=0.3, color='teal', label="Upper")
         plt.plot(episodes, self.history["avg_lower_td_loss"], alpha=0.3, color='olive', label="Lower")
         if len(episodes) >= window:

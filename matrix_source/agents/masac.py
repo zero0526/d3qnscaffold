@@ -50,14 +50,16 @@ class MFCritic(nn.Module):
         return q1, q2
 
 class MFGaussianActor(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256, num_instances=1, log_std_min: float = -20, log_std_max: float = 2):
+    def __init__(self, state_dim: int, action_dim: int,mf_dim:int=None, hidden_dim: int = 256, num_instances=1, log_std_min: float = -20, log_std_max: float = 2):
         super().__init__()
         self.action_dim = action_dim
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
         self.num_instances = num_instances
+        if not mf_dim:
+            mf_dim=action_dim
 
-        self.l1 = MultiInstanceLinear(num_instances, state_dim + action_dim, hidden_dim) # State + MF
+        self.l1 = MultiInstanceLinear(num_instances, state_dim + mf_dim, hidden_dim) # State + MF
         self.norm1 = MultiInstanceRMSNorm(num_instances, hidden_dim)
         self.l2 = MultiInstanceLinear(num_instances, hidden_dim, hidden_dim)
         self.norm2 = MultiInstanceRMSNorm(num_instances, hidden_dim)
@@ -94,12 +96,13 @@ class MFGaussianActor(nn.Module):
 
 
 class MFDirichletActor(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256, num_instances=1):
+    def __init__(self, state_dim: int, action_dim: int, mf_dim:int= None, hidden_dim: int = 256, num_instances=1):
         super().__init__()
         self.action_dim = action_dim
         self.num_instances = num_instances
-        
-        self.l1 = MultiInstanceLinear(num_instances, state_dim + action_dim, hidden_dim)
+        if not mf_dim:
+            mf_dim=action_dim
+        self.l1 = MultiInstanceLinear(num_instances, state_dim + mf_dim, hidden_dim)
         self.norm1 = MultiInstanceRMSNorm(num_instances, hidden_dim)
         self.l2 = MultiInstanceLinear(num_instances, hidden_dim, hidden_dim)
         self.norm2 = MultiInstanceRMSNorm(num_instances, hidden_dim)
@@ -186,10 +189,10 @@ class MFSACAgent:
         hidden_dim = hidden_sizes[0]
 
         if dist_type == "gaussian":
-            self.actor = MFGaussianActor(state_dim, mf_dim, hidden_dim, num_instances).to(self.device)
+            self.actor = MFGaussianActor(state_dim, action_dim, mf_dim, hidden_dim, num_instances).to(self.device)
             self.target_entropy = -float(self.action_dim)
         elif dist_type == "dirichlet":
-            self.actor = MFDirichletActor(state_dim, mf_dim, hidden_dim, num_instances).to(self.device)
+            self.actor = MFDirichletActor(state_dim, action_dim, mf_dim, hidden_dim, num_instances).to(self.device)
             uniform_alpha = torch.ones(self.action_dim, device=self.device)
             uniform_dist = torch.distributions.Dirichlet(uniform_alpha)
             max_entropy = uniform_dist.entropy().item()
@@ -201,7 +204,7 @@ class MFSACAgent:
         self.critic_target = MFCritic(state_dim, self.action_dim, mf_dim, hidden_dim, num_instances).to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
         
-        self.mf_net = MF(state_dim, mf_dim, mf_hidden_sizes, num_instances).to(self.device)
+        self.mf_net = MF(state_dim + mf_dim, mf_dim, mf_hidden_sizes, num_instances).to(self.device)
 
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=critic_lr)
@@ -280,15 +283,21 @@ class MFSACAgent:
         return final_actions.cpu().numpy()
 
     def store_transition_train_mf_batch(self, states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids):
-        # We don't train MF here in MFSAC to avoid splitting the optimization step unnecessarily,
-        # but we maintain the interface. MF is trained in `learn()`.
         if not torch.is_tensor(actions):
             actions = torch.tensor(actions, dtype=torch.float32, device=self.device)
         else:
             actions = actions.to(self.device).float()
             
-        res = self.memory.add_batch(states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids)
-        return 0.0
+        self.memory.add_batch(states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids)
+
+        # train mf
+        pred_curr_mf = self.mf_net(torch.cat([states, prev_mfs], dim=-1), indices=agent_ids)
+        mf_loss = (self.mf_loss_fn(pred_curr_mf, curr_mfs).mean(dim=1)).mean()
+        self.mf_optimizer.zero_grad()
+        mf_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.mf_net.parameters(), 5.0)
+        self.mf_optimizer.step()
+        return mf_loss.item()
 
     def learn(self, agents_ids: torch.Tensor = None):
         ready_pool = (self.memory.buffer_sizes >= self.min_batch_size).nonzero(as_tuple=True)[0]
@@ -318,13 +327,7 @@ class MFSACAgent:
         if actions.shape[-1] == 1 and self.action_dim > 1: # Adjust shape if incorrectly recorded as 1D
             actions = actions.view(-1, self.action_dim)
             
-        # 1. Train MF Network
         pred_curr_mf = self.mf_net(torch.cat([states, prev_mfs], dim=-1), indices=agent_ids)
-        mf_loss = (self.mf_loss_fn(pred_curr_mf, curr_mfs).mean(dim=1) * weights).mean()
-        self.mf_optimizer.zero_grad()
-        mf_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.mf_net.parameters(), 5.0)
-        self.mf_optimizer.step()
 
         # 2. Train Critic
         with torch.no_grad():
@@ -384,7 +387,7 @@ class MFSACAgent:
         q_mean = q_new.mean().item()
         
         step=10
-        if self.node_type=="Terminal_Group":step=100
+        if self.node_type=="Offload_Group":step=100
         if self.learn_step_counter % step == 0:
             print(f"[{self.node_type} Group] Step {self.learn_step_counter:5d} | C-Loss: {critic_loss.item():.5f} | A-Loss: {actor_loss.item():.5f} | Q [Min: {q_min:.3f}, Max: {q_max:.3f}, Mean: {q_mean:.3f}]")
 
