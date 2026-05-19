@@ -137,6 +137,7 @@ celerybeat.pid
 *.pid
 
 # RabbitMQ
+data/checkpoints/
 mnesia/
 rabbitmq/
 rabbitmq-data/
