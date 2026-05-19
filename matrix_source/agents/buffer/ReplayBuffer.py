@@ -113,6 +113,7 @@ class MultiAgentReplayBuffer:
             self.print_reward()
             # if self.node_type=="Terminal_Group":
             #     self.print_stats()
+        return self.total_size
 
     def print_stats(self):
         all_s_list = [b.state[:b.size] for b in self.buffers if b.size > 0]
