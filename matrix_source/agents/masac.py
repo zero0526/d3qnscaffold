@@ -87,10 +87,9 @@ class MFGaussianActor(nn.Module):
         else:
             z = normal.rsample()
 
-        action = z
+        action = torch.tanh(z)
 
-        # No Tanh correction needed for unconstrained logits
-        log_prob = normal.log_prob(z)
+        log_prob = normal.log_prob(z) - (2 * (math.log(2) - z - F.softplus(-2 * z)))
         log_prob = log_prob.sum(dim=-1, keepdim=True)
         return action, log_prob
 
@@ -265,7 +264,7 @@ class MFSACAgent:
                 if deterministic:
                     final_actions[indices] = 0.0
                 else:
-                    final_actions[indices] = torch.randn((len(indices), self.action_dim), device=self.device)
+                    final_actions[indices] = torch.rand((len(indices), self.action_dim), device=self.device) * 2 - 1.0
 
         policy_mask = is_policy_agent
         if policy_mask.any():

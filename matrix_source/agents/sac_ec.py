@@ -130,10 +130,10 @@ class GaussianActor(nn.Module):
         else:
             z = normal.rsample()
 
-        action = z
+        action = torch.tanh(z)
 
         # No Tanh correction needed for unconstrained logits
-        log_prob = normal.log_prob(z)
+        log_prob = normal.log_prob(z) - (2 * (math.log(2) - z - F.softplus(-2 * z)))
         log_prob = log_prob.sum(dim=-1, keepdim=True)
         return action, log_prob
 
