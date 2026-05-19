@@ -341,6 +341,11 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         return loss
 
     def run_training(self, trainer_obj: Trainer):
+        """
+        # collect 100 eps random for lower agent
+        train 1000 eps for stable lower agent
+        train upper agent from 1100 eps 
+        """
         num_eps = trainer_obj.config.hyper_neural['NUMOF_TRAIN_EP']
         max_slots = trainer_obj.env.time_manager.max_steps
         print(colored("="*50, "blue", attrs=["bold"]))
@@ -353,7 +358,6 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
             prev_lower_res["mean_field"]= torch.zeros((self.num_edges*trainer_obj.num_services, trainer_obj.num_nodes), device=trainer_obj.device)
             current_upper_state = self.build_upper_state(trainer_obj, obs_upper)
             
-            epoch_lower_steps = 0
             for slot in range(max_slots):
                 if trainer_obj.env.time_manager.is_new_frame():
                     u_acts_matrix = self.get_upper_actions(trainer_obj, current_upper_state, obs_upper)
@@ -368,14 +372,13 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
 
                     next_res["is_done"] = (slot == max_slots - 1)
                     lower_train_metrics = self.store_lower_transitions(trainer_obj, prev_lower_res, next_res, t_idx, s_idx, n_idx, m_idx, tasks_min_accuracy, task_deadlines, batch_sizes, all_probs)
-                    epoch_lower_steps += 1
-                    prev_lower_res = next_res
 
                     learn_res = self.lower_agent.learn()
-                    trainer_obj.total_lower_steps += 1
-                    if learn_res and isinstance(learn_res, dict):
-                        trainer_obj.aggregator.record_q_stats("Lower", learn_res.get("q_min", 0.0), learn_res.get("q_max", 0.0), learn_res.get("q_mean", 0.0))
-                        trainer_obj.aggregator.record_td_losses(lower_losses=learn_res.get("loss", 0.0))
+                    if learn_res:
+                        trainer_obj.total_lower_steps += 1
+                        if isinstance(learn_res, dict):
+                            trainer_obj.aggregator.record_q_stats("Lower", learn_res.get("q_min", 0.0), learn_res.get("q_max", 0.0), learn_res.get("q_mean", 0.0))
+                            trainer_obj.aggregator.record_td_losses(lower_losses=learn_res.get("loss", 0.0))
                 else:
                     trainer_obj.env.time_manager.tick()
 
@@ -388,13 +391,14 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
                     if trainer_obj.total_lower_steps >= trainer_obj.lower_stable_threshold:
                         mf_upper_loss = self.store_upper_transitions(trainer_obj, current_upper_state, ns_upper_state, obs_upper,
                                                      next_res_upper, u_acts_matrix, is_ep_done)
-                        trainer_obj.total_upper_steps += 1
 
                     trainer_obj.aggregator.add_upper(next_res_upper, mf_loss=mf_upper_loss)
 
                     # train upper
                     res = self.upper_agent.learn(torch.arange(trainer_obj.num_edge_agents, device=trainer_obj.device))
+
                     if res is not None:
+                        trainer_obj.total_upper_steps += 1
                         if isinstance(res, dict):
                             loss = res["loss"]
                             trainer_obj.aggregator.record_q_stats("Edge_Group", res["q_min"], res["q_max"], res["q_mean"])

@@ -33,14 +33,20 @@ class Trainer:
         self.epsilons = {nid: 1.0 for nid in range(self.num_nodes)}
         self.lower_epsilons = {tid: 1.0 for tid in range(self.num_terminals)}
         self.zeta_initial = cfg.hyper_neural.get("ZETA", 1.0)
-        self.zeta_max = cfg.hyper_neural.get("ZETA_MAX", 10.0)
+        self.zeta_max = cfg.hyper_neural.get("ZETA_MAX", 20.0)
         self.zeta_upper = self.zeta_initial
         self.zeta_lower = self.zeta_initial
+
+        # --- Lower-level zeta exploration schedule (independent from upper) ---
+        # Lower zeta stays frozen during warmup, then increases slowly per episode
+        self.zeta_lower_warmup = int(cfg.hyper_neural.get("ZETA_LOWER_WARMUP", 200))   # episodes to keep zeta_lower = initial
+        self.zeta_lower_step  = float(cfg.hyper_neural.get("ZETA_LOWER_STEP", 0.005))  # additive increment per episode after warmup
+        self.zeta_lower_max   = float(cfg.hyper_neural.get("ZETA_LOWER_MAX", 5.0))     # separate cap for lower (keep < upper cap)
 
         # Training control variables
         self.total_lower_steps = 0
         self.total_upper_steps = 0
-        self.lower_stable_threshold = self.config.hyper_neural["BUFFER_MIN_SIZE"][0]*10
+        self.lower_stable_threshold = self.config.hyper_neural["LOWER_STABLE"]
         self.lower_start_threshold = self.config.hyper_neural["BUFFER_MIN_SIZE"][1]
         
         self.aggregator = MetricsAggregator()
@@ -67,16 +73,25 @@ class Trainer:
         for tid in self.lower_epsilons: 
             self.lower_epsilons[tid] = max(self.min_epsilon, self.lower_epsilons[tid] * self.epsilon_decay)
             
-        # 2. Update Zeta (Inverse Temperature) - Linear Scale based on Total Steps
-        # We increase zeta to reduce exploration over time
-        zeta_increment = self.config.hyper_neural.get("ZETA_STEP", 1.001)
-        if zeta_increment > 1.0:
-            zeta_increment -= 1.0 # Convert 1.001 to 0.001 additive step
-            
-        # Linear scaling: zeta = initial + (step * increment)
-        # Lower steps occur much more frequently than upper steps
-        self.zeta_upper = min(self.zeta_max, self.zeta_initial + zeta_increment * self.total_upper_steps)
-        self.zeta_lower = min(self.zeta_max, self.zeta_initial + zeta_increment * self.total_lower_steps/10)
+        # 2a. Update Zeta Upper — step-count driven (many fewer steps → fine-grained control)
+        upper_increment = self.config.hyper_neural.get("ZETA_STEP", 1.001)
+        if upper_increment > 1.0:
+            upper_increment -= 1.0  # Convert 1.001 → 0.001 additive step
+        
+        self.zeta_upper = min(self.zeta_max, self.zeta_initial + upper_increment * self.total_upper_steps)
+
+        # 2b. Update Zeta Lower — episode-based, with warmup phase
+        # During warmup (ep < ZETA_LOWER_WARMUP): keep zeta_lower = zeta_initial → maximum Boltzmann exploration
+        # After warmup: slowly increase by ZETA_LOWER_STEP per episode, capped at zeta_lower_max
+        # This prevents premature exploitation collapse in the lower-level SAC agent
+        if ep < self.zeta_lower_warmup:
+            self.zeta_lower = self.zeta_initial
+        else:
+            episodes_past_warmup = ep - self.zeta_lower_warmup
+            self.zeta_lower = min(
+                self.zeta_lower_max,
+                self.zeta_initial + self.zeta_lower_step * episodes_past_warmup
+            )
 
 def log_transform(reward: float) -> float:
     return reward

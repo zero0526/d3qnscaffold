@@ -189,7 +189,7 @@ class MFSACAgent:
 
         if dist_type == "gaussian":
             self.actor = MFGaussianActor(state_dim, action_dim, mf_dim, hidden_dim, num_instances).to(self.device)
-            self.target_entropy = -float(self.action_dim)
+            self.target_entropy = -float(self.action_dim)*1.5
         elif dist_type == "dirichlet":
             self.actor = MFDirichletActor(state_dim, action_dim, mf_dim, hidden_dim, num_instances).to(self.device)
             uniform_alpha = torch.ones(self.action_dim, device=self.device)
@@ -209,7 +209,7 @@ class MFSACAgent:
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=critic_lr)
         self.mf_optimizer = optim.Adam(self.mf_net.parameters(), lr=mf_lr)
 
-        self.log_alpha = torch.zeros(num_instances, 1, device=self.device, requires_grad=True)
+        self.log_alpha = torch.full((num_instances, 1), 1.5, device=self.device, requires_grad=True)
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=alpha_lr)
         
         self.use_per = use_per

@@ -1,7 +1,7 @@
 NEURON_NET:
     BATCH_SIZE: 128
     MEMORY_SIZE: 300000
-    BUFFER_MIN_SIZE: [4000, 50000]
+    BUFFER_MIN_SIZE: [4000, 10000]
     ANNEALING_LENGTH: 2000
     NUMOF_TEST_EP: 10
     NUMOF_TRAIN_EP: 6000
@@ -27,8 +27,16 @@ NEURON_NET:
     DISCOUNT_FACTOR: 0.95
     UPDATE_TARGET_COEF: 0.005 # 0.005
     ZETA: 1.0
-    ZETA_MAX: 20
-    ZETA_STEP: 1.001
+    ZETA_MAX: 20          # Cap for upper-level zeta
+    ZETA_STEP: 1.001      # Upper zeta additive step per training step (0.001 after conversion)
+
+    # Lower-level agent zeta schedule (episode-based, separate from upper)
+    ZETA_LOWER_WARMUP: 200   # Episodes to keep zeta_lower = ZETA (full exploration)
+    ZETA_LOWER_STEP: 0.005   # Additive increment per episode after warmup ends
+    ZETA_LOWER_MAX: 5.0      # Cap for lower-level zeta (keep lower than upper cap)
+
     EPSILON: 0.05 # 0.01
     EPSILON_DECAY: 0.995
+
+    LOWER_STABLE: 100000
 
