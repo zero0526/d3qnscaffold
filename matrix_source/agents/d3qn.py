@@ -253,7 +253,7 @@ class D3QNAgent:
         res = self.memory.add_batch(states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids)
         if res is not None:
             # Train MF on finalized N-step transitions
-            loss = self.learn_mf_batch(res[0], res[1], res[2], res[3])
+            loss = self.learn_mf_batch(states, prev_mfs, curr_mfs, agent_ids)
             return loss
         return 0.0
 
@@ -262,8 +262,8 @@ class D3QNAgent:
         pmf = prev_mf_batch.to(self.device) if torch.is_tensor(prev_mf_batch) else torch.FloatTensor(prev_mf_batch).to(self.device)
         gt_mf = ground_truth_mf_batch.to(self.device) if torch.is_tensor(ground_truth_mf_batch) else torch.FloatTensor(ground_truth_mf_batch).to(self.device)
         
-        pred_mf = self.mf_net(torch.cat([s, pmf], dim=-1), indices=agent_ids)
-        loss = self.loss_fn(pred_mf, gt_mf)
+        pred_mf = self.mf_net(torch.cat([s[agent_ids], pmf[agent_ids]], dim=-1), indices=agent_ids)
+        loss = self.loss_fn(pred_mf, gt_mf).mean()
         
         self.mf_optimizer.zero_grad()
         loss.backward()

@@ -327,16 +327,16 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         rew_divisor = trainer.config.norm_upper_rw
         norm_rew = log_transform(reward / (rew_divisor if rew_divisor != 0 else 1.0))
         rewards = torch.full((trainer.num_edge_agents,), norm_rew, dtype=torch.float32, device=trainer.device)
-        dones = torch.full((self.num_edges,), float(is_done), device=trainer.device)
-        agent_ids = torch.arange(self.num_edges, device=trainer.device)
-        
+        dones = torch.full((trainer.num_edge_agents,), float(is_done), device=trainer.device)
+
         # Actions for upper agent are placement vectors. For DQN, we need indices.
         # If upper agent is scalar SAC/DQN, we map placement matrix row to an index.
         # But Rainbow agents usually use discrete actions.
         a_ids = acts_matrix[trainer.edge_node_ids].sum(dim=-1).long() # Placeholder logic
-        
+        instance_indices = torch.tensor([trainer.node_to_instance[nid] for nid in trainer.edge_node_ids], device=trainer.device)
+
         loss = self.upper_agent.store_transition_train_mf_batch(
-            s_all, edge_mfs, edge_ns_mfs, a_ids, rewards, ns_all, dones, agent_ids
+            s_all, edge_mfs, edge_ns_mfs, a_ids, rewards, ns_all, dones, instance_indices
         )
         return loss
 
