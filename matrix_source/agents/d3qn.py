@@ -161,10 +161,7 @@ class D3QNAgent:
         
         # Each agent instance gets its own partitioned buffer to prevent "noise" and ensure fair training
         self.use_per = use_per
-        if use_per:
-            self.memory = MultiAgentPrioritizedReplayBuffer(num_instances, node_type, buffer_size, state_dim, action_dim, self.device, n_step=n_step)
-        else:
-            self.memory = MultiAgentReplayBuffer(num_instances, node_type, buffer_size, state_dim, action_dim, self.device)
+        self.memory = MultiAgentReplayBuffer(num_instances, node_type, buffer_size, state_dim, action_dim,u_action_dim, self.device)
 
         # Logging
         self.prev_loss = 0.0
@@ -176,13 +173,14 @@ class D3QNAgent:
         actions = self.choose_action_batch(
             state.unsqueeze(0) if not torch.is_tensor(state) else state.detach().unsqueeze(0),
             prev_mf.unsqueeze(0) if not torch.is_tensor(prev_mf) else prev_mf.detach().unsqueeze(0),
-            zeta, 
+            epsilon, 
+            zeta,
             masks_batch=mask.unsqueeze(0) if mask is not None else None,
             agent_indices=idx_tensor
         )
         return int(actions[0])
 
-    def choose_action_batch(self, states_batch, prev_mfs_batch, zeta, masks_batch=None, agent_indices=None):
+    def choose_action_batch(self, states_batch, prev_mfs_batch, epsilon, zeta, masks_batch=None, agent_indices=None):
         batch_size = states_batch.shape[0]
         if agent_indices is None:
             agent_indices = torch.zeros(batch_size, dtype=torch.long, device=self.device)
@@ -241,28 +239,31 @@ class D3QNAgent:
                 
                 if self.exclude_zero and self.u_action_dim > 1:
                     q_values[:, 0] -= 1e10
-                
+
+                probs_boltzmann = torch.softmax(q_values * zeta, dim=1)
+                random_probs = torch.ones_like(q_values)
+                if masks_batch is not None:
+                    m = masks_batch[indices]
+                    random_probs = m / m.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                else:
+                    random_probs = random_probs / self.u_action_dim
                 # zeta factor controls the exploration temperature
-                probs = torch.softmax(q_values * zeta, dim=1)
-                final_actions[indices] = torch.multinomial(probs, 1).squeeze(1)
+                final_probs = (1.0 - epsilon) * probs_boltzmann + epsilon * random_probs
+                final_actions[indices] = torch.multinomial(final_probs, 1).squeeze(1)
 
         return final_actions.tolist()
 
-    def store_transition_train_mf_batch(self, states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids):
-        # res: (states, prev_mfs, curr_mfs, agent_ids) of finalized N-step transitions
-        res = self.memory.add_batch(states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids)
-        if res is not None:
-            # Train MF on finalized N-step transitions
-            loss = self.learn_mf_batch(states, prev_mfs, curr_mfs, agent_ids)
-            return loss
-        return 0.0
+    def store_transition_train_mf_batch(self, states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids, masks=None, next_masks=None):
+        self.memory.add_batch(states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids, masks=masks, next_masks=next_masks)
+        # Train MF predictor using the incoming batch as ground truth
+        return self.learn_mf_batch(states, prev_mfs, curr_mfs, agent_ids)
 
     def learn_mf_batch(self, states_batch, prev_mf_batch, ground_truth_mf_batch, agent_ids):
         s = states_batch.to(self.device) if torch.is_tensor(states_batch) else torch.FloatTensor(states_batch).to(self.device)
         pmf = prev_mf_batch.to(self.device) if torch.is_tensor(prev_mf_batch) else torch.FloatTensor(prev_mf_batch).to(self.device)
         gt_mf = ground_truth_mf_batch.to(self.device) if torch.is_tensor(ground_truth_mf_batch) else torch.FloatTensor(ground_truth_mf_batch).to(self.device)
         
-        pred_mf = self.mf_net(torch.cat([s[agent_ids], pmf[agent_ids]], dim=-1), indices=agent_ids)
+        pred_mf = self.mf_net(torch.cat([s, pmf], dim=-1), indices=agent_ids)
         loss = self.loss_fn(pred_mf, gt_mf).mean()
         
         self.mf_optimizer.zero_grad()
@@ -292,41 +293,29 @@ class D3QNAgent:
             return None
 
         # 2. Sample data from a diverse set of target agents
-        if self.use_per:
-            states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids, indices, weights = \
-                self.memory.sample(self.batch_size, agent_ids=target_agents)
-        else:
-            states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids = \
-                self.memory.sample(self.batch_size, agent_ids=target_agents)
-            weights = torch.ones_like(rewards).view(-1)
-
-        # 1. Train MF (prediction and current state)
-        # 2. DQN update
-        agent_ids = agent_ids.view(-1)
-        q_eval = self.eval_net(states, curr_mfs, indices=agent_ids).gather(1, actions)
-
+        states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids, masks, next_masks = \
+            self.memory.sample(self.batch_size, agent_ids=target_agents)
+        # 1. Train MF (prediction of current MF based on state and previous MF)
+        self.learn_mf_batch(states, prev_mfs, curr_mfs, agent_ids)
+        
+        # 2. DQN update (using updated MF network)
+        pred_curr_mfs = self.mf_net(torch.cat([states, prev_mfs], dim=-1), indices=agent_ids)
+        q_eval = self.eval_net(states, pred_curr_mfs.detach(), indices=agent_ids).gather(1, actions)
         with torch.no_grad():
             next_pred_mfs = self.mf_net(torch.cat([next_states, curr_mfs], dim=-1), indices=agent_ids)
+            q_next_pre = self.eval_net(next_states, next_pred_mfs, indices=agent_ids)
+            if next_masks is not None:
+                q_next_pre = q_next_pre + (next_masks - 1.0) * 1e10
             next_actions = self.eval_net(next_states, next_pred_mfs, indices=agent_ids).argmax(dim=1, keepdim=True)
             q_next = self.target_net(next_states, next_pred_mfs, indices=agent_ids).gather(1, next_actions)
             q_target = rewards + self.gamma * q_next * (1 - dones)
 
         # Calculate element-wise loss for priority update
-        td_errors = torch.abs(q_eval - q_target).detach()
-        
-        # Weighted loss for backprop
-        loss = (self.loss_fn(q_eval, q_target.detach()) * weights.view(-1, 1)).mean()
-        
+        loss = self.loss_fn(q_eval, q_target).mean()
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.eval_net.parameters(), max_norm=1.0)
         self.optimizer.step()
-
-        # Update priorities in buffer
-        if self.use_per:
-            # priorities = (abs(td_error) + epsilon)^alpha (simplified here as abs(td_error) + 1e-6)
-            new_priorities = td_errors.view(-1) + 1e-6
-            self.memory.update_priorities(agent_ids, indices, new_priorities)
 
         # Update logging/target
         self.learn_step_counter += 1

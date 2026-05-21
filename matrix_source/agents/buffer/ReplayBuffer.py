@@ -2,7 +2,7 @@ import torch
 import numpy as np
 
 class ReplayBuffer:
-    def __init__(self, max_size,node_type, state_dim, action_dim, device="cpu"):
+    def __init__(self, max_size,node_type, state_dim, action_dim,mask_dim, device="cpu"):
         self.max_size = max_size
         self.ptr = 0
         self.size = 0
@@ -19,13 +19,15 @@ class ReplayBuffer:
         self.done = torch.zeros((max_size, 1), dtype=torch.float32, device=device)
         # Tracking which agent generated the transition
         self.agent_id = torch.zeros((max_size, 1), dtype=torch.int64, device=device)
+        self.mask = torch.zeros((max_size, mask_dim), dtype=torch.float32, device=device) # Mask for current state action selection
+        self.next_mask = torch.zeros((max_size, mask_dim), dtype=torch.float32, device=device) # Mask for next state (Bellman target)
 
     def _to_tensor(self, x, dtype):
         if torch.is_tensor(x):
             return x.detach().to(device=self.device, dtype=dtype)
         return torch.tensor(x, dtype=dtype, device=self.device)
 
-    def add(self, state, prev_mf, curr_mf, action, reward, next_state, done, agent_id=0):
+    def add(self, state, prev_mf, curr_mf, action, reward, next_state, done, agent_id=0, mask=None, next_mask=None):
         self.state[self.ptr] = self._to_tensor(state, torch.float32)
         self.prev_mf[self.ptr] = self._to_tensor(prev_mf, torch.float32)
         self.curr_mf[self.ptr] = self._to_tensor(curr_mf, torch.float32)
@@ -34,11 +36,15 @@ class ReplayBuffer:
         self.next_state[self.ptr] = self._to_tensor(next_state, torch.float32)
         self.done[self.ptr] = self._to_tensor(done, torch.float32)
         self.agent_id[self.ptr] = self._to_tensor(agent_id, torch.int64)
+        if mask is not None:
+             self.mask[self.ptr] = self._to_tensor(mask, torch.float32)
+        if next_mask is not None:
+             self.next_mask[self.ptr] = self._to_tensor(next_mask, torch.float32)
 
         self.ptr = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
 
-    def add_batch(self, states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids):
+    def add_batch(self, states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids, masks=None, next_masks=None):
         batch_size = states.shape[0]
         if batch_size == 0: return
         
@@ -48,12 +54,16 @@ class ReplayBuffer:
         self.prev_mf[indices] = prev_mfs.detach().to(device=self.device, dtype=torch.float32)
         self.curr_mf[indices] = curr_mfs.detach().to(device=self.device, dtype=torch.float32)
         
-        # Ensure actions/rewards/dones/agent_ids are 2D (Batch, 1)
         self.action[indices] = actions.detach().to(device=self.device, dtype=torch.int64).view(-1, 1)
         self.reward[indices] = rewards.detach().to(device=self.device, dtype=torch.float32).view(-1, 1)
         self.next_state[indices] = next_states.detach().to(device=self.device, dtype=torch.float32)
         self.done[indices] = dones.detach().to(device=self.device, dtype=torch.float32).view(-1, 1)
         self.agent_id[indices] = agent_ids.detach().to(device=self.device, dtype=torch.int64).view(-1, 1)
+        
+        if masks is not None:
+             self.mask[indices] = masks.detach().to(device=self.device, dtype=torch.float32)
+        if next_masks is not None:
+             self.next_mask[indices] = next_masks.detach().to(device=self.device, dtype=torch.float32)
 
         self.ptr = (self.ptr + batch_size) % self.max_size
         self.size = min(self.size + batch_size, self.max_size)
@@ -66,26 +76,28 @@ class ReplayBuffer:
         ind = torch.randint(0, self.size, (num_to_sample,), device=self.device)
             
         return (
-            self.state[ind].to(self.device),
-            self.prev_mf[ind].to(self.device),
-            self.curr_mf[ind].to(self.device),
-            self.action[ind].to(self.device),
-            self.reward[ind].to(self.device),
-            self.next_state[ind].to(self.device),
-            self.done[ind].to(self.device),
-            self.agent_id[ind].squeeze(1).to(self.device)
+            self.state[ind],
+            self.prev_mf[ind],
+            self.curr_mf[ind],
+            self.action[ind],
+            self.reward[ind],
+            self.next_state[ind],
+            self.done[ind],
+            self.agent_id[ind].squeeze(1), # Return as (Batch,) for indexing
+            self.mask[ind],
+            self.next_mask[ind]
         )
 
     def __len__(self):
         return self.size
 
 class MultiAgentReplayBuffer:
-    def __init__(self, num_agents, node_type, max_size_per_agent, state_dim, action_dim, device="cpu"):
+    def __init__(self, num_agents, node_type, max_size_per_agent, state_dim, action_dim, mask_dim, device="cpu"):
         self.num_agents = num_agents
         self.device = device
         self.node_type = node_type
         self.buffers = [
-            ReplayBuffer(max_size_per_agent, node_type, state_dim, action_dim, device)
+            ReplayBuffer(max_size_per_agent, node_type, state_dim, action_dim,mask_dim, device)
             for _ in range(num_agents)
         ]
         self.buffer_sizes = torch.zeros(num_agents, dtype=torch.long, device=device)
@@ -93,13 +105,15 @@ class MultiAgentReplayBuffer:
         self.total_adds = 0
         self.log_interval = 5000*num_agents if node_type=="Terminal_Group" else 500*num_agents
 
-    def add_batch(self, states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids):
+    def add_batch(self, states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids, masks=None, next_masks=None):
         # Maintain everything in tensor form
         a_ids = agent_ids.view(-1)
         for i in range(len(a_ids)):
             a_id = int(a_ids[i])
             self.buffers[a_id].add(
-                states[i], prev_mfs[i], curr_mfs[i], actions[i], rewards[i], next_states[i], dones[i], a_id
+                states[i], prev_mfs[i], curr_mfs[i], actions[i], rewards[i], next_states[i], dones[i], a_id, 
+                mask=masks[i] if masks is not None else None,
+                next_mask=next_masks[i] if next_masks is not None else None
             )
             # Update tracking tensor
             self.buffer_sizes[a_id] = self.buffers[a_id].size
@@ -113,7 +127,6 @@ class MultiAgentReplayBuffer:
             self.print_reward()
             # if self.node_type=="Terminal_Group":
             #     self.print_stats()
-        return self.total_size
 
     def print_stats(self):
         all_s_list = [b.state[:b.size] for b in self.buffers if b.size > 0]
@@ -164,7 +177,7 @@ class MultiAgentReplayBuffer:
         
         # 4. Collate (Stack tensors)
         collated = []
-        for i in range(8): # 8 fields in transition
+        for i in range(10): # 10 fields in transition (added next_mask)
             collated.append(torch.cat([s[i] for s in samples if s is not None], dim=0))
         
         collated[7] = collated[7].squeeze(-1)

@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 from collections import defaultdict, deque
 import os
 import logging
+import csv
 from matrix_source.configs.configs import cfg
 
 class MetricsAggregator:
@@ -65,6 +66,7 @@ class MetricsAggregator:
         self.episode_violations = [] # Added for clarity
         self.episode_success_qos = []
         self.episode_violate_qos = []
+        self.episode_backlog_drift = []
 
         # Task Statistics Counters
         self.eps_assigned = 0
@@ -429,9 +431,8 @@ class MetricsAggregator:
         
         plt.figure(figsize=(18, 10))
         plt.suptitle(f"Model Evolution Over Episodes (up to {len(episodes)})", fontsize=20)
-        
-        # Plot 1: Rewards
-        plt.subplot(2, 3, 1)
+               # Plot 1: Rewards
+        plt.subplot(3, 4, 1)
         plt.plot(episodes, self.history["total_reward"], alpha=0.3, color='blue', label="Raw Total")
         if len(episodes) >= window:
             ma = self._moving_average(self.history["total_reward"], window)
@@ -441,7 +442,7 @@ class MetricsAggregator:
         plt.legend()
         
         # Plot 2: Energy
-        plt.subplot(2, 3, 2)
+        plt.subplot(3, 4, 2)
         plt.plot(episodes, self.history["total_energy"], alpha=0.3, color='orange')
         if len(episodes) >= window:
             ma = self._moving_average(self.history["total_energy"], window)
@@ -450,17 +451,16 @@ class MetricsAggregator:
         plt.xlabel("Episode")
         
         # Plot 3: QoS Success Rate
-        plt.subplot(2, 3, 3)
+        plt.subplot(3, 4, 3)
         plt.plot(episodes, self.history["qos_success_rate"], alpha=0.3, color='purple')
         if len(episodes) >= window:
             ma = self._moving_average(self.history["qos_success_rate"], window)
             plt.plot(range(window, len(self.history["qos_success_rate"]) + 1), ma, color='purple', linewidth=2)
-        # plt.ylim(0, 1.05) # Removed for auto-scaling
         plt.title("QoS Success Rate (vs Processed)")
         plt.xlabel("Episode")
  
         # Plot 4: Remaining Tasks
-        plt.subplot(2, 3, 4)
+        plt.subplot(3, 4, 4)
         plt.plot(episodes, self.history["avg_remaining_tasks"], alpha=0.3, color='brown')
         if len(episodes) >= window:
             ma = self._moving_average(self.history["avg_remaining_tasks"], window)
@@ -469,7 +469,7 @@ class MetricsAggregator:
         plt.xlabel("Episode")
  
         # Plot 5: MF Training Losses
-        plt.subplot(2, 3, 5)
+        plt.subplot(3, 4, 5)
         plt.plot(episodes, self.history["avg_upper_mf_loss"], alpha=0.3, color='cyan', label="Upper")
         plt.plot(episodes, self.history["avg_lower_mf_loss"], alpha=0.3, color='magenta', label="Lower")
         if len(episodes) >= window:
@@ -485,7 +485,7 @@ class MetricsAggregator:
         plt.legend()
  
         # Plot 6: TD Training Losses (Q-Network)
-        plt.subplot(2, 3, 6)
+        plt.subplot(3, 4, 6)
         plt.plot(episodes, self.history["avg_upper_td_loss"], alpha=0.3, color='teal', label="Upper")
         plt.plot(episodes, self.history["avg_lower_td_loss"], alpha=0.3, color='olive', label="Lower")
         if len(episodes) >= window:
@@ -499,7 +499,7 @@ class MetricsAggregator:
         plt.title("TD Loss (Log)")
         plt.xlabel("Episode")
         plt.legend()
-
+ 
         # Plot 7: Upper Q-Values
         plt.subplot(3, 4, 7)
         plt.plot(episodes, self.history["upper_q_min"], alpha=0.3, color='blue', label="Min")
@@ -508,7 +508,7 @@ class MetricsAggregator:
         plt.title("Upper Q-Value Stats")
         plt.xlabel("Episode")
         plt.legend()
-
+ 
         # Plot 8: Lower Q-Values
         plt.subplot(3, 4, 8)
         plt.plot(episodes, self.history["lower_q_min"], alpha=0.3, color='blue', label="Min")
@@ -517,7 +517,7 @@ class MetricsAggregator:
         plt.title("Lower Q-Value Stats")
         plt.xlabel("Episode")
         plt.legend()
-
+ 
         # Plot 9: Backlog Drift
         plt.subplot(3, 4, 9)
         plt.plot(episodes, self.history["avg_backlog_drift"], alpha=0.3, color='crimson', label="Raw Drift")
@@ -528,15 +528,22 @@ class MetricsAggregator:
         plt.title("Backlog Drift Evolution")
         plt.xlabel("Episode")
         plt.legend()
-
+ 
         # Plot 10: Completion Rate (vs Assigned)
         plt.subplot(3, 4, 10)
         plt.plot(episodes, self.history["completion_rate"], alpha=0.3, color='forestgreen', label="Raw Rate")
         if len(episodes) >= window:
             ma = self._moving_average(self.history["completion_rate"], window)
             plt.plot(range(window, len(self.history["completion_rate"]) + 1), ma, color='forestgreen', linewidth=2, label=f"MA-{window}")
-        # plt.ylim(0, 1.05) # Removed for auto-scaling
         plt.title("Completion Rate (vs Assigned)")
+        plt.xlabel("Episode")
+        plt.legend()
+
+        # Plot 11: Zeta Evolution
+        plt.subplot(3, 4, 11)
+        plt.plot(episodes, self.history["zeta_upper"], color='darkred', label="Upper")
+        plt.plot(episodes, self.history["zeta_lower"], color='darkblue', label="Lower")
+        plt.title("Zeta (Exploration Temp)")
         plt.xlabel("Episode")
         plt.legend()
 
