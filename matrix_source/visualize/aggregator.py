@@ -13,8 +13,10 @@ class MetricsAggregator:
         self._setup_logger()
         self.history["zeta_lower"] = []
         self.history["zeta_upper"] = []
+        self.history["avg_backlog_drift"] = []
+        self.history["completion_rate"] = []
         
-        # Q-Value History (Min, Max, Mean)
+        # Q-Value History
         self.history["upper_q_min"] = []
         self.history["upper_q_max"] = []
         self.history["upper_q_mean"] = []
@@ -89,7 +91,7 @@ class MetricsAggregator:
         self.curr_zeta_lower = 1.0
         self.curr_zeta_upper = 1.0
         
-        # Q-Stats buffers for current episode
+        # Q-Stats buffers
         self.episode_upper_q_min = []
         self.episode_upper_q_max = []
         self.episode_upper_q_mean = []
@@ -104,6 +106,10 @@ class MetricsAggregator:
         self.eps_f_alloc = []
         self.eps_arrivals = []
         self.eps_backlog = []
+        
+        self.episode_fail_reasons = {"deadline": 0, "hardware": 0, "queue_full": 0}
+        self.eps_hw_deficit = None # Will initialize based on num_services
+        self.eps_hw_fail_count = None
 
     def add_upper(self, step_output, mf_loss=None, state=None):
         """Adds data from an upper-level step."""
@@ -134,6 +140,7 @@ class MetricsAggregator:
         if obs:
             backlog_drift = obs.get("total_drift", 0)
             self.episode_backlog_drift.append(backlog_drift)
+            
         energy_dist = step_output.get("energy", {})
         if energy_dist:
             self.episode_energy.append(energy_dist)
@@ -154,6 +161,21 @@ class MetricsAggregator:
         self.eps_assigned += info.get("num_tasks", 0)
         self.eps_failed += info.get("immediate_fails", 0) + info.get("expired_count", 0)
         self.last_remaining = info.get("remaining", 0)
+        
+        # Track failure reasons
+        reasons = info.get("fail_reasons", {})
+        for k in self.episode_fail_reasons:
+            self.episode_fail_reasons[k] += reasons.get(k, 0)
+            
+        # Per-service hardware deficit
+        hw_def = reasons.get("hw_deficit_per_svc")
+        hw_cnt = reasons.get("hw_fail_count_per_svc")
+        if hw_def is not None:
+            if self.eps_hw_deficit is None:
+                self.eps_hw_deficit = np.zeros_like(hw_def)
+                self.eps_hw_fail_count = np.zeros_like(hw_cnt)
+            self.eps_hw_deficit += hw_def
+            self.eps_hw_fail_count += hw_cnt
 
     def add_step_matrices(self, f_alloc, arrivals, backlog):
         """Accumulates (Node x Service) matrices for averaging at end of episode."""
@@ -207,16 +229,10 @@ class MetricsAggregator:
         self.history["total_violate_qos"].append(np.sum(self.episode_violate_qos) if self.episode_violate_qos else 0)
         
         # Training Losses
-        def get_avg_or_last(current_list, history_key):
-            if current_list:
-                return np.mean(current_list)
-            return self.history[history_key][-1] if self.history[history_key] else 0
-
         self.history["avg_upper_mf_loss"].append(np.mean(self.episode_upper_mf_losses) if self.episode_upper_mf_losses else 0)
         self.history["avg_lower_mf_loss"].append(np.mean(self.episode_lower_mf_losses) if self.episode_lower_mf_losses else 0)
-        
-        self.history["avg_upper_td_loss"].append(get_avg_or_last(self.episode_upper_td_losses, "avg_upper_td_loss"))
-        self.history["avg_lower_td_loss"].append(get_avg_or_last(self.episode_lower_td_losses, "avg_lower_td_loss"))
+        self.history["avg_upper_td_loss"].append(np.mean(self.episode_upper_td_losses) if self.episode_upper_td_losses else 0)
+        self.history["avg_lower_td_loss"].append(np.mean(self.episode_lower_td_losses) if self.episode_lower_td_losses else 0)
 
         self.history["zeta_lower"].append(self.curr_zeta_lower)
         self.history["zeta_upper"].append(self.curr_zeta_upper)
@@ -322,6 +338,20 @@ class MetricsAggregator:
             self.log("-" * 50)
             self.log(f" Completion Rate (vs Assigned): {completion_rate:.2f}%")
             self.log(f" QoS Success Rate (vs Proc):   {qos_rate:.2f}%")
+            self.log(f" --- Immediate Failure Reasons ---")
+            self.log(f"  * Deadline Violations: {self.episode_fail_reasons['deadline']}")
+            self.log(f"  * Hardware Limits   : {self.episode_fail_reasons['hardware']}")
+            self.log(f"  * Queue Full        : {self.episode_fail_reasons['queue_full']}")
+            
+            if self.eps_hw_fail_count is not None and np.sum(self.eps_hw_fail_count) > 0:
+                self.log(f"\n--- Hardware Failure Analysis (Time Deficit) ---")
+                self.log(f"{'Svc ID':<10} | {'Fail Count':<12} | {'Avg Deficit (s)':<15}")
+                self.log("-" * 45)
+                for i in range(len(self.eps_hw_deficit)):
+                    if self.eps_hw_fail_count[i] > 0:
+                        avg_def = self.eps_hw_deficit[i] / self.eps_hw_fail_count[i]
+                        self.log(f"{i:<10} | {self.eps_hw_fail_count[i]:<12.0f} | {avg_def:<15.4f}")
+            
             self.log("="*50 + "\n")
 
         self.log("---------------------------\n")
@@ -454,7 +484,7 @@ class MetricsAggregator:
         if len(episodes) >= window:
             ma = self._moving_average(self.history["qos_success_rate"], window)
             plt.plot(range(window, len(self.history["qos_success_rate"]) + 1), ma, color='purple', linewidth=2)
-        # plt.ylim(0, 1.05) # Removed for auto-scaling visualization of variance
+        # plt.ylim(0, 1.05) # Removed for auto-scaling
         plt.title("QoS Success Rate (vs Processed)")
         plt.xlabel("Episode")
  
@@ -498,7 +528,7 @@ class MetricsAggregator:
         plt.title("TD Loss (Log)")
         plt.xlabel("Episode")
         plt.legend()
-        
+
         # Plot 7: Upper Q-Values
         plt.subplot(3, 4, 7)
         plt.plot(episodes, self.history["upper_q_min"], alpha=0.3, color='blue', label="Min")
