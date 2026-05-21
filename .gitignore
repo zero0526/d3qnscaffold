@@ -2,7 +2,7 @@
 __pycache__/
 *.py[codz]
 *$py.class
-
+data/checkpoints
 # C extensions
 *.so
 

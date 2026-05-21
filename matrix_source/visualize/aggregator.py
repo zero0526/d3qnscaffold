@@ -2,7 +2,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from collections import defaultdict, deque
 import os
-import csv
 import logging
 from matrix_source.configs.configs import cfg
 
@@ -13,15 +12,17 @@ class MetricsAggregator:
         self._setup_logger()
         self.history["zeta_lower"] = []
         self.history["zeta_upper"] = []
-        
-        # Q-Value History (Min, Max, Mean)
+        self.history["avg_backlog_drift"] = []
+        self.history["completion_rate"] = []
+
+        # Q-Value History
         self.history["upper_q_min"] = []
         self.history["upper_q_max"] = []
         self.history["upper_q_mean"] = []
         self.history["lower_q_min"] = []
         self.history["lower_q_max"] = []
         self.history["lower_q_mean"] = []
-        
+
         self.reset_episode()
 
     def _setup_logger(self):
@@ -64,7 +65,6 @@ class MetricsAggregator:
         self.episode_violations = [] # Added for clarity
         self.episode_success_qos = []
         self.episode_violate_qos = []
-        self.episode_backlog_drift = [] # Track backlog drift over time
 
         # Task Statistics Counters
         self.eps_assigned = 0
@@ -89,14 +89,14 @@ class MetricsAggregator:
         self.curr_zeta_lower = 1.0
         self.curr_zeta_upper = 1.0
         
-        # Q-Stats buffers for current episode
+        # Q-Stats buffers
         self.episode_upper_q_min = []
         self.episode_upper_q_max = []
         self.episode_upper_q_mean = []
         self.episode_lower_q_min = []
         self.episode_lower_q_max = []
         self.episode_lower_q_mean = []
-        
+
         # Offloading flow matrix: [SourceNode][TargetNode] -> count
         self.episode_offloading_matrix = defaultdict(lambda: defaultdict(int))
         
@@ -134,6 +134,7 @@ class MetricsAggregator:
         if obs:
             backlog_drift = obs.get("total_drift", 0)
             self.episode_backlog_drift.append(backlog_drift)
+
         energy_dist = step_output.get("energy", {})
         if energy_dist:
             self.episode_energy.append(energy_dist)
@@ -182,7 +183,7 @@ class MetricsAggregator:
     def record_zeta(self, lower, upper):
         self.curr_zeta_lower = lower
         self.curr_zeta_upper = upper
-        
+
     def record_q_stats(self, node_type, q_min, q_max, q_mean):
         """Records Q-value statistics for the specified node type."""
         if node_type == "Edge_Group": # Upper
@@ -239,9 +240,9 @@ class MetricsAggregator:
         total_completed = self.eps_assigned - self.eps_failed - self.last_remaining
         completion_rate = (total_completed / self.eps_assigned) if self.eps_assigned > 0 else 0
         self.history["completion_rate"].append(completion_rate)
-        
+
         self.history["avg_backlog_drift"].append(np.mean(self.episode_backlog_drift) if self.episode_backlog_drift else 0)
-        
+
         self.history["avg_remaining_tasks"].append(np.mean(self.episode_remaining_tasks) if self.episode_remaining_tasks else 0)
 
         # Keep old qos_rate for backward compatibility if needed, but we focus on success rate
@@ -426,11 +427,11 @@ class MetricsAggregator:
         episodes = range(1, len(self.history["total_reward"]) + 1)
         window = 10 # Window for smoothing
         
-        plt.figure(figsize=(24, 18))
+        plt.figure(figsize=(18, 10))
         plt.suptitle(f"Model Evolution Over Episodes (up to {len(episodes)})", fontsize=20)
         
         # Plot 1: Rewards
-        plt.subplot(3, 4, 1)
+        plt.subplot(2, 3, 1)
         plt.plot(episodes, self.history["total_reward"], alpha=0.3, color='blue', label="Raw Total")
         if len(episodes) >= window:
             ma = self._moving_average(self.history["total_reward"], window)
@@ -440,7 +441,7 @@ class MetricsAggregator:
         plt.legend()
         
         # Plot 2: Energy
-        plt.subplot(3, 4, 2)
+        plt.subplot(2, 3, 2)
         plt.plot(episodes, self.history["total_energy"], alpha=0.3, color='orange')
         if len(episodes) >= window:
             ma = self._moving_average(self.history["total_energy"], window)
@@ -449,17 +450,17 @@ class MetricsAggregator:
         plt.xlabel("Episode")
         
         # Plot 3: QoS Success Rate
-        plt.subplot(3, 4, 3)
+        plt.subplot(2, 3, 3)
         plt.plot(episodes, self.history["qos_success_rate"], alpha=0.3, color='purple')
         if len(episodes) >= window:
             ma = self._moving_average(self.history["qos_success_rate"], window)
             plt.plot(range(window, len(self.history["qos_success_rate"]) + 1), ma, color='purple', linewidth=2)
-        # plt.ylim(0, 1.05) # Removed for auto-scaling visualization of variance
+        # plt.ylim(0, 1.05) # Removed for auto-scaling
         plt.title("QoS Success Rate (vs Processed)")
         plt.xlabel("Episode")
  
         # Plot 4: Remaining Tasks
-        plt.subplot(3, 4, 4)
+        plt.subplot(2, 3, 4)
         plt.plot(episodes, self.history["avg_remaining_tasks"], alpha=0.3, color='brown')
         if len(episodes) >= window:
             ma = self._moving_average(self.history["avg_remaining_tasks"], window)
@@ -468,7 +469,7 @@ class MetricsAggregator:
         plt.xlabel("Episode")
  
         # Plot 5: MF Training Losses
-        plt.subplot(3, 4, 5)
+        plt.subplot(2, 3, 5)
         plt.plot(episodes, self.history["avg_upper_mf_loss"], alpha=0.3, color='cyan', label="Upper")
         plt.plot(episodes, self.history["avg_lower_mf_loss"], alpha=0.3, color='magenta', label="Lower")
         if len(episodes) >= window:
@@ -484,7 +485,7 @@ class MetricsAggregator:
         plt.legend()
  
         # Plot 6: TD Training Losses (Q-Network)
-        plt.subplot(3, 4, 6)
+        plt.subplot(2, 3, 6)
         plt.plot(episodes, self.history["avg_upper_td_loss"], alpha=0.3, color='teal', label="Upper")
         plt.plot(episodes, self.history["avg_lower_td_loss"], alpha=0.3, color='olive', label="Lower")
         if len(episodes) >= window:
@@ -498,7 +499,7 @@ class MetricsAggregator:
         plt.title("TD Loss (Log)")
         plt.xlabel("Episode")
         plt.legend()
-        
+
         # Plot 7: Upper Q-Values
         plt.subplot(3, 4, 7)
         plt.plot(episodes, self.history["upper_q_min"], alpha=0.3, color='blue', label="Min")
@@ -538,7 +539,7 @@ class MetricsAggregator:
         plt.title("Completion Rate (vs Assigned)")
         plt.xlabel("Episode")
         plt.legend()
-        
+
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         
         # Save latest
@@ -605,19 +606,19 @@ class MetricsAggregator:
         """Saves the entire history to a CSV file for model comparison."""
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
-            
+
         file_path = os.path.join(save_dir, filename)
-        
+
         # Determine headers from history keys
         keys = sorted(self.history.keys())
         num_episodes = len(self.history["total_reward"])
-        
+
         try:
             with open(file_path, mode='w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 # Header: Episode + History Keys
                 writer.writerow(["episode"] + keys)
-                
+
                 # Rows: Episode 1..N
                 for i in range(num_episodes):
                     row = [i + 1]
