@@ -249,6 +249,8 @@ class D3QNAgent:
                     random_probs = random_probs / self.u_action_dim
                 # zeta factor controls the exploration temperature
                 final_probs = (1.0 - epsilon) * probs_boltzmann + epsilon * random_probs
+                final_probs = probs_boltzmann
+
                 final_actions[indices] = torch.multinomial(final_probs, 1).squeeze(1)
 
         return final_actions.tolist()

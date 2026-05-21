@@ -107,6 +107,15 @@ class MetricsAggregator:
         self.eps_arrivals = []
         self.eps_backlog = []
 
+        # Failure analytics initialization
+        self.episode_fail_reasons = {
+            'deadline': 0,
+            'hardware': 0,
+            'queue_full': 0
+        }
+        self.eps_hw_deficit = None
+        self.eps_hw_fail_count = None
+
     def add_upper(self, step_output, mf_loss=None, state=None):
         """Adds data from an upper-level step."""
         self.episode_upper_rewards.append(step_output.get("reward_global", 0))
