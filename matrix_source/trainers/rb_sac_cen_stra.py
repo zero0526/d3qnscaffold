@@ -1,4 +1,5 @@
 import torch
+import os
 from termcolor import colored
 from matrix_source.trainers.strategies import AlgorithmStrategy
 from matrix_source.agents.d3qn import D3QNAgent
@@ -76,7 +77,7 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         # Combine actions and phi for each node
         return torch.cat([actions, phi], dim=-1)
 
-    def get_upper_actions(self, trainer, current_upper_state, obs_upper):
+    def get_upper_actions(self, trainer, current_upper_state, obs_upper, deterministic=False):
         act_matrix = torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device)
         sc_mfs = obs_upper.get('mean_fields', torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device))
         
@@ -84,8 +85,14 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         edge_mfs = sc_mfs[trainer.edge_node_ids]
         instance_indices = torch.tensor(range(self.num_edges), device=trainer.device)
 
+        # For DQN, 'deterministic' usually means epsilon=0. 
+        # But D3QNAgent.choose_action_batch uses Boltzmann (zeta).
+        # We can simulate deterministic by using a very high zeta or modifying choose_action_batch.
+        # Here we just pass a high zeta if deterministic is True.
+        zeta = trainer.zeta_upper if not deterministic else 100.0
+        
         batch_a_ids = self.upper_agent.choose_action_batch(
-            edge_states, edge_mfs, zeta=trainer.zeta_upper, agent_indices=instance_indices
+            edge_states, edge_mfs, zeta=zeta, agent_indices=instance_indices
         )
 
         for i, nid in enumerate(trainer.edge_node_ids):
@@ -164,7 +171,7 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         state_3d = full_state_tensor.view(self.num_edges, num_services, -1)
         return state_3d, task_agent_ids, task_edge_ids
 
-    def get_lower_actions(self, trainer, res_lower, t_idx, s_idx, tasks_min_accuracy, task_deadlines, batch_sizes):
+    def get_lower_actions(self, trainer, res_lower, t_idx, s_idx, tasks_min_accuracy, task_deadlines, batch_sizes, deterministic=False):
         meta = trainer.env.metadata
         unit_sizes = meta['service_input_size']
         data_sizes = batch_sizes * unit_sizes[s_idx].squeeze(-1)
@@ -184,7 +191,8 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         all_probs = self.lower_agent.choose_action_batch(
             flat_states,
             mf,
-            agent_indices=flat_agent_indices
+            agent_indices=flat_agent_indices,
+            deterministic=deterministic
         )
         all_probs = torch.as_tensor(all_probs, device=trainer.device, dtype=torch.float32)
 
@@ -423,6 +431,64 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
             print(f"Lower Samples: {trainer_obj.total_lower_steps} | Upper Samples: {trainer_obj.total_upper_steps}")
             print(f"Zeta Lower: {trainer_obj.zeta_lower:.4f} | Zeta Upper: {trainer_obj.zeta_upper:.4f}")
             print(f"Current Epsilon (Edge N0): {trainer_obj.epsilons[0]:.4f}")
+
+        # Final Checkpoint Saving
+        checkpoint_dir = getattr(trainer_obj.config, 'checkpoints', 'data/checkpoints')
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        self.lower_agent.save(os.path.join(checkpoint_dir, "lower_sac_final.pth"))
+        self.upper_agent.save(os.path.join(checkpoint_dir, "upper_d3qn_final.pth"))
+        print(colored(f"\n[Final] Checkpoints saved to {checkpoint_dir}", "green", attrs=["bold"]))
+
+    def load_checkpoints(self, trainer, lower_path=None, upper_path=None):
+        """Loads checkpoints for evaluation."""
+        if lower_path and os.path.exists(lower_path):
+            self.lower_agent.load(lower_path)
+            print(f"[RB_SAC_CEN_STRA] Lower SAC agent loaded from {lower_path}")
+        
+        if upper_path and os.path.exists(upper_path):
+            self.upper_agent.load(upper_path)
+            print(f"[RB_SAC_CEN_STRA] Upper D3QN agent loaded from {upper_path}")
+
+    def run_evaluation(self, trainer, num_episodes=5):
+        """Runs a deterministic evaluation loop."""
+        print(f"\n>>> Starting Evaluation SAC ({num_episodes} episodes) <<<")
+        max_slots = trainer.env.time_manager.max_steps
+        
+        for ep in range(num_episodes):
+            res = trainer.env.reset()
+            obs_upper, prev_lower_res = res["upper"], res["lower"]
+            prev_lower_res["mean_field"]= torch.zeros((self.num_edges*trainer.num_services, trainer.num_nodes), device=trainer.device)
+            current_upper_state = self.build_upper_state(trainer, obs_upper)
+            
+            for slot in range(max_slots):
+                if trainer.env.time_manager.is_new_frame():
+                    u_acts_matrix = self.get_upper_actions(trainer, current_upper_state, obs_upper, deterministic=True)
+                    trainer.env.step_upper(u_acts_matrix)
+
+                t_idx, s_idx, batch_sizes, tasks_min_accuracy, task_deadlines = trainer.workload_gen.generate_step()
+                if len(t_idx) > 0:
+                    n_idx, m_idx, task_agent_ids, all_probs = self.get_lower_actions(trainer, prev_lower_res, t_idx, s_idx, tasks_min_accuracy, task_deadlines, batch_sizes, deterministic=True)
+                    next_res = trainer.env.step_lower(t_idx, s_idx, batch_sizes, n_idx, m_idx, task_deadlines, tasks_min_accuracy)
+                    next_res["mean_field"] = self.compute_next_mean_field(trainer, task_agent_ids, s_idx, n_idx, m_idx, batch_sizes)
+                    
+                    trainer.aggregator.add_lower(next_res)
+                    prev_lower_res = next_res
+                else:
+                    trainer.env.time_manager.tick()
+
+                if trainer.env.time_manager.is_new_frame():
+                    res_upper = trainer.env.collect_upper_metrics()
+                    next_upper_state = self.build_upper_state(trainer, res_upper)
+                    trainer.aggregator.add_upper(res_upper)
+                    
+                    current_upper_state = next_upper_state
+                    obs_upper = res_upper
+
+            trainer.aggregator.store_history()
+            trainer.aggregator.report_episode(ep)
+        
+        print(f"\n>>> Evaluation Complete <<<")
 
 
     def heuristic(

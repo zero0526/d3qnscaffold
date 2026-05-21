@@ -356,5 +356,25 @@ class D3QNAgent:
             for target_param, eval_param in zip(self.target_net.parameters(), self.eval_net.parameters()):
                 target_param.data.copy_(self.alpha * eval_param.data + (1.0 - self.alpha) * target_param.data)
 
+    def save(self, path):
+        checkpoint = {
+            'eval_net': self.eval_net.state_dict(),
+            'target_net': self.target_net.state_dict(),
+            'mf_net': self.mf_net.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'mf_optimizer': self.mf_optimizer.state_dict(),
+            'learn_step': self.learn_step_counter
+        }
+        torch.save(checkpoint, path)
+
+    def load(self, path):
+        checkpoint = torch.load(path, map_location=self.device)
+        self.eval_net.load_state_dict(checkpoint['eval_net'])
+        self.target_net.load_state_dict(checkpoint['target_net'])
+        self.mf_net.load_state_dict(checkpoint['mf_net'])
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        self.mf_optimizer.load_state_dict(checkpoint['mf_optimizer'])
+        self.learn_step_counter = checkpoint.get('learn_step', 0)
+
 
 

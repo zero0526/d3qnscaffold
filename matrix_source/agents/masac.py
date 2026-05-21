@@ -398,3 +398,31 @@ class MFSACAgent:
                 "q_mean": q_mean
             }
         return critic_loss.item()
+
+    def save(self, path):
+        checkpoint = {
+            'actor': self.actor.state_dict(),
+            'critic': self.critic.state_dict(),
+            'critic_target': self.critic_target.state_dict(),
+            'mf_net': self.mf_net.state_dict(),
+            'actor_opt': self.actor_optimizer.state_dict(),
+            'critic_opt': self.critic_optimizer.state_dict(),
+            'mf_opt': self.mf_optimizer.state_dict(),
+            'log_alpha': self.log_alpha,
+            'alpha_opt': self.alpha_optimizer.state_dict(),
+            'learn_step': self.learn_step_counter
+        }
+        torch.save(checkpoint, path)
+
+    def load(self, path):
+        checkpoint = torch.load(path, map_location=self.device)
+        self.actor.load_state_dict(checkpoint['actor'])
+        self.critic.load_state_dict(checkpoint['critic'])
+        self.critic_target.load_state_dict(checkpoint['critic_target'])
+        self.mf_net.load_state_dict(checkpoint['mf_net'])
+        self.actor_optimizer.load_state_dict(checkpoint['actor_opt'])
+        self.critic_optimizer.load_state_dict(checkpoint['critic_opt'])
+        self.mf_optimizer.load_state_dict(checkpoint['mf_opt'])
+        self.log_alpha.data.copy_(checkpoint['log_alpha'].data)
+        self.alpha_optimizer.load_state_dict(checkpoint['alpha_opt'])
+        self.learn_step_counter = checkpoint.get('learn_step', 0)
