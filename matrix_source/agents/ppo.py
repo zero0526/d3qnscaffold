@@ -82,8 +82,12 @@ class MultiInstanceActor(nn.Module):
         x = F.silu(self.norm2(self.fc2(x, indices), indices))
         return self.actor_logits(x, indices)
         
-    def evaluate(self, state, mf, action, indices=None):
+    def evaluate(self, state, mf, action, masks=None, indices=None):
         logits = self.forward(state, mf, indices)
+        
+        if masks is not None:
+            logits = logits + (masks - 1.0) * 1e10
+            
         dist = Categorical(logits=logits)
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
@@ -166,7 +170,7 @@ class PPOAgent:
         self.mf_optimizer = optim.Adam(self.mf_net.parameters(), lr=mf_lr)
         self.loss_fn = nn.SmoothL1Loss()
 
-        self.memory = MultiAgentPolicyBuffer(num_instances, buffer_size, state_dim, self.action_dim, self.device)
+        self.memory = MultiAgentPolicyBuffer(num_instances, buffer_size, state_dim, self.action_dim, self.u_action_dim, self.device)
         self.learn_step_counter = 0
         
         # Caches to maintain drop-in compatibility with D3QN
@@ -231,7 +235,7 @@ class PPOAgent:
 
         return actions.cpu().tolist()
 
-    def store_transition_train_mf_batch(self, states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids):
+    def store_transition_train_mf_batch(self, states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids, masks=None):
         # Retrieve cached log_probs and values
         log_probs_list = [self._cached_log_probs.get(aid, 0.0) for aid in agent_ids.tolist()]
         values_list = [self._cached_values.get(aid, 0.0) for aid in agent_ids.tolist()]
@@ -240,7 +244,7 @@ class PPOAgent:
         loss_mf = self.learn_mf_batch(states, prev_mfs, curr_mfs, agent_ids)
         
         # 2. Store in Buffer
-        self.memory.add_batch(states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, log_probs_list, values_list, agent_ids)
+        self.memory.add_batch(states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, log_probs_list, values_list, agent_ids, masks=masks)
         return loss_mf
 
     def learn_mf_batch(self, states, prev_mfs, ground_truth_mfs, agent_ids):
@@ -266,7 +270,7 @@ class PPOAgent:
             return None
         
         # Unpack data
-        states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, old_log_probs, old_values, agent_ids = data
+        states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, old_log_probs, old_values, masks, agent_ids = data
         
         # Flatten inputs
         actions = actions.squeeze(-1)
@@ -309,7 +313,7 @@ class PPOAgent:
                 
                 # Predict MF for evaluation (in case it dynamically changes, though it's typically stable)
                 # It's better to use the curr_mfs from buffer to maintain consistency
-                log_probs, entropy = self.actor.evaluate(batch_states, batch_curr_mfs, batch_actions, indices=batch_agent_ids)
+                log_probs, entropy = self.actor.evaluate(batch_states, batch_curr_mfs, batch_actions, masks=masks[idx], indices=batch_agent_ids)
                 values = self.critic(batch_states, batch_curr_mfs, indices=batch_agent_ids)
 
                 # Ratio for clipping

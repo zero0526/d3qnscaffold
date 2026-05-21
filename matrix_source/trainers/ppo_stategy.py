@@ -37,9 +37,9 @@ class PPOStrategy(AlgorithmStrategy):
         # Hyperparams from user
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 6}
         self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 4}
-        self.lower_warmup_steps = 45
-        self.upper_warmup_steps = 50
-        self.alt_steps = 50
+        self.lower_warmup_steps = 0
+        self.upper_warmup_steps = 0
+        self.alt_steps = 100
 
     def initialize_agents(self, trainer):
         # 1. Upper Agent
@@ -81,6 +81,19 @@ class PPOStrategy(AlgorithmStrategy):
             num_instances=trainer.num_terminals,
             device=trainer.device
         )
+        # 3. Initial Phase Jump (if warmup is 0)
+        if self.phase == 'LOWER_ONLY' and self.lower_warmup_steps == 0:
+            self.phase = 'UPPER_ONLY'
+            print(f"[Curriculum] Initial skip: LOWER_ONLY -> UPPER_ONLY")
+            
+        if self.phase == 'UPPER_ONLY' and self.upper_warmup_steps == 0:
+            self.phase = 'ALTERNATING'
+            print(f"[Curriculum] Initial skip: UPPER_ONLY -> ALTERNATING")
+            # Apply Alternating Phase defaults immediately
+            trainer.shared_lower_agent.set_lr_factor(1.0)
+            trainer.shared_upper_agent.set_lr_factor(1.0)
+            trainer.shared_lower_agent.k_epochs = 8
+            trainer.shared_upper_agent.k_epochs = 6
 
     def get_upper_actions(self, trainer, current_upper_state, obs_upper):
         act_matrix = torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device)
@@ -118,6 +131,31 @@ class PPOStrategy(AlgorithmStrategy):
             act_matrix[nid] = torch.ones(trainer.num_services, device=trainer.device)
         return act_matrix
 
+    def _get_batch_placements(self, trainer, s_idx, num_reqs, placement_matrix=None):
+        if placement_matrix is None:
+            placement_matrix = trainer.env.engine.placement_matrix
+            
+        placements = placement_matrix[:, s_idx] # (num_nodes, ...)
+        if placements.dim() == 2:
+            return placements.T # (num_reqs, num_nodes)
+        else:
+            return placements.unsqueeze(0).expand(num_reqs, -1) # (num_reqs, num_nodes)
+
+    def calculate_lower_masks(self, trainer, t_idx, s_idx, tasks_min_accuracy, placement_matrix=None):
+        num_reqs = len(t_idx)
+        current_placements = self._get_batch_placements(trainer, s_idx, num_reqs, placement_matrix)
+        
+        # Action space: (num_reqs, num_nodes, max_models)
+        node_model_mask = current_placements.unsqueeze(-1).expand(-1, -1, trainer.max_models)
+        masks = node_model_mask.reshape(num_reqs, -1)
+        
+        # Safety: if no node is valid, allow all to prevent NaNs in softmax
+        invalid_mask_rows = (masks.sum(dim=1) == 0)
+        if invalid_mask_rows.any():
+            masks = masks.clone() 
+            masks[invalid_mask_rows] = 1.0
+        return masks
+
     def get_lower_actions(self, trainer, res_lower, t_idx, s_idx, tasks_min_accuracy, task_deadlines, batch_sizes):
         obs_dict = res_lower['obs']
         mf_terminals = res_lower['mean_field']
@@ -134,7 +172,7 @@ class PPOStrategy(AlgorithmStrategy):
         if states.shape[1] > 4:
             states[:, 4:4+2*trainer.num_nodes] /= trainer.config.norm_gflop
             
-        masks = torch.ones((len(t_idx), trainer.num_nodes * trainer.max_models), device=trainer.device)
+        masks = self.calculate_lower_masks(trainer, t_idx, s_idx, tasks_min_accuracy)
         mfs = mf_terminals[t_idx]
         
         # "Freeze" lower (argmax) only during Upper-Only phase. In Alternating, both are stochastic.
@@ -147,9 +185,9 @@ class PPOStrategy(AlgorithmStrategy):
         )
         
         a_ids = torch.tensor(batch_actions, device=trainer.device)
-        return a_ids // trainer.max_models, a_ids % trainer.max_models
+        return a_ids // trainer.max_models, a_ids % trainer.max_models, masks
 
-    def store_lower_transitions(self, trainer, current_res, next_res, t_idx, s_idx, n_idx, m_idx):
+    def store_lower_transitions(self, trainer, current_res, next_res, t_idx, s_idx, n_idx, m_idx, masks):
         from matrix_source.trainers.train import log_transform
         
         # 1. Build states for MF network training (even if frozen, we might want to track MF loss)
@@ -180,7 +218,7 @@ class PPOStrategy(AlgorithmStrategy):
             a_ids = (n_idx * trainer.max_models + m_idx).long()
             
             avg_mf_loss = trainer.shared_lower_agent.store_transition_train_mf_batch(
-                states, c_mf[t_idx], n_mf[t_idx], a_ids, rewards, next_states, done, agent_ids=t_idx
+                states, c_mf[t_idx], n_mf[t_idx], a_ids, rewards, next_states, done, agent_ids=t_idx, masks=masks
             )
             
         # 4. ALWAYS record metrics!
@@ -244,16 +282,16 @@ class PPOStrategy(AlgorithmStrategy):
             self.upper_mf_ema = None # Reset EMA for new episode
             current_upper_state = self.build_upper_state(trainer, obs_upper) 
             
-            for slot in range(max_slots):
+            for slot in tqdm(range(max_slots), desc=f"Episode {ep}", leave=False):
                 if trainer.env.time_manager.is_new_frame():
                     u_acts_matrix = self.get_upper_actions(trainer, current_upper_state, obs_upper)
                     trainer.env.step_upper(u_acts_matrix)
 
                 t_idx, s_idx, batch_sizes, tasks_min_accuracy, task_deadlines = trainer.workload_gen.generate_step()
                 if len(t_idx) > 0:
-                    n_idx, m_idx = self.get_lower_actions(trainer, prev_lower_res, t_idx, s_idx, tasks_min_accuracy, task_deadlines, batch_sizes)
+                    n_idx, m_idx, masks = self.get_lower_actions(trainer, prev_lower_res, t_idx, s_idx, tasks_min_accuracy, task_deadlines, batch_sizes)
                     results = trainer.env.step_lower(t_idx, s_idx, batch_sizes, n_idx, m_idx, task_deadlines, tasks_min_accuracy)
-                    self.store_lower_transitions(trainer, prev_lower_res, results, t_idx, s_idx, n_idx, m_idx)
+                    self.store_lower_transitions(trainer, prev_lower_res, results, t_idx, s_idx, n_idx, m_idx, masks)
                     
                     trainer.aggregator.add_step_matrices(
                         f_alloc=trainer.env.engine.cpu_alloc_matrix,
@@ -311,8 +349,8 @@ class PPOStrategy(AlgorithmStrategy):
                                 self.phase = 'ALTERNATING'
                                 print(f"\n[Curriculum] Phase 2 Complete. Switching to {self.phase}")
                                 # Apply Phase 3 overrides: 0.5x LR, 8000/800 buffers, 8/6 epochs
-                                trainer.shared_lower_agent.set_lr_factor(0.2)
-                                trainer.shared_upper_agent.set_lr_factor(0.2)
+                                trainer.shared_lower_agent.set_lr_factor(1)
+                                trainer.shared_upper_agent.set_lr_factor(1)
                                 trainer.shared_lower_agent.k_epochs = 8
                                 trainer.shared_upper_agent.k_epochs = 6
                                 trainer.shared_lower_agent.min_batch_size = 8000
