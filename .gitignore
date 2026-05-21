@@ -5,7 +5,7 @@ __pycache__/
 data/checkpoints
 # C extensions
 *.so
-
+checkpoints/
 # Distribution / packaging
 .Python
 build/
