@@ -228,7 +228,7 @@ class MatrixPhysicalEngine:
         cold_delays = task_cold_start.float() * (rand_vals * (self.cold_start_delay_max - self.cold_start_delay_min) + self.cold_start_delay_min)
         
         # Deadline calculation
-        t_rem_raw = task_deadlines - trans_delays - cold_delays
+        t_rem_raw = task_deadlines - trans_delays
         t_q_rem = t_rem_raw - task_max_queue
         
         valid_mask = t_rem_raw >= 1e-4

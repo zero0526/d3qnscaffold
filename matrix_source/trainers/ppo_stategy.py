@@ -37,8 +37,8 @@ class PPOStrategy(AlgorithmStrategy):
         # Hyperparams from user
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 6}
         self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 4}
-        self.lower_warmup_steps = 0
-        self.upper_warmup_steps = 0
+        self.lower_warmup_steps = 2
+        self.upper_warmup_steps = 2
         self.alt_steps = 100
 
     def initialize_agents(self, trainer):
@@ -282,7 +282,7 @@ class PPOStrategy(AlgorithmStrategy):
             self.upper_mf_ema = None # Reset EMA for new episode
             current_upper_state = self.build_upper_state(trainer, obs_upper) 
             
-            for slot in tqdm(range(max_slots), desc=f"Episode {ep}", leave=False):
+            for slot in range(max_slots):
                 if trainer.env.time_manager.is_new_frame():
                     u_acts_matrix = self.get_upper_actions(trainer, current_upper_state, obs_upper)
                     trainer.env.step_upper(u_acts_matrix)
