@@ -137,7 +137,7 @@ class PPOStrategy(AlgorithmStrategy):
         # Use is_evaluating flag to determine if we should use argmax
         is_det = self.is_evaluating
 
-        batch_a_ids = trainer.shared_upper_agent.choose_action_batch(
+        batch_a_ids, log_probs, values = trainer.shared_upper_agent.choose_action_batch(
             edge_states, edge_mfs, agent_indices=instance_indices, deterministic=is_det
         )
 
@@ -146,17 +146,14 @@ class PPOStrategy(AlgorithmStrategy):
 
         for nid in trainer.env.static_matrices.get("cloud_ids", []):
             act_matrix[nid] = torch.ones(trainer.num_services, device=trainer.device)
-        return act_matrix
+        return act_matrix, log_probs, values
 
     def _get_batch_placements(self, trainer, s_idx, num_reqs, placement_matrix=None):
         if placement_matrix is None:
             placement_matrix = trainer.env.engine.placement_matrix
 
         placements = placement_matrix[:, s_idx]  # (num_nodes, ...)
-        if placements.dim() == 2:
-            return placements.T  # (num_reqs, num_nodes)
-        else:
-            return placements.unsqueeze(0).expand(num_reqs, -1)  # (num_reqs, num_nodes)
+        return placements.T  # (num_reqs, num_nodes)
 
     def calculate_lower_masks(self, trainer, t_idx, s_idx, tasks_min_accuracy, placement_matrix=None):
         num_reqs = len(t_idx)
@@ -181,8 +178,12 @@ class PPOStrategy(AlgorithmStrategy):
         data_sizes = batch_sizes * meta['service_input_size'][s_idx].squeeze(-1)
         s_tasks = torch.stack(
             [data_sizes, tasks_min_accuracy, task_deadlines, meta['service_omega'][s_idx].squeeze(-1)], dim=1).float()
-        s_backlogs = obs_dict['backlog'][:, s_idx].T
-        s_cpus = obs_dict['cpu_alloc'][:, s_idx].T
+        # Get Current Placement to mask out stale values (especially on frame boundaries)
+        current_placement = trainer.env.engine.placement_matrix[:, s_idx]
+        num_reqs = states_rows = s_tasks.shape[0]
+        
+        s_backlogs = (obs_dict['backlog'][:, s_idx] * current_placement).unsqueeze(0).expand(num_reqs, -1)
+        s_cpus = (obs_dict['cpu_alloc'][:, s_idx] * current_placement).unsqueeze(0).expand(num_reqs, -1)
         states = torch.cat([s_tasks, s_backlogs, s_cpus], dim=1)
 
         states[:, 0] /= trainer.config.norm_data_size
@@ -196,21 +197,28 @@ class PPOStrategy(AlgorithmStrategy):
         # Use is_evaluating flag to determine if we should use argmax
         is_det = self.is_evaluating
 
-        batch_actions = trainer.shared_lower_agent.choose_action_batch(
+        batch_actions, log_probs, values = trainer.shared_lower_agent.choose_action_batch(
             states, mfs, masks_batch=masks,
             agent_indices=torch.arange(trainer.num_terminals, device=trainer.device),
             deterministic=is_det
         )
 
         a_ids = batch_actions.view(-1).long()
-        return a_ids // trainer.max_models, a_ids % trainer.max_models, masks
+        return a_ids // trainer.max_models, a_ids % trainer.max_models, masks, log_probs, values
 
-    def store_lower_transitions(self, trainer, current_res, next_res, t_idx, s_idx, n_idx, m_idx, masks):
+    def store_lower_transitions(self, trainer, current_res, next_res, t_idx, s_idx, n_idx, m_idx, masks, log_probs, values):
         from matrix_source.trainers.train import log_transform
 
-        # 1. Build states for MF network training (even if frozen, we might want to track MF loss)
+        # 1. Build states
         def build_state(obs, tidx, sidx):
-            st = torch.cat([obs['task_reqs'][tidx], obs['backlog'][:, sidx].T, obs['cpu_alloc'][:, sidx].T], dim=1)
+            # Mask backlog and cpu_alloc with current placement to ensure consistency
+            placement = trainer.env.engine.placement_matrix[:, sidx]
+            num_reqs = obs['task_reqs'][tidx].shape[0]
+            
+            b_masked = (obs['backlog'][:, sidx] * placement).unsqueeze(0).expand(num_reqs, -1)
+            c_masked = (obs['cpu_alloc'][:, sidx] * placement).unsqueeze(0).expand(num_reqs, -1)
+            
+            st = torch.cat([obs['task_reqs'][tidx], b_masked, c_masked], dim=1)
             st[:, 0] /= trainer.config.norm_data_size
             st[:, 1] /= 100.0
             if st.shape[1] > 4: st[:, 4:4 + 2 * trainer.num_nodes] /= trainer.config.norm_gflop
@@ -225,8 +233,8 @@ class PPOStrategy(AlgorithmStrategy):
         rew_divisor = trainer.config.norm_lower_rw
         norm_rew = log_transform(reward / (rew_divisor if rew_divisor != 0 else 1.0))
 
-        # 3. Handle MF training and transition storage (only if NOT frozen and NOT evaluating)
-        avg_mf_loss = None
+        # 3. Handle MF training and transition storage
+        avg_mf_loss = 0.0
         is_frozen = (self.phase == 'UPPER_ONLY')
 
         if not is_frozen and not self.is_evaluating:
@@ -236,13 +244,14 @@ class PPOStrategy(AlgorithmStrategy):
             a_ids = (n_idx * trainer.max_models + m_idx).long()
 
             avg_mf_loss = trainer.shared_lower_agent.store_transition_train_mf_batch(
-                states, c_mf[t_idx], n_mf[t_idx], a_ids, rewards, next_states, done, agent_ids=t_idx, masks=masks
+                states, c_mf[t_idx], n_mf[t_idx], a_ids, rewards, next_states, done, 
+                agent_ids=t_idx, log_prob=log_probs, value=values, masks=masks
             )
 
         # 4. ALWAYS record metrics!
         trainer.aggregator.add_lower(next_res, mf_loss=avg_mf_loss, state=states[0] if len(states) > 0 else None)
 
-    def store_upper_transitions(self, trainer, s_all, ns_all, current_res, next_res, acts_matrix, is_done):
+    def store_upper_transitions(self, trainer, s_all, ns_all, current_res, next_res, acts_matrix, log_probs, values, is_done):
         from matrix_source.trainers.train import log_transform
 
         # 1. Extract global metrics
@@ -251,7 +260,7 @@ class PPOStrategy(AlgorithmStrategy):
         norm_rew = log_transform(reward / (rew_divisor if rew_divisor != 0 else 1.0))
 
         # 2. Handle MF training and transition storage (if NOT frozen and NOT evaluating)
-        avg_mf_loss = None
+        avg_mf_loss = 0.0
         is_frozen = (self.phase == 'LOWER_ONLY')
 
         # Safely extract edge_states for metric recording
@@ -281,7 +290,7 @@ class PPOStrategy(AlgorithmStrategy):
 
             avg_mf_loss = trainer.shared_upper_agent.store_transition_train_mf_batch(
                 edge_states, edge_c_mfs, next_raw_mf[trainer.edge_node_ids], edge_a_ids, rewards, edge_next_states,
-                dones, agent_ids=instance_indices
+                dones, agent_ids=instance_indices, log_prob=log_probs, value=values
             )
 
         # 3. ALWAYS record metrics!
@@ -312,16 +321,16 @@ class PPOStrategy(AlgorithmStrategy):
 
             for slot in range(max_slots):
                 if trainer.env.time_manager.is_new_frame():
-                    u_acts_matrix = self.get_upper_actions(trainer, current_upper_state, obs_upper)
+                    u_acts_matrix, u_log_probs, u_values = self.get_upper_actions(trainer, current_upper_state, obs_upper)
                     trainer.env.step_upper(u_acts_matrix)
 
                 t_idx, s_idx, batch_sizes, tasks_min_accuracy, task_deadlines = trainer.workload_gen.generate_step()
                 if len(t_idx) > 0:
-                    n_idx, m_idx, masks = self.get_lower_actions(trainer, prev_lower_res, t_idx, s_idx,
+                    n_idx, m_idx, masks, l_log_probs, l_values = self.get_lower_actions(trainer, prev_lower_res, t_idx, s_idx,
                                                                  tasks_min_accuracy, task_deadlines, batch_sizes)
                     results = trainer.env.step_lower(t_idx, s_idx, batch_sizes, n_idx, m_idx, task_deadlines,
                                                      tasks_min_accuracy)
-                    self.store_lower_transitions(trainer, prev_lower_res, results, t_idx, s_idx, n_idx, m_idx, masks)
+                    self.store_lower_transitions_v2(trainer, prev_lower_res, results, t_idx, s_idx, n_idx, m_idx, masks, l_log_probs, l_values)
 
                     trainer.aggregator.add_step_matrices(
                         f_alloc=trainer.env.engine.cpu_alloc_matrix,
@@ -357,11 +366,10 @@ class PPOStrategy(AlgorithmStrategy):
                 if trainer.env.time_manager.is_new_frame():
                     res_upper = trainer.env.collect_upper_metrics()
                     next_upper_state = self.build_upper_state(trainer, res_upper)
-                    trainer.aggregator.add_upper(res_upper)
                     is_ep_done = (slot == max_slots - 1)
 
                     self.store_upper_transitions(trainer, current_upper_state, next_upper_state, obs_upper, res_upper,
-                                                 u_acts_matrix, is_ep_done)
+                                                 u_acts_matrix, u_log_probs, u_values, is_ep_done)
 
                     # 2. Train Upper Level (ONLY in Phase UPPER_ONLY)
                     if self.phase == 'UPPER_ONLY':
@@ -429,23 +437,23 @@ class PPOStrategy(AlgorithmStrategy):
 
             for slot in range(max_slots):
                 if trainer.env.time_manager.is_new_frame():
-                    u_acts_matrix = self.get_upper_actions(trainer, current_upper_state, obs_upper)
+                    u_acts_matrix, u_log_probs, u_vals = self.get_upper_actions(trainer, current_upper_state, obs_upper)
                     trainer.env.step_upper(u_acts_matrix)
 
                 t_idx, s_idx, batch_sizes, tasks_min_accuracy, task_deadlines = trainer.workload_gen.generate_step()
                 if len(t_idx) > 0:
-                    n_idx, m_idx, masks = self.get_lower_actions(trainer, prev_lower_res, t_idx, s_idx,
+                    n_idx, m_idx, masks, l_log_probs, l_vals = self.get_lower_actions(trainer, prev_lower_res, t_idx, s_idx,
                                                                  tasks_min_accuracy, task_deadlines, batch_sizes)
                     results = trainer.env.step_lower(t_idx, s_idx, batch_sizes, n_idx, m_idx, task_deadlines,
                                                      tasks_min_accuracy)
 
                     # Record lower metrics
-                    self.store_lower_transitions(trainer, prev_lower_res, results, t_idx, s_idx, n_idx, m_idx, masks)
+                    self.store_lower_transitions(trainer, prev_lower_res, results, t_idx, s_idx, n_idx, m_idx, masks, l_log_probs, l_vals)
 
                     # Record upper metrics
                     # Use current_upper_state if available, results otherwise
                     self.store_upper_transitions(trainer, current_upper_state, None, obs_upper, results, u_acts_matrix,
-                                                 (slot == max_slots - 1))
+                                                 None, None, (slot == max_slots - 1))
 
                     ep_reward += results['reward_global']
                     ep_backlog.append(results['obs']['backlog'].sum().item())
