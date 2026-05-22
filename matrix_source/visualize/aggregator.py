@@ -118,7 +118,8 @@ class MetricsAggregator:
 
     def add_upper(self, step_output, mf_loss=None, state=None):
         """Adds data from an upper-level step."""
-        self.episode_upper_rewards.append(step_output.get("reward_global", 0))
+        r = step_output.get("reward_global", 0)
+        self.episode_upper_rewards.append(float(r) if hasattr(r, "item") else float(r))
         if mf_loss is not None:
             self.episode_upper_mf_losses.append(float(mf_loss))
         if state is not None:
@@ -148,11 +149,16 @@ class MetricsAggregator:
             backlog_drift = obs.get("total_drift", 0)
             self.episode_backlog_drift.append(float(backlog_drift) if hasattr(backlog_drift, "item") else float(backlog_drift))
             
-        energy_dist = step_output.get("energy", {})
+        energy_dist = step_output.get("energy", 0)
         if energy_dist:
-            # Recursive item extraction for energy dict
-            cpu_energy = {k: (v.item() if hasattr(v, "item") else v) for k, v in energy_dist.items()}
-            self.episode_energy.append(cpu_energy)
+            if isinstance(energy_dist, dict):
+                # Recursive item extraction for energy dict
+                cpu_energy = {k: (v.item() if hasattr(v, "item") else v) for k, v in energy_dist.items()}
+                self.episode_energy.append(cpu_energy)
+            else:
+                # Scalar value
+                val = energy_dist.item() if hasattr(energy_dist, "item") else energy_dist
+                self.episode_energy.append({"total": float(val)})
 
         # Violations count
         violations = step_output.get("violations", 0)
