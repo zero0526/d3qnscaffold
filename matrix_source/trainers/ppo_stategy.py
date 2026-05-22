@@ -202,7 +202,7 @@ class PPOStrategy(AlgorithmStrategy):
             deterministic=is_det
         )
 
-        a_ids = torch.tensor(batch_actions, device=trainer.device)
+        a_ids = batch_actions.view(-1).long()
         return a_ids // trainer.max_models, a_ids % trainer.max_models, masks
 
     def store_lower_transitions(self, trainer, current_res, next_res, t_idx, s_idx, n_idx, m_idx, masks):

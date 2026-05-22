@@ -255,7 +255,7 @@ class PPOAgent:
             self._cached_log_probs[aid] = log_probs[i].item()
             self._cached_values[aid] = values[i].item()
 
-        return actions.cpu().tolist()
+        return actions
 
     def store_transition_train_mf_batch(self, states, prev_mfs, curr_mfs, actions, rewards, next_states, dones,
                                         agent_ids, masks=None):
