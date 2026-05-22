@@ -241,7 +241,7 @@ class D3QNAgent:
                 if self.exclude_zero and self.u_action_dim > 1:
                     q_values[:, 0] -= 1e10
 
-                probs_boltzmann = torch.softmax(q_values * zeta, dim=1)
+                probs_boltzmann = torch.softmax(q_values, dim=1)
                 random_probs = torch.ones_like(q_values)
 
                 if masks_batch is not None:

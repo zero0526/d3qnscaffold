@@ -72,16 +72,16 @@ class PPOStrategy(AlgorithmStrategy):
             mf_hidden_sizes=tuple(trainer.config.hyper_neural["MF_HIDDEN_LAYER"]),
             mf_lr=float(trainer.config.hyper_neural['MF_LR']),
             buffer_min_size=self.upper_cfg['min_size'],
-            entropy_coef_start=0.04,
-            entropy_coef_end=0.003,
+            target_entropy_ratio=0.8,
+            target_entropy_end_ratio=0.05,
             total_train_steps=100,
             hidden_sizes=trainer.config.hyper_neural['AGENT_HIDDEN_LAYER'],
             lr=float(trainer.config.hyper_neural['UPPER_LR']),
             gamma=trainer.config.hyper_neural['DISCOUNT_FACTOR'],
-            alpha=float(trainer.config.hyper_neural['UPDATE_TARGET_COEF']),
-            buffer_size=trainer.config.hyper_neural['MEMORY_SIZE'],
-            batch_size=self.upper_cfg['batch'],
+            lam=trainer.config.hyper_neural.get('LAMBDA', 0.95),
+            clip_eps=trainer.config.hyper_neural.get('CLIP_EPS', 0.2),
             k_epochs=self.upper_cfg['epochs'],
+            batch_size=self.upper_cfg['batch'],
             num_instances=trainer.num_edge_agents,
             device=trainer.device
         )
@@ -95,16 +95,16 @@ class PPOStrategy(AlgorithmStrategy):
             mf_hidden_sizes=tuple(trainer.config.hyper_neural["MF_HIDDEN_LAYER"]),
             mf_lr=float(trainer.config.hyper_neural['MF_LR']),
             buffer_min_size=self.lower_cfg['min_size'],
-            entropy_coef_start=0.015,
-            entropy_coef_end=0.001,
+            target_entropy_ratio=0.5,
+            target_entropy_end_ratio=0.01,
             total_train_steps=300,
             hidden_sizes=tuple(trainer.config.hyper_neural['AGENT_HIDDEN_LAYER']),
             lr=float(trainer.config.hyper_neural['LOWER_LR']),
             gamma=trainer.config.hyper_neural['DISCOUNT_FACTOR'],
-            alpha=float(trainer.config.hyper_neural['UPDATE_TARGET_COEF']),
-            buffer_size=trainer.config.hyper_neural['MEMORY_SIZE'],
-            batch_size=self.lower_cfg['batch'],
+            lam=trainer.config.hyper_neural.get('LAMBDA', 0.95),
+            clip_eps=trainer.config.hyper_neural.get('CLIP_EPS', 0.2),
             k_epochs=self.lower_cfg['epochs'],
+            batch_size=self.lower_cfg['batch'],
             num_instances=trainer.num_terminals,
             device=trainer.device
         )
@@ -339,7 +339,6 @@ class PPOStrategy(AlgorithmStrategy):
                             trainer.total_lower_steps += 1
                             self.lower_train_num += 1
                             self.current_phase_updates += 1
-                            trainer.shared_lower_agent.update_entropy_coef(trainer.total_lower_steps)
                             trainer.aggregator.record_td_losses(lower_losses=loss)
 
                             # Checkpoint
@@ -372,7 +371,6 @@ class PPOStrategy(AlgorithmStrategy):
                             trainer.total_upper_steps += 1
                             self.upper_train_num += 1
                             self.current_phase_updates += 1
-                            trainer.shared_upper_agent.update_entropy_coef(trainer.total_upper_steps)
                             trainer.aggregator.record_td_losses(upper_losses=loss)
 
                             # Checkpoint

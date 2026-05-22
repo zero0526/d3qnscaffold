@@ -137,7 +137,7 @@ class MFNetwork(nn.Module):
 
 class PPOAgent:
     def __init__(self, node_id, node_type, state_dim, action_dim, u_action_dim,
-                 mf_hidden_sizes, mf_lr, buffer_min_size, entropy_coef_start=0.2, entropy_coef_end=0.1,
+                 mf_hidden_sizes, mf_lr, buffer_min_size, target_entropy_ratio=0.8, target_entropy_end_ratio=0.05,
                  total_train_steps=100, hidden_sizes=(128, 64),
                  lr=3e-4, gamma=0.99, alpha=0.005, buffer_size=100000, batch_size=64,
                  lam=0.95, clip_eps=0.2, k_epochs=5, entropy_coef=0.01,
@@ -158,11 +158,17 @@ class PPOAgent:
         self.action_dim = action_dim  # Dimensions of mean field
         self.u_action_dim = u_action_dim  # Number of discrete actions
         self.exclude_zero = exclude_zero
+        
+        # Entropy Auto-tuning (SAC-style) with Decay
+        self.target_entropy_start = target_entropy_ratio * np.log(u_action_dim)
+        self.target_entropy_end = target_entropy_end_ratio * np.log(u_action_dim)
+        self.total_train_steps = total_train_steps
+        self.target_entropy = self.target_entropy_start
+        
+        self.log_alpha = torch.tensor([np.log(entropy_coef)], requires_grad=True, device=self.device)
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=lr)
 
         # PPO Hyperparameters
-        self.entropy_coef_start = entropy_coef_start
-        self.entropy_coef_end = entropy_coef_end
-        self.total_train_steps = total_train_steps
         self.gamma = gamma
         self.lmbda = lam
         self.eps_clip = clip_eps
@@ -359,6 +365,23 @@ class PPOAgent:
 
                 epoch_v_loss += critic_loss.item()
                 total_batches += 1
+
+        # 3. Automatic Entropy Tuning Update
+        with torch.no_grad():
+            # Update dynamic target entropy based on global training progress
+            progress = min(self.learn_step_counter / self.total_train_steps, 1.0)
+            self.target_entropy = self.target_entropy_start + (self.target_entropy_end - self.target_entropy_start) * progress
+            
+            _, current_entropies = self.actor.evaluate(states, curr_mfs, actions, masks=masks, indices=agent_ids)
+            avg_entropy = current_entropies.mean()
+            
+        alpha_loss = (self.log_alpha * (self.target_entropy - avg_entropy).detach()).mean()
+        
+        self.alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optimizer.step()
+        
+        self.entropy_coef = self.log_alpha.exp().item()
 
         self.learn_step_counter += 1
 
