@@ -130,7 +130,9 @@ class MetricsAggregator:
 
     def add_lower(self, step_output, mf_loss=None, state=None):
         """Adds data from a lower-level step."""
-        self.episode_lower_rewards.append(step_output.get("reward", 0))
+        r = step_output.get("reward", 0)
+        self.episode_lower_rewards.append(float(r) if hasattr(r, "item") else float(r))
+        
         if mf_loss is not None:
             self.episode_lower_mf_losses.append(float(mf_loss))
         if state is not None:
@@ -144,22 +146,29 @@ class MetricsAggregator:
         obs = step_output.get("obs", {})
         if obs:
             backlog_drift = obs.get("total_drift", 0)
-            self.episode_backlog_drift.append(backlog_drift)
+            self.episode_backlog_drift.append(float(backlog_drift) if hasattr(backlog_drift, "item") else float(backlog_drift))
+            
         energy_dist = step_output.get("energy", {})
         if energy_dist:
-            self.episode_energy.append(energy_dist)
+            # Recursive item extraction for energy dict
+            cpu_energy = {k: (v.item() if hasattr(v, "item") else v) for k, v in energy_dist.items()}
+            self.episode_energy.append(cpu_energy)
 
         # Violations count
         violations = step_output.get("violations", 0)
-        self.episode_violations.append(violations)
+        self.episode_violations.append(float(violations) if hasattr(violations, "item") else float(violations))
+
+        def safe_sum(v):
+            if hasattr(v, "sum"): return v.float().sum().item()
+            return np.sum(v)
 
         success_qos = info.get("success_qos", {})
         if success_qos:
-            self.episode_success_qos.append(sum(np.sum(v) for v in success_qos.values()))
+            self.episode_success_qos.append(sum(safe_sum(v) for v in success_qos.values()))
             
         violate_qos = info.get("violate_qos", {})
         if violate_qos:
-            self.episode_violate_qos.append(sum(np.sum(v) for v in violate_qos.values()))
+            self.episode_violate_qos.append(sum(safe_sum(v) for v in violate_qos.values()))
             
         # Accumulate task stats
         self.eps_assigned += info.get("num_tasks", 0)
