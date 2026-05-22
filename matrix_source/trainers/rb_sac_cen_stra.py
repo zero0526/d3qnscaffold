@@ -92,7 +92,7 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         zeta = trainer.zeta_upper if not deterministic else 100.0
         
         batch_a_ids = self.upper_agent.choose_action_batch(
-            edge_states, edge_mfs, zeta=zeta, agent_indices=instance_indices
+            edge_states, edge_mfs,epsilon=trainer.eps_upper,  zeta=zeta, agent_indices=instance_indices
         )
 
         for i, nid in enumerate(trainer.edge_node_ids):
@@ -260,8 +260,17 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         # Add discrete success/fail rewards per agent-service group
         for e_idx in range(self.num_edges):
             e_node_id = self.edge_ids[e_idx] # The physical node ID of this agent
-            node_succ = success_qos.get(e_node_id, [0]*trainer.num_services)
-            node_fail = violate_qos.get(e_node_id, [0]*trainer.num_services)
+            
+            # Robust retrieval: handle both dictionary and tensor formats
+            if isinstance(success_qos, torch.Tensor):
+                node_succ = success_qos[e_node_id] if e_node_id < success_qos.shape[0] else [0]*trainer.num_services
+            else:
+                node_succ = success_qos.get(e_node_id, [0]*trainer.num_services)
+                
+            if isinstance(violate_qos, torch.Tensor):
+                node_fail = violate_qos[e_node_id] if e_node_id < violate_qos.shape[0] else [0]*trainer.num_services
+            else:
+                node_fail = violate_qos.get(e_node_id, [0]*trainer.num_services)
             
             for s_idx in range(trainer.num_services):
                 local_idx = e_idx * trainer.num_services + s_idx

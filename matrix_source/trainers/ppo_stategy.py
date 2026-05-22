@@ -182,8 +182,9 @@ class PPOStrategy(AlgorithmStrategy):
         current_placement = trainer.env.engine.placement_matrix[:, s_idx]
         num_reqs = states_rows = s_tasks.shape[0]
         
-        s_backlogs = (obs_dict['backlog'][:, s_idx] * current_placement).unsqueeze(0).expand(num_reqs, -1)
-        s_cpus = (obs_dict['cpu_alloc'][:, s_idx] * current_placement).unsqueeze(0).expand(num_reqs, -1)
+        # Use reshape(1, -1) to safely handle any dimensionality from s_idx indexing before expansion
+        s_backlogs = (obs_dict['backlog'][:, s_idx] * current_placement).T
+        s_cpus = (obs_dict['cpu_alloc'][:, s_idx] * current_placement).T
         states = torch.cat([s_tasks, s_backlogs, s_cpus], dim=1)
 
         states[:, 0] /= trainer.config.norm_data_size
@@ -215,8 +216,9 @@ class PPOStrategy(AlgorithmStrategy):
             placement = trainer.env.engine.placement_matrix[:, sidx]
             num_reqs = obs['task_reqs'][tidx].shape[0]
             
-            b_masked = (obs['backlog'][:, sidx] * placement).unsqueeze(0).expand(num_reqs, -1)
-            c_masked = (obs['cpu_alloc'][:, sidx] * placement).unsqueeze(0).expand(num_reqs, -1)
+            # Use reshape(1, -1) to safely handle any dimensionality from sidx indexing before expansion
+            b_masked = (obs['backlog'][:, sidx] * placement).T
+            c_masked = (obs['cpu_alloc'][:, sidx] * placement).T
             
             st = torch.cat([obs['task_reqs'][tidx], b_masked, c_masked], dim=1)
             st[:, 0] /= trainer.config.norm_data_size
@@ -316,7 +318,7 @@ class PPOStrategy(AlgorithmStrategy):
             obs = trainer.env.reset()
             obs_upper = obs['upper']
             prev_lower_res = obs['lower']
-            self.upper_mf_ema = None  # Reset EMA for new episode
+            prev_lower_res["mean_field"] = torch.zeros((trainer.num_terminals, trainer.lower_action_dim), device=trainer.device)
             current_upper_state = self.build_upper_state(trainer, obs_upper)
 
             for slot in range(max_slots):
@@ -328,9 +330,11 @@ class PPOStrategy(AlgorithmStrategy):
                 if len(t_idx) > 0:
                     n_idx, m_idx, masks, l_log_probs, l_values = self.get_lower_actions(trainer, prev_lower_res, t_idx, s_idx,
                                                                  tasks_min_accuracy, task_deadlines, batch_sizes)
+                                                                 
                     results = trainer.env.step_lower(t_idx, s_idx, batch_sizes, n_idx, m_idx, task_deadlines,
                                                      tasks_min_accuracy)
-                    self.store_lower_transitions_v2(trainer, prev_lower_res, results, t_idx, s_idx, n_idx, m_idx, masks, l_log_probs, l_values)
+                    
+                    self.store_lower_transitions(trainer, prev_lower_res, results, t_idx, s_idx, n_idx, m_idx, masks, l_log_probs, l_values)
 
                     trainer.aggregator.add_step_matrices(
                         f_alloc=trainer.env.engine.cpu_alloc_matrix,
@@ -426,9 +430,11 @@ class PPOStrategy(AlgorithmStrategy):
         }
 
         for ep in range(num_episodes):
-            obs = trainer.env.reset()
-            obs_upper = obs['upper']
-            prev_lower_res = obs['lower']
+            res = trainer.env.reset()
+            obs_upper, prev_lower_res = res['upper'], res['lower']
+            
+            prev_lower_res["mean_field"] = torch.zeros((trainer.num_nodes * trainer.num_services, trainer.num_nodes), device=trainer.device)
+            
             current_upper_state = self.build_upper_state(trainer, obs_upper)
 
             ep_reward = 0
@@ -444,9 +450,10 @@ class PPOStrategy(AlgorithmStrategy):
                 if len(t_idx) > 0:
                     n_idx, m_idx, masks, l_log_probs, l_vals = self.get_lower_actions(trainer, prev_lower_res, t_idx, s_idx,
                                                                  tasks_min_accuracy, task_deadlines, batch_sizes)
+                    
                     results = trainer.env.step_lower(t_idx, s_idx, batch_sizes, n_idx, m_idx, task_deadlines,
                                                      tasks_min_accuracy)
-
+                    
                     # Record lower metrics
                     self.store_lower_transitions(trainer, prev_lower_res, results, t_idx, s_idx, n_idx, m_idx, masks, l_log_probs, l_vals)
 
