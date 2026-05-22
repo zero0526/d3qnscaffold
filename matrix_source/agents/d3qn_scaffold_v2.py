@@ -135,7 +135,7 @@ class MF(nn.Module):
 # D3QN Agent V2 — Split Backbone/Head Phased-SCAFFOLD
 # ─────────────────────────────────────────────────────────────────────────────
 
-class D3QNAgent:
+class D3QNAgentV2:
     """
     Multi-instance D3QN with split backbone/head SCAFFOLD.
 
@@ -213,12 +213,9 @@ class D3QNAgent:
             # Per-param, per-instance tensors
             self.c_b_local  = [torch.zeros_like(p) for p in bone_params]
             self.c_b_global = [torch.zeros_like(p) for p in bone_params]
-            self.c_h_local  = [torch.zeros_like(p) for p in head_params]
-            self.c_h_global = [torch.zeros_like(p) for p in head_params]
 
             # Raw gradient accumulators (for multi-step c update)
             self.grad_b_sum = [torch.zeros_like(p) for p in bone_params]
-            self.grad_h_sum = [torch.zeros_like(p) for p in head_params]
             self.steps_in_round = torch.zeros(num_instances, dtype=torch.long, device=self.device)
 
         # ── Misc ──────────────────────────────────────────────────────────────
@@ -235,11 +232,8 @@ class D3QNAgent:
             return 3
 
     def _get_lambda(self, round_idx):
-        """SCAFFOLD correction scale for the Head."""
-        if round_idx < self.T2:
-            return 1.0
-        denom = max(self.total_rounds - self.T2, 1)
-        return max(0.0, 1.0 - (round_idx - self.T2) / denom)
+        """No longer used as Head SCAFFOLD is disabled."""
+        return 0.0
 
     def _set_backbone_lr(self, phase):
         lr = self.lr_bone_high if phase == 1 else self.lr_bone_low
@@ -258,8 +252,6 @@ class D3QNAgent:
             return
         with torch.no_grad():
             for g in self.grad_b_sum:
-                g.zero_()
-            for g in self.grad_h_sum:
                 g.zero_()
             self.steps_in_round.zero_()
 
@@ -326,7 +318,19 @@ class D3QNAgent:
                 if self.exclude_zero and self.u_action_dim > 1:
                     q_values[:, 0] -= 1e10
 
+                # Guard: clamp q_values to prevent softmax overflow
+                q_values = torch.nan_to_num(q_values, nan=0.0, posinf=50.0, neginf=-50.0)
+                q_values = q_values.clamp(-50.0, 50.0)
+
                 probs = torch.softmax(q_values, dim=1)
+
+                # Guard: repair NaN rows (e.g. if all logits are identical after clamping)
+                bad_rows = torch.isnan(probs).any(dim=1) | torch.isinf(probs).any(dim=1)
+                if bad_rows.any():
+                    if masks_batch is not None:
+                        probs[bad_rows] = (masks_batch[indices][bad_rows].float() + 1e-8)
+                    probs[bad_rows] = probs[bad_rows] / probs[bad_rows].sum(dim=1, keepdim=True)
+
                 final_actions[indices] = torch.multinomial(probs, 1).squeeze(1)
 
         return final_actions.tolist()
@@ -398,44 +402,35 @@ class D3QNAgent:
             q_next        = self.target_net.head(next_feat_tgt, indices=agent_ids).gather(1, next_actions)
             q_target      = rewards + self.gamma * q_next * (1 - dones)
 
+        # Fix 2: Clamp before loss to prevent Q-value explosion corrupting gradients
+        q_eval   = q_eval.clamp(-50.0, 50.0)
+        q_target = q_target.clamp(-50.0, 50.0)
+
         loss = self.loss_fn(q_eval, q_target).mean()
 
         # ── Backbone update (Phase 1 & 2 only) ────────────────────────────────
         self.bone_optimizer.zero_grad()
         self.head_optimizer.zero_grad()
-        loss.backward(retain_graph=(phase < 3))
+        loss.backward()  # Fix 5: no retain_graph — single backward pass covers all leaf params
 
         if self.use_scaffold:
             with torch.no_grad():
                 unique_ids = torch.unique(agent_ids)
+
+                # Fix 3: Direct-index correction — no m_mask broadcasting.
+                # PyTorch zeroes gradients for non-participating instances automatically.
 
                 # ── Apply SCAFFOLD correction to backbone gradients ────────────
                 if phase < 3:
                     bone_params = list(self.eval_net.backbone.parameters())
                     for i, p in enumerate(bone_params):
                         if p.grad is not None:
-                            mdims = [self.num_instances] + [1] * (p.data.dim() - 1)
-                            m_mask = torch.zeros(mdims, device=self.device)
-                            m_mask[unique_ids] = 1.0
                             raw_g = p.grad.data.clone()
-                            # g_b_corrected = g_b - c_b_local + c_b_global
-                            p.grad.data = raw_g + m_mask * (self.c_b_global[i] - self.c_b_local[i])
-                            self.grad_b_sum[i].index_add_(0, unique_ids,
-                                raw_g[unique_ids] - self.grad_b_sum[i][unique_ids])
+                            # g_b_corrected = g_b - c_b_local + c_b_global  (only active ids)
+                            p.grad.data[unique_ids] = raw_g[unique_ids] + (
+                                self.c_b_global[i][unique_ids] - self.c_b_local[i][unique_ids]
+                            )
                             self.grad_b_sum[i][unique_ids] += raw_g[unique_ids]
-
-                # ── Apply SCAFFOLD correction to head gradients ────────────────
-                head_params = list(self.eval_net.head.parameters())
-                for i, p in enumerate(head_params):
-                    if p.grad is not None:
-                        mdims = [self.num_instances] + [1] * (p.data.dim() - 1)
-                        m_mask = torch.zeros(mdims, device=self.device)
-                        m_mask[unique_ids] = 1.0
-                        raw_g = p.grad.data.clone()
-                        # g_h_corrected = g_h - lambda * (c_h_local - c_h_global)
-                        correction = m_mask * lambda_t * (self.c_h_local[i] - self.c_h_global[i])
-                        p.grad.data = raw_g - correction
-                        self.grad_h_sum[i][unique_ids] += raw_g[unique_ids]
 
                 self.steps_in_round[unique_ids] += 1
 
@@ -449,7 +444,7 @@ class D3QNAgent:
         self.head_optimizer.step()
 
         self.learn_step_counter += 1
-        self._soft_update()
+        # self._soft_update()
 
         if self.logs_q:
             return {
@@ -480,36 +475,32 @@ class D3QNAgent:
             for c_g, new_val in zip(self.c_b_global, c_b_global_list):
                 c_g[instance_ids] = new_val
 
-    def get_c_h_local(self, instance_ids):
-        return [c[instance_ids].clone() for c in self.c_h_local]
 
-    def set_c_h_global(self, instance_ids, c_h_global_list):
-        with torch.no_grad():
-            for c_g, new_val in zip(self.c_h_global, c_h_global_list):
-                c_g[instance_ids] = new_val
 
     def update_local_cvariates(self, instance_ids: torch.Tensor):
         """
         Call at the END of a round (before aggregation), for each instance.
-        c_b_local[i] <- c_b_local[i] - grad_b_sum[i]/K + c_b_global[i]
-        c_h_local[i] <- c_h_local[i] - grad_h_sum[i]/K + c_h_global[i]
+        SCAFFOLD Option I (Karimireddy et al. 2020):
+          c_i+ = c_i - c_global + (1/K) * sum_k grad_k
+
+        Fix 1: Only update agents that actually trained this round (steps > 0).
         """
         if not self.use_scaffold:
             return
         with torch.no_grad():
-            K = self.steps_in_round[instance_ids].float().clamp(min=1).view(-1, *([1] * (self.grad_b_sum[0].dim() - 1)))
+            # Only process agents that actually ran gradient steps this round
+            active_mask = self.steps_in_round[instance_ids] > 0
+            if not active_mask.any():
+                return
+            active_ids = instance_ids[active_mask]
+            steps = self.steps_in_round[active_ids].float()  # always > 0, no clamp needed
+
             for i in range(len(self.c_b_local)):
-                self.c_b_local[i][instance_ids] = (
-                    self.c_b_local[i][instance_ids]
-                    - self.grad_b_sum[i][instance_ids] / K
-                    + self.c_b_global[i][instance_ids]
-                )
-            Kh = self.steps_in_round[instance_ids].float().clamp(min=1).view(-1, *([1] * (self.grad_h_sum[0].dim() - 1)))
-            for i in range(len(self.c_h_local)):
-                self.c_h_local[i][instance_ids] = (
-                    self.c_h_local[i][instance_ids]
-                    - self.grad_h_sum[i][instance_ids] / Kh
-                    + self.c_h_global[i][instance_ids]
+                K = steps.view(-1, *([1] * (self.grad_b_sum[i].dim() - 1)))
+                self.c_b_local[i][active_ids] = (
+                    self.c_b_local[i][active_ids]
+                    - self.c_b_global[i][active_ids]
+                    + self.grad_b_sum[i][active_ids] / K
                 )
 
     # ── Soft update & IO ──────────────────────────────────────────────────────

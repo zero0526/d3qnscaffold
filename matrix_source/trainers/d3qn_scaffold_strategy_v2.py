@@ -1,9 +1,12 @@
 import torch
 from matrix_source.agents.d3qn_scaffold import D3QNAgent
+from matrix_source.agents.d3qn_scaffold_v2 import D3QNAgentV2
 from matrix_source.trainers.strategies import AlgorithmStrategy
 from matrix_source.utils.math_utils import to_binary
 from tqdm import tqdm
 from matrix_source.trainers.train import Trainer
+
+
 class D3QNScaffoldStrategy(AlgorithmStrategy):
     def initialize_agents(self, trainer):
         # Upper Agent
@@ -27,7 +30,7 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
         )
 
         # Lower Agent (Uses SCAFFOLD)
-        trainer.shared_lower_agent = D3QNAgent(
+        trainer.shared_lower_agent = D3QNAgentV2(
             node_id=-1, node_type="Terminal_Group",
             state_dim=trainer.lower_state_dim,
             action_dim=trainer.lower_action_dim,
@@ -44,7 +47,8 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
             num_instances=trainer.num_terminals,
             device=trainer.device,
             logs_q=False,
-            use_scaffold=True # Enabled for Terminals
+            use_scaffold=True, # Enabled for Terminals
+            total_rounds= trainer.config.hyper_neural['NUMOF_TRAIN_EP']
         )
         # Initialize Cluster Mapping (Terminal -> Edge)
         # terminal_to_comp_node_map is 2D: (num_terminals, num_comp_nodes)
@@ -267,13 +271,13 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
                 agent.update_local_cvariates(t_ids)
 
                 # Step 2: Aggregate backbone weights (Phase 1 & 2 only)
+                # Fix 4: Do NOT hard-sync target net here — that breaks Polyak averaging.
+                # _soft_update() (alpha=0.005) is the only target-net update path.
                 if phase < 3:
                     bone_params = list(agent.eval_net.backbone.parameters())
-                    tgt_bone_params = list(agent.target_net.backbone.parameters())
-                    for p, tp in zip(bone_params, tgt_bone_params):
+                    for p in bone_params:
                         cluster_mean = p.data[t_ids].mean(dim=0, keepdim=True)
                         p.data[t_ids] = cluster_mean.expand(len(terminal_ids), *cluster_mean.shape[1:])
-                        tp.data[t_ids] = p.data[t_ids]  # sync target
 
                 # Step 3: Aggregate backbone control variates -> new c_b_global
                 c_b_local_slices = agent.get_c_b_local(t_ids)
@@ -281,14 +285,9 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
                                 for c in c_b_local_slices]
                 agent.set_c_b_global(t_ids, c_b_new_global)
 
-                # Step 4: Aggregate head control variates -> new c_h_global
-                c_h_local_slices = agent.get_c_h_local(t_ids)
-                c_h_new_global = [c.mean(dim=0, keepdim=True).expand(len(terminal_ids), *c.shape[1:])
-                                for c in c_h_local_slices]
-                agent.set_c_h_global(t_ids, c_h_new_global)
-
         # Reset grad accumulators and step counters for next round
         agent.save_base_initial()
+        agent._soft_update()
 
     def run_training(self, trainer: Trainer):
         num_eps = trainer.config.hyper_neural['NUMOF_TRAIN_EP']
@@ -366,7 +365,7 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
 
             # update ep and history
             # Federated Aggregation (SCAFFOLD) for lower agents
-            self.perform_scaffold_aggregation_v2(trainer.shared_lower_agent)
+            self.perform_scaffold_aggregation_v2(trainer.shared_lower_agent, round_idx=ep)
 
             trainer.update_rates(ep)
             trainer.aggregator.store_history()
