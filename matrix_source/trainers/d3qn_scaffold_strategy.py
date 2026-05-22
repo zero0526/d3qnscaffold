@@ -43,7 +43,7 @@ class D3QNStrategy(AlgorithmStrategy):
             batch_size=trainer.config.hyper_neural['BATCH_SIZE'],
             num_instances=trainer.num_terminals,
             device=trainer.device,
-            logs_q=True
+            logs_q=False
         )
 
     def get_upper_actions(self, trainer, current_upper_state, obs_upper):

@@ -4,6 +4,6 @@ from matrix_source.trainers.d3qn_strategy import D3QNStrategy
 from matrix_source.trainers.rb_sac_cen_stra import RB_SAC_CEN_STRA
 
 if __name__ == '__main__':
-    strategy = PPOStrategy()
+    strategy = D3QNStrategy()
     trainer = Trainer(strategy=strategy)
     trainer.train()

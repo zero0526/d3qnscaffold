@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from matrix_source.agents.buffer.ReplayBuffer import MultiAgentReplayBuffer
-import random
 from matrix_source.agents.buffer.PrioritizedReplayBuffer import MultiAgentPrioritizedReplayBuffer
 
 
@@ -243,17 +242,16 @@ class D3QNAgent:
 
                 probs_boltzmann = torch.softmax(q_values * zeta, dim=1)
                 random_probs = torch.ones_like(q_values)
-
                 if masks_batch is not None:
                     m = masks_batch[indices]
                     random_probs = m / m.sum(dim=1, keepdim=True).clamp(min=1e-8)
                 else:
                     random_probs = random_probs / self.u_action_dim
+                # zeta factor controls the exploration temperature
+                final_probs = (1.0 - epsilon) * probs_boltzmann + epsilon * random_probs
+                final_probs = probs_boltzmann
 
-                if random.random() < epsilon:
-                    return random_probs
-
-                final_actions[indices] = torch.multinomial(probs_boltzmann, 1).squeeze(1)
+                final_actions[indices] = torch.multinomial(final_probs, 1).squeeze(1)
 
         return final_actions.tolist()
 
@@ -300,11 +298,11 @@ class D3QNAgent:
         states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids, masks, next_masks = \
             self.memory.sample(self.batch_size, agent_ids=target_agents)
         # 1. Train MF (prediction of current MF based on state and previous MF)
-        # self.learn_mf_batch(states, prev_mfs, curr_mfs, agent_ids)
+        self.learn_mf_batch(states, prev_mfs, curr_mfs, agent_ids)
         
         # 2. DQN update (using updated MF network)
-        # pred_curr_mfs = self.mf_net(torch.cat([states, prev_mfs], dim=-1), indices=agent_ids)
-        q_eval = self.eval_net(states, curr_mfs, indices=agent_ids).gather(1, actions)
+        pred_curr_mfs = self.mf_net(torch.cat([states, prev_mfs], dim=-1), indices=agent_ids)
+        q_eval = self.eval_net(states, pred_curr_mfs.detach(), indices=agent_ids).gather(1, actions)
         with torch.no_grad():
             next_pred_mfs = self.mf_net(torch.cat([next_states, curr_mfs], dim=-1), indices=agent_ids)
             q_next_pre = self.eval_net(next_states, next_pred_mfs, indices=agent_ids)

@@ -33,12 +33,15 @@ class Trainer:
         self.eps_upper = 1.0
         self.eps_lower = 1.0
         self.lower_epsilons = {tid: 1.0 for tid in range(self.num_terminals)}
-        self.zeta_initial = cfg.hyper_neural.get("ZETA", 1.0)
-        self.zeta_max = cfg.hyper_neural.get("ZETA_MAX", 20.0)
-        self.zeta_upper = self.zeta_initial
-        self.zeta_lower = self.zeta_initial
+        self.zeta_initial_upper = cfg.hyper_neural.get("ZETA", 1.0)
+        self.zeta_initial_lower = cfg.hyper_neural.get("ZETA", 1.0)
+        self.zeta_max_upper = cfg.hyper_neural.get("ZETA_MAX", 20.0)
+        self.zeta_max_lower = cfg.hyper_neural.get("ZETA_MAX", 20.0)
+
+        self.zeta_upper = self.zeta_initial_upper
+        self.zeta_lower = self.zeta_initial_lower
         self.epsilon_start = 1.0
-        self.epsilon_tau = cfg.hyper_neural.get("ANNEALING_LENGTH", 5000)
+        self.annealing = cfg.hyper_neural.get("ANNEALING_LENGTH", 5000)
         # --- Lower-level zeta exploration schedule (independent from upper) ---
         # Lower zeta stays frozen during warmup, then increases slowly per episode
         self.zeta_lower_warmup = int(cfg.hyper_neural.get("ZETA_LOWER_WARMUP", 200))   # episodes to keep zeta_lower = initial
@@ -72,23 +75,17 @@ class Trainer:
         # 1. Update Epsilons using exponential decay: eps = eps_end + (eps_start - eps_end) * exp(-t / tau)
         import math
         self.eps_upper = self.min_epsilon + (self.epsilon_start - self.min_epsilon) * \
-                         math.exp(-self.total_upper_steps / 10 / self.epsilon_tau)
+                         math.exp(-self.total_upper_steps / 10 / self.annealing)
 
         self.eps_lower = self.min_epsilon + (self.epsilon_start - self.min_epsilon) * \
-                         math.exp(-self.total_lower_steps / 100 / self.epsilon_tau)
+                         math.exp(-self.total_lower_steps / 100 / self.annealing)
 
-        # 2. Delayed Linear Zeta Annealing
-        # Zeta only starts increasing after Epsilon has reached its "mature" phase
-        lower_zeta_threshold = self.epsilon_tau * 100
-        upper_zeta_threshold = self.epsilon_tau * 10
+        self.zeta_upper = self.zeta_initial_upper + (self.zeta_max_upper - self.zeta_initial_upper) * \
+                         math.exp(-self.total_upper_steps / 10 / self.annealing)
 
-        if self.total_lower_steps > lower_zeta_threshold:
-            zeta_steps_l = self.total_lower_steps - lower_zeta_threshold
-            self.zeta_lower = min(self.zeta_max, self.zeta_initial + zeta_steps_l * self.config.zeta_lower_step)
+        self.zeta_lower = self.zeta_initial_lower + (self.zeta_initial_lower - self.zeta_initial_lower) * \
+                         math.exp(-self.total_lower_steps / 100 / self.annealing)
 
-        if self.total_upper_steps > upper_zeta_threshold:
-            zeta_steps_u = self.total_upper_steps - upper_zeta_threshold
-            self.zeta_upper = min(self.zeta_max, self.zeta_initial + zeta_steps_u * self.config.zeta_upper_step)
 def log_transform(reward: float) -> float:
     return reward
 
