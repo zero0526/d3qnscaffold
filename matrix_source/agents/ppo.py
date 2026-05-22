@@ -91,7 +91,7 @@ class MultiInstanceActor(nn.Module):
         logits = self.forward(state, mf, indices)
 
         if masks is not None:
-            logits = logits + (masks - 1.0) * 1e10
+            logits = logits.masked_fill(masks == 0, -1e9)
 
         dist = Categorical(logits=logits)
         log_prob = dist.log_prob(action)
@@ -159,11 +159,10 @@ class PPOAgent:
         self.u_action_dim = u_action_dim  # Number of discrete actions
         self.exclude_zero = exclude_zero
         
-        # Entropy Auto-tuning (SAC-style) with Decay
-        self.target_entropy_start = target_entropy_ratio * np.log(u_action_dim)
-        self.target_entropy_end = target_entropy_end_ratio * np.log(u_action_dim)
+        # Dynamic Entropy Auto-tuning (SAC-style) with state-dependent target
+        self.target_entropy_ratio = target_entropy_ratio
+        self.target_entropy_end_ratio = target_entropy_end_ratio
         self.total_train_steps = total_train_steps
-        self.target_entropy = self.target_entropy_start
         
         self.log_alpha = torch.tensor([np.log(entropy_coef)], requires_grad=True, device=self.device)
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=lr)
@@ -194,14 +193,10 @@ class PPOAgent:
                                              self.device)
         self.learn_step_counter = 0
 
-        # Caches to maintain drop-in compatibility with D3QN
-        self._cached_log_probs = {}
-        self._cached_values = {}
-
     def choose_action(self, state, prev_mf, epsilon, mask=None, agent_idx=0):
         # Single agent usage
         idx_tensor = torch.tensor([agent_idx], device=self.device)
-        actions = self.choose_action_batch(
+        actions, _, _ = self.choose_action_batch(
             state.unsqueeze(0) if not torch.is_tensor(state) else state.detach().unsqueeze(0),
             prev_mf.unsqueeze(0) if not torch.is_tensor(prev_mf) else prev_mf.detach().unsqueeze(0),
             masks_batch=mask.unsqueeze(0) if mask is not None else None,
@@ -240,35 +235,23 @@ class PPOAgent:
             # 4. Sample actions
             if deterministic:
                 actions = logits.argmax(dim=-1)
-                log_probs = torch.zeros_like(actions,
-                                             dtype=torch.float32)  # Log prob not typically used for deterministic actions but kept for compatibility
+                log_probs = torch.zeros(batch_size, device=self.device)
             else:
-                probs = torch.softmax(logits, dim=-1)
-                dist = Categorical(probs)
+                dist = Categorical(logits=logits)
                 actions = dist.sample()
-
-                # In PPO we need log_prob and value of the sampled action.
                 log_probs = dist.log_prob(actions)
 
-        # Cache values securely mapped to agent_index to use in storage stage (to keep API compatible)
-        for i, aid in enumerate(agent_indices.tolist()):
-            self._cached_log_probs[aid] = log_probs[i].item()
-            self._cached_values[aid] = values[i].item()
-
-        return actions
+        return actions, log_probs.detach(), values.detach()
 
     def store_transition_train_mf_batch(self, states, prev_mfs, curr_mfs, actions, rewards, next_states, dones,
-                                        agent_ids, masks=None):
-        # Retrieve cached log_probs and values
-        log_probs_list = [self._cached_log_probs.get(aid, 0.0) for aid in agent_ids.tolist()]
-        values_list = [self._cached_values.get(aid, 0.0) for aid in agent_ids.tolist()]
-
+                                        agent_ids, log_prob, value, masks=None):
         # 1. Train MF (supervised learning)
         loss_mf = self.learn_mf_batch(states, prev_mfs, curr_mfs, agent_ids)
 
         # 2. Store in Buffer
-        self.memory.add_batch(states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, log_probs_list,
-                              values_list, agent_ids, masks=masks)
+        # Ensure log_prob and value are handled as lists/tensors correctly
+        self.memory.add_batch(states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, log_prob,
+                              value, agent_ids, masks=masks)
         return loss_mf
 
     def learn_mf_batch(self, states, prev_mfs, ground_truth_mfs, agent_ids):
@@ -366,16 +349,25 @@ class PPOAgent:
                 epoch_v_loss += critic_loss.item()
                 total_batches += 1
 
-        # 3. Automatic Entropy Tuning Update
+        # 3. Automatic Dynamic Entropy Tuning Update
         with torch.no_grad():
-            # Update dynamic target entropy based on global training progress
-            progress = min(self.learn_step_counter / self.total_train_steps, 1.0)
-            self.target_entropy = self.target_entropy_start + (self.target_entropy_end - self.target_entropy_start) * progress
+            # a. Compute dynamic target entropy based on valid actions in the current batch
+            # masks shape: (batch, action_dim)
+            valid_action_counts = masks.sum(dim=-1).float().clamp(min=1.0)
             
+            # b. Compute current entropy ratio based on progress
+            progress = min(self.learn_step_counter / self.total_train_steps, 1.0)
+            current_ratio = self.target_entropy_ratio + (self.target_entropy_end_ratio - self.target_entropy_ratio) * progress
+            
+            # c. Compute per-sample target entropy and average it
+            sample_target_entropies = current_ratio * torch.log(valid_action_counts)
+            target_entropy = sample_target_entropies.mean()
+
+            # d. Compute average current entropy for comparison
             _, current_entropies = self.actor.evaluate(states, curr_mfs, actions, masks=masks, indices=agent_ids)
             avg_entropy = current_entropies.mean()
             
-        alpha_loss = (self.log_alpha * (self.target_entropy - avg_entropy).detach()).mean()
+        alpha_loss = (self.log_alpha * (target_entropy - avg_entropy).detach()).mean()
         
         self.alpha_optimizer.zero_grad()
         alpha_loss.backward()
