@@ -1,8 +1,9 @@
 import torch
 import numpy as np
 
+
 class PolicyReplayBuffer:
-    def __init__(self, max_size, state_dim, action_dim, device="cpu"):
+    def __init__(self, max_size, state_dim, action_dim, u_action_dim, device="cpu"):
         self.max_size = max_size
         self.ptr = 0
         self.size = 0
@@ -40,7 +41,7 @@ class PolicyReplayBuffer:
         if mask is not None:
             self.mask[self.ptr] = self._to_tensor(mask, torch.float32)
         else:
-            self.mask[self.ptr] = 1.0 # Default all valid
+            self.mask[self.ptr] = 1.0  # Default all valid
         self.agent_id[self.ptr] = self._to_tensor(agent_id, torch.int64)
 
         self.ptr = (self.ptr + 1) % self.max_size
@@ -67,6 +68,7 @@ class PolicyReplayBuffer:
             self.agent_id[:self.size].squeeze(1)
         )
 
+
 class MultiAgentPolicyBuffer:
     def __init__(self, num_agents, max_size_per_agent, state_dim, action_dim, u_action_dim, device="cpu"):
         self.num_agents = num_agents
@@ -78,7 +80,8 @@ class MultiAgentPolicyBuffer:
         self.buffer_sizes = torch.zeros(num_agents, dtype=torch.long, device=device)
         self.total_size = 0
 
-    def add_batch(self, states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, log_probs, values, agent_ids, masks=None):
+    def add_batch(self, states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, log_probs, values, agent_ids,
+                  masks=None):
         a_ids = agent_ids.view(-1)
         for i in range(len(a_ids)):
             a_id = int(a_ids[i])
@@ -100,16 +103,16 @@ class MultiAgentPolicyBuffer:
         """Returns all transitions for specified agents that meet the min_size."""
         if agent_ids_pool is None:
             agent_ids_pool = torch.arange(self.num_agents, device=self.device)
-            
+
         ready_mask = (self.buffer_sizes >= min_size)
         ready_agents = agent_ids_pool[ready_mask[agent_ids_pool]]
-        
+
         if len(ready_agents) == 0:
             return None
 
         samples = [self.buffers[int(a_id)].get_all() for a_id in ready_agents]
         collated = []
-        for i in range(11): # 11 fields
+        for i in range(11):  # 11 fields
             collated.append(torch.cat([s[i] for s in samples if s is not None], dim=0))
-        
+
         return tuple(collated)
