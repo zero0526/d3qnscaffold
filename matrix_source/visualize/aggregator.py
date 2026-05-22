@@ -165,8 +165,9 @@ class MetricsAggregator:
         self.episode_violations.append(float(violations) if hasattr(violations, "item") else float(violations))
 
         def safe_sum(v):
-            if hasattr(v, "sum"): return v.float().sum().item()
-            return np.sum(v)
+            import torch
+            if isinstance(v, torch.Tensor): return v.float().sum().item()
+            return float(np.sum(v))
 
         success_qos = info.get("success_qos", {})
         if success_qos:
@@ -177,9 +178,15 @@ class MetricsAggregator:
             self.episode_violate_qos.append(sum(safe_sum(v) for v in violate_qos.values()))
             
         # Accumulate task stats
-        self.eps_assigned += info.get("num_tasks", 0)
-        self.eps_failed += info.get("immediate_fails", 0) + info.get("expired_count", 0)
-        self.last_remaining = info.get("remaining", 0)
+        rem = info.get("remaining", 0)
+        self.last_remaining = float(rem.item()) if hasattr(rem, "item") else float(rem)
+        self.episode_remaining_tasks.append(self.last_remaining)
+        
+        assigned = info.get("num_tasks", 0)
+        self.eps_assigned += float(assigned.item()) if hasattr(assigned, "item") else float(assigned)
+        
+        fails = info.get("immediate_fails", 0) + info.get("expired_count", 0)
+        self.eps_failed += float(fails.item()) if hasattr(fails, "item") else float(fails)
 
         # Track failure reasons
         reasons = info.get("fail_reasons", {})
@@ -208,17 +215,20 @@ class MetricsAggregator:
 
     def record_td_losses(self, upper_losses=None, lower_losses=None):
         """Records TD losses at their respective timescales (e.g. per-slot for lower, per-frame for upper)."""
+        def _to_float(x):
+            if hasattr(x, "item"): return x.item()
+            return float(x)
         if upper_losses is not None:
             if isinstance(upper_losses, list) and len(upper_losses) > 0:
-                self.episode_upper_td_losses.append(np.mean(upper_losses))
-            elif isinstance(upper_losses, (float, int)):
-                self.episode_upper_td_losses.append(float(upper_losses))
+                self.episode_upper_td_losses.append(np.mean([_to_float(l) for l in upper_losses]))
+            elif not isinstance(upper_losses, list):
+                self.episode_upper_td_losses.append(_to_float(upper_losses))
                 
         if lower_losses is not None:
             if isinstance(lower_losses, list) and len(lower_losses) > 0:
-                self.episode_lower_td_losses.append(np.mean(lower_losses))
-            elif isinstance(lower_losses, (float, int)):
-                self.episode_lower_td_losses.append(float(lower_losses))
+                self.episode_lower_td_losses.append(np.mean([_to_float(l) for l in lower_losses]))
+            elif not isinstance(lower_losses, list):
+                self.episode_lower_td_losses.append(_to_float(lower_losses))
 
     def record_zeta(self, lower, upper):
         self.curr_zeta_lower = lower
@@ -226,14 +236,16 @@ class MetricsAggregator:
         
     def record_q_stats(self, node_type, q_min, q_max, q_mean):
         """Records Q-value statistics for the specified node type."""
+        def _s(x):
+            return x.item() if hasattr(x, "item") else float(x)
         if node_type == "Edge_Group": # Upper
-            self.episode_upper_q_min.append(q_min)
-            self.episode_upper_q_max.append(q_max)
-            self.episode_upper_q_mean.append(q_mean)
+            self.episode_upper_q_min.append(_s(q_min))
+            self.episode_upper_q_max.append(_s(q_max))
+            self.episode_upper_q_mean.append(_s(q_mean))
         elif node_type == "Terminal_Group": # Lower
-            self.episode_lower_q_min.append(q_min)
-            self.episode_lower_q_max.append(q_max)
-            self.episode_lower_q_mean.append(q_mean)
+            self.episode_lower_q_min.append(_s(q_min))
+            self.episode_lower_q_max.append(_s(q_max))
+            self.episode_lower_q_mean.append(_s(q_mean))
 
     def store_history(self):
         """Saves episode averages to history and RESETS intra-episode data."""
@@ -241,8 +253,13 @@ class MetricsAggregator:
         self.history["lower_reward"].append(np.sum(self.episode_lower_rewards))
         self.history["total_reward"].append(np.sum(self.episode_upper_rewards) + np.sum(self.episode_lower_rewards))
         
-        self.history["total_energy"].append(np.sum(self.episode_energy) if self.episode_energy else 0)
-        self.history["total_violations"].append(np.sum(self.episode_violations) if self.episode_violations else 0)
+        # episode_energy is a list of dicts {"total": val} or {k: val, ...}
+        if self.episode_energy:
+            total_e = sum(sum(d.values()) for d in self.episode_energy if isinstance(d, dict))
+            self.history["total_energy"].append(total_e)
+        else:
+            self.history["total_energy"].append(0)
+        self.history["total_violations"].append(sum(self.episode_violations) if self.episode_violations else 0)
         
         self.history["total_success_qos"].append(np.sum(self.episode_success_qos) if self.episode_success_qos else 0)
         self.history["total_violate_qos"].append(np.sum(self.episode_violate_qos) if self.episode_violate_qos else 0)
