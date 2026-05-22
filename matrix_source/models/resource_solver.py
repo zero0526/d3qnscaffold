@@ -69,9 +69,7 @@ class KKTSolverADMM:
         checkpoints = [15, 30, 50, 70, 100] if debug else []
         max_it = 100 if debug else self.max_iter
 
-        for i in range(max_it):
-            z_prev = z.clone()
-
+        for i in range(20):
             # 1. f-update (KKT of local subproblem)
             f = (G + rho * (z - u)) / denom
 
@@ -81,18 +79,6 @@ class KKTSolverADMM:
 
             # 3. u-update: Dual variable (Lagrange multipliers)
             u = u + (f - z)
-
-            # 4. Residual and Objective Tracking
-            res_r = torch.norm(f - z, dim=1).max().item()
-            res_s = torch.norm(rho * (z - z_prev), dim=1).max().item()
-            
-            if debug and (i + 1 in checkpoints):
-                # Calculate Current Objective: Maximize sum(G*z - Z*z^2)
-                obj_val = (G * z - Z * (z**2)).sum().item()
-                print(f"  [Checkpoint {i+1:3d}] Objective: {obj_val:12.4f} | Prim Res: {res_r:.2e} | Dual Res: {res_s:.2e}")
-
-            if not debug and (res_r < self.tol and res_s < self.tol):
-                break
         
         if debug:
             final_obj = (G * z - Z * (z**2)).sum().item()

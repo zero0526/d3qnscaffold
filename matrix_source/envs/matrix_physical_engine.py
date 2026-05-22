@@ -310,53 +310,56 @@ class MatrixPhysicalEngine:
                 self.service_hw_deficit.index_put_((fhs,), deficit, accumulate=True)
                 self.service_hw_fail_count.index_put_((fhs,), torch.ones_like(fhs, dtype=torch.float), accumulate=True)
 
-            # 2. Xử lý các task hợp lệ bằng Batching trên CPU (Bỏ qua sync GPU chậm)
-            valid_hw_mask = hw_mask
-            if valid_hw_mask.any():
-                # Chuyển dữ liệu sang List của Python (chạy trên RAM)
-                sv_n = vn[valid_hw_mask].tolist()
-                sv_s = vs[valid_hw_mask].tolist()
-                sv_w = vw[valid_hw_mask].tolist()
-                sv_t = vt[valid_hw_mask].tolist()
-                sv_fmin = p_f_min_all[valid_hw_mask].tolist()
+            # Vectorized Queue Pointer Calculation
+            if hw_mask.any():
+                v_hw_n, v_hw_s = vn[hw_mask], vs[hw_mask]
+                v_hw_w, v_hw_t = vw[hw_mask], vt[hw_mask]
+                v_hw_fmin = p_f_min_all[hw_mask]
+
+                # We need to compute indices for (node, service) pairs as if they were flattened
+                # But since multiple tasks for the same (n, s) might arrive in the same slot,
+                # we use cumsum to find their positions relative to the current counts.
+                flat_idx = v_hw_n * self.num_services + v_hw_s
                 
-                # Fetch pointers về RAM 1 lần duy nhất thay vì item() mỗi vòng
-                local_counts = self.backlog_counts.cpu().numpy()
+                # Sort arrivals by (node, service) to group them
+                sort_idx = torch.argsort(flat_idx)
+                v_hw_n, v_hw_s, v_hw_w, v_hw_t, v_hw_fmin, flat_idx = \
+                    v_hw_n[sort_idx], v_hw_s[sort_idx], v_hw_w[sort_idx], v_hw_t[sort_idx], v_hw_fmin[sort_idx], flat_idx[sort_idx]
+
+                # Current counts for these (node, service) pairs
+                base_counts = self.backlog_counts[v_hw_n, v_hw_s]
                 
-                batch_n, batch_s, batch_k = [], [], []
-                batch_w, batch_t, batch_fmin = [], [], []
-                fail_n, fail_s = [], []
+                # Rank tasks within the same (node, service) pair in this batch
+                # Using a trick with diff and cumsum to find ranks
+                diffs = torch.cat([torch.tensor([1], device=self.device), (flat_idx[1:] != flat_idx[:-1]).long()])
+                ranks_in_batch = torch.cumsum(torch.ones_like(flat_idx), dim=0) - 1
+                group_start_rank = torch.masked_select(ranks_in_batch, diffs.bool())
+                # Expanded starts to match every element in flat_idx
+                expanded_starts = torch.repeat_interleave(group_start_rank, torch.diff(torch.cat([torch.where(diffs)[0], torch.tensor([len(flat_idx)], device=self.device)])))
+                relative_ranks = ranks_in_batch - expanded_starts
                 
-                for n, s, w, t, fmin in zip(sv_n, sv_s, sv_w, sv_t, sv_fmin):
-                    ptr = local_counts[n, s]
-                    if ptr < self.max_K:
-                        batch_n.append(n)
-                        batch_s.append(s)
-                        batch_k.append(ptr)
-                        batch_w.append(w)
-                        batch_t.append(t)
-                        batch_fmin.append(fmin)
-                        local_counts[n, s] += 1
-                    else:
-                        fail_n.append(n)
-                        fail_s.append(s)
+                absolute_ks = base_counts + relative_ranks
                 
-                # Cập nhật hàng loạt (Bulk update) vào GPU
-                if batch_n:
-                    b_n = torch.tensor(batch_n, device=self.device)
-                    b_s = torch.tensor(batch_s, device=self.device)
-                    b_k = torch.tensor(batch_k, device=self.device)
+                # Mask out tasks that still exceed capacity
+                valid_queue_mask = absolute_ks < self.max_K
+                
+                if valid_queue_mask.any():
+                    vq_n, vq_s, vq_k = v_hw_n[valid_queue_mask], v_hw_s[valid_queue_mask], absolute_ks[valid_queue_mask]
+                    self.backlog_queue[vq_n, vq_s, vq_k] = v_hw_w[valid_queue_mask]
+                    self.deadline_queue[vq_n, vq_s, vq_k] = v_hw_t[valid_queue_mask]
+                    self.f_min_queue[vq_n, vq_s, vq_k] = v_hw_fmin[valid_queue_mask]
                     
-                    self.backlog_queue[b_n, b_s, b_k] = torch.tensor(batch_w, dtype=self.backlog_queue.dtype, device=self.device)
-                    self.deadline_queue[b_n, b_s, b_k] = torch.tensor(batch_t, dtype=self.deadline_queue.dtype, device=self.device)
-                    self.f_min_queue[b_n, b_s, b_k] = torch.tensor(batch_fmin, dtype=self.f_min_queue.dtype, device=self.device)
-                    self.backlog_counts.copy_(torch.from_numpy(local_counts).to(self.device))
-                
-                if fail_n:
-                    f_n = torch.tensor(fail_n, device=self.device)
-                    f_s = torch.tensor(fail_s, device=self.device)
-                    self.immediate_fails.index_put_((f_n, f_s), torch.ones_like(f_s, dtype=torch.float), accumulate=True)
-                    self.fail_queue.index_put_((f_n, f_s), torch.ones_like(f_s, dtype=torch.float), accumulate=True)
+                    # Update counts: Need to find max relative rank per node-service + 1
+                    # A safe way is to just use index_put with atomic add (not supported for max, but we can do it with a counts update)
+                    added_counts = torch.zeros_like(self.backlog_counts)
+                    added_counts.index_put_((vq_n, vq_s), torch.ones_like(vq_n, dtype=torch.long), accumulate=True)
+                    self.backlog_counts += added_counts
+
+                # Queue Full Failures
+                if (~valid_queue_mask).any():
+                    fq_n, fq_s = v_hw_n[~valid_queue_mask], v_hw_s[~valid_queue_mask]
+                    self.immediate_fails.index_put_((fq_n, fq_s), torch.ones_like(fq_s, dtype=torch.float), accumulate=True)
+                    self.fail_queue.index_put_((fq_n, fq_s), torch.ones_like(fq_s, dtype=torch.float), accumulate=True)
             
             node_arrival_matrix.index_put_((vn, vs), vw, accumulate=True)
             
