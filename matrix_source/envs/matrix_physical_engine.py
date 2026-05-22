@@ -393,11 +393,9 @@ class MatrixPhysicalEngine:
         self.backlog_counts = (self.backlog_queue > 1e-6).sum(dim=-1)
         
         violate_step_tensor = expired_counts_tensor + self.immediate_fails
-        num_violations = int(violate_step_tensor.sum().item())
+        num_violations = violate_step_tensor.sum()
         
-        # Success count calculation: before + arrivals - current - failed
-        # Careful: arrivals_counts_step only includes those that ENTERED or were IMMEDIATELY FAILED.
-        # So count_before + arrivals_counts_step is the total tasks we dealt with.
+        # Success count calculation
         success_qos_tensor = (count_before + self.arrival_counts_step - self.backlog_counts - violate_step_tensor).clamp(min=0)
         
         total_drift = ops.calculate_lyapunov_drift(current_backlog_total, node_arrival_matrix, self.cpu_alloc_matrix * self.slot_duration)
@@ -408,35 +406,33 @@ class MatrixPhysicalEngine:
         total_energy = comp_energy + trans_energy_total
         
         f1 = total_drift + self.lypa_coef * total_energy
-        self.reward_global_accumulator += f1.item()
+        self.reward_global_accumulator += f1
         
-        # Refined QoS penalty: Use a smaller factor or linear penalty for violations
-        # Original: omega_1 * exp(omega_2 * num_violations) -> 1000 * exp(0.12 * 800) = Infinity
-        # New: omega_1 * (num_violations^1.5) or smaller exp
-        qos_penalty = self.omega_1 * torch.pow(torch.tensor(num_violations, device=self.device), 1.2)
+        # Refined QoS penalty
+        qos_penalty = self.omega_1 * torch.pow(num_violations.float(), 1.2)
         
         reward = -(f1 + qos_penalty)
         obs = {
             "total_drift": total_drift,
             "task_reqs": self.current_task_reqs.clone(),
-            "backlog": self.backlog_queue.sum(dim=-1).clone(),
+            "backlog": current_backlog_total.clone(),
             "cpu_alloc": self.cpu_alloc_matrix.clone()
         }
         info = {
             "num_tasks": self.current_num_tasks,
-            "immediate_fails": int(self.immediate_fails.sum().item()),
-            "expired_count": int(violate_step_tensor.sum().item() - self.immediate_fails.sum().item()),
-            "remaining": int(self.backlog_counts.sum().item()),
-            "success_qos": {i: success_qos_tensor[i].cpu().numpy() for i in range(self.num_nodes)},
-            "violate_qos": {i: violate_step_tensor[i].cpu().numpy() for i in range(self.num_nodes)},
+            "immediate_fails": self.immediate_fails.sum(),
+            "expired_count": violate_step_tensor.sum() - self.immediate_fails.sum(),
+            "remaining": self.backlog_counts.sum(),
+            "success_qos": success_qos_tensor, 
+            "violate_qos": violate_step_tensor,
             "arrival_matrix": self.arrival_counts_step.clone(),
             "fail_reasons": {
-                "deadline": self.fail_deadline.sum().item(),
-                "hardware": self.fail_hw.sum().item(),
-                "queue_full": self.fail_queue.sum().item(),
-                "invalid_placement": self.fail_placement.sum().item(),
-                "hw_deficit_per_svc": self.service_hw_deficit.cpu().numpy(),
-                "hw_fail_count_per_svc": self.service_hw_fail_count.cpu().numpy()
+                "deadline": self.fail_deadline.sum(),
+                "hardware": self.fail_hw.sum(),
+                "queue_full": self.fail_queue.sum(),
+                "invalid_placement": self.fail_placement.sum(),
+                "hw_deficit_per_svc": self.service_hw_deficit,
+                "hw_fail_count_per_svc": self.service_hw_fail_count
             }
         }
         res = {
