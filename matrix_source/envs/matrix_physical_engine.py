@@ -206,9 +206,6 @@ class MatrixPhysicalEngine:
         n_idx_flat = node_indices.reshape(-1).long()
         m_idx_flat = model_indices.reshape(-1).long()
         
-        # DEBUG: If error persists, checking these shapes is key
-        print(f"DEBUG: T_idx: {t_idx_flat.shape}, N_idx: {n_idx_flat.shape}, Tracking: {self.prev_node_indices.shape}")
-        
         self.prev_node_indices[t_idx_flat] = n_idx_flat
         self.prev_model_indices[t_idx_flat] = m_idx_flat
         
@@ -227,7 +224,6 @@ class MatrixPhysicalEngine:
         n_at = node_indices.reshape(-1).long()
         s_at = svc_indices.reshape(-1).long()
         ones = torch.ones(n_at.shape[0], dtype=torch.float, device=self.device)
-        print(f"DEBUG: Index_put: {n_at.shape}, {s_at.shape}, Target: {self.arrival_counts_step.shape}")
         self.arrival_counts_step.index_put_((n_at, s_at), ones, accumulate=True)
         self.current_task_reqs.zero_()
         
