@@ -201,13 +201,17 @@ class MatrixPhysicalEngine:
 
     def process_arrivals(self, terminal_indices, svc_indices, node_indices, model_indices, task_batch_sizes, task_deadlines, task_accuracies):
         t0 = time.perf_counter()
-        # Update action history - using scatter_ for maximum robustness on CUDA
-        idx = terminal_indices.view(-1).long()
-        val_n = node_indices.view(-1).long()
-        val_m = model_indices.view(-1).long()
-        self.prev_node_indices.scatter_(0, idx, val_n)
-        self.prev_model_indices.scatter_(0, idx, val_m)
-
+        # Update action history - Flattening strictly for CUDA
+        t_idx_flat = terminal_indices.reshape(-1).long()
+        n_idx_flat = node_indices.reshape(-1).long()
+        m_idx_flat = model_indices.reshape(-1).long()
+        
+        # DEBUG: If error persists, checking these shapes is key
+        print(f"DEBUG: T_idx: {t_idx_flat.shape}, N_idx: {n_idx_flat.shape}, Tracking: {self.prev_node_indices.shape}")
+        
+        self.prev_node_indices[t_idx_flat] = n_idx_flat
+        self.prev_model_indices[t_idx_flat] = m_idx_flat
+        
         num_tasks = len(svc_indices)
         node_arrival_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
         f_min_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
@@ -218,8 +222,15 @@ class MatrixPhysicalEngine:
         self.service_hw_deficit.zero_()
         self.service_hw_fail_count.zero_()
         self.arrival_counts_step.zero_()
-        self.arrival_counts_step.index_put_((node_indices.view(-1).long(), svc_indices.view(-1).long()), torch.ones_like(svc_indices.view(-1), dtype=torch.float), accumulate=True)
+        
+        # Enforce Long 1D for index_put_
+        n_at = node_indices.reshape(-1).long()
+        s_at = svc_indices.reshape(-1).long()
+        ones = torch.ones(n_at.shape[0], dtype=torch.float, device=self.device)
+        print(f"DEBUG: Index_put: {n_at.shape}, {s_at.shape}, Target: {self.arrival_counts_step.shape}")
+        self.arrival_counts_step.index_put_((n_at, s_at), ones, accumulate=True)
         self.current_task_reqs.zero_()
+        
 
         if num_tasks == 0:
             self.current_num_tasks = 0
