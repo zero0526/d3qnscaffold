@@ -242,7 +242,53 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
             # 4. Checkpoint for next round
             agent.save_base_initial()
 
+    def perform_scaffold_aggregation_v2(self, agent, round_idx: int = 0):
+        """
+        Cluster-Based Federated Aggregation for D3QNAgentV2 (split backbone/head).
+        Called once per federated round, after all local learning steps are done.
 
+        Phase 1 & 2: averages backbone weights per cluster.
+        Phase 3:     backbone frozen, only control variates are synced.
+        Always:      c_b and c_h aggregated per cluster.
+        """
+        if not agent.use_scaffold:
+            return
+
+        phase = agent._get_phase(round_idx)
+
+        with torch.no_grad():
+            for node_id, terminal_ids in self.node_to_terminals.items():
+                if not terminal_ids:
+                    continue
+
+                t_ids = torch.tensor(terminal_ids, device=agent.device)
+
+                # Step 1: Update local control variates before we read them
+                agent.update_local_cvariates(t_ids)
+
+                # Step 2: Aggregate backbone weights (Phase 1 & 2 only)
+                if phase < 3:
+                    bone_params = list(agent.eval_net.backbone.parameters())
+                    tgt_bone_params = list(agent.target_net.backbone.parameters())
+                    for p, tp in zip(bone_params, tgt_bone_params):
+                        cluster_mean = p.data[t_ids].mean(dim=0, keepdim=True)
+                        p.data[t_ids] = cluster_mean.expand(len(terminal_ids), *cluster_mean.shape[1:])
+                        tp.data[t_ids] = p.data[t_ids]  # sync target
+
+                # Step 3: Aggregate backbone control variates -> new c_b_global
+                c_b_local_slices = agent.get_c_b_local(t_ids)
+                c_b_new_global = [c.mean(dim=0, keepdim=True).expand(len(terminal_ids), *c.shape[1:])
+                                for c in c_b_local_slices]
+                agent.set_c_b_global(t_ids, c_b_new_global)
+
+                # Step 4: Aggregate head control variates -> new c_h_global
+                c_h_local_slices = agent.get_c_h_local(t_ids)
+                c_h_new_global = [c.mean(dim=0, keepdim=True).expand(len(terminal_ids), *c.shape[1:])
+                                for c in c_h_local_slices]
+                agent.set_c_h_global(t_ids, c_h_new_global)
+
+        # Reset grad accumulators and step counters for next round
+        agent.save_base_initial()
 
     def run_training(self, trainer: Trainer):
         num_eps = trainer.config.hyper_neural['NUMOF_TRAIN_EP']
@@ -320,7 +366,7 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
 
             # update ep and history
             # Federated Aggregation (SCAFFOLD) for lower agents
-            self.perform_scaffold_aggregation(trainer.shared_lower_agent)
+            self.perform_scaffold_aggregation_v2(trainer.shared_lower_agent)
 
             trainer.update_rates(ep)
             trainer.aggregator.store_history()

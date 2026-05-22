@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from matrix_source.agents.buffer.ReplayBuffer import MultiAgentReplayBuffer
 from matrix_source.agents.buffer.PrioritizedReplayBuffer import MultiAgentPrioritizedReplayBuffer
-
+import random
 
 class MultiInstanceLinear(nn.Module):
     """
@@ -129,7 +129,7 @@ class MF(nn.Module):
 class D3QNAgent:
     def __init__(self, node_id, node_type, state_dim, action_dim, u_action_dim, mf_hidden_sizes, mf_lr, buffer_min_size,
                  hidden_sizes=(128, 64), lr=1e-4, gamma=0.99, alpha=0.005, buffer_size=100000, batch_size=64,
-                 exclude_zero=False, num_instances=1, device=None, use_per=False, n_step=1, logs_q=False):
+                 exclude_zero=False, num_instances=1, device=None, use_per=False, n_step=1, logs_q=False, use_scaffold=False):
         self.node_id = node_id
         self.node_type = node_type
         self.action_dim = action_dim
@@ -163,9 +163,37 @@ class D3QNAgent:
         self.use_per = use_per
         self.memory = MultiAgentReplayBuffer(num_instances, node_type, buffer_size, state_dim, action_dim,u_action_dim, self.device)
 
+        # SCAFFOLD Control Variates
+        self.use_scaffold = use_scaffold
+        if self.use_scaffold:
+            # Base parameters are those in eval_net.l1, norm1, l2, norm2
+            # We track them per instance: (num_instances, weight_dims)
+            self.c_i = [] # Local control variates per instance
+            self.c_global = [] # Global/Edge control variates (replicated for ease of use)
+            self.grad_sum = [] # Accumulator for raw gradients
+            self.initial_base_params = [] # Weights at the start of a round
+            
+            for p in self.eval_net.get_base_params():
+                # p.shape: (num_instances, ...)
+                self.c_i.append(torch.zeros_like(p).to(self.device))
+                self.c_global.append(torch.zeros_like(p).to(self.device))
+                self.grad_sum.append(torch.zeros_like(p).to(self.device))
+                self.initial_base_params.append(p.data.clone().to(self.device))
+            
+            self.steps_in_round = torch.zeros(num_instances, dtype=torch.long, device=self.device)
+
         # Logging
         self.prev_loss = 0.0
         self.learn_step_counter = 0
+
+    def save_base_initial(self):
+        """Checkpoint weights at the start of a federated round for SCAFFOLD."""
+        if not self.use_scaffold: return
+        with torch.no_grad():
+            for i, p in enumerate(self.eval_net.get_base_params()):
+                self.initial_base_params[i].copy_(p.data)
+                self.grad_sum[i].zero_()
+            self.steps_in_round.zero_()
 
     def choose_action(self, state, prev_mf, epsilon, zeta, mask=None, agent_idx=0):
         # Single agent usage (fallback or legacy)
@@ -240,18 +268,21 @@ class D3QNAgent:
                 if self.exclude_zero and self.u_action_dim > 1:
                     q_values[:, 0] -= 1e10
 
-                probs_boltzmann = torch.softmax(q_values * zeta, dim=1)
+                # probs_boltzmann = torch.softmax(q_values * zeta, dim=1)
+                # random_probs = torch.ones_like(q_values)
+                probs_boltzmann = torch.softmax(q_values, dim=1)
                 random_probs = torch.ones_like(q_values)
+
                 if masks_batch is not None:
                     m = masks_batch[indices]
                     random_probs = m / m.sum(dim=1, keepdim=True).clamp(min=1e-8)
                 else:
                     random_probs = random_probs / self.u_action_dim
-                # zeta factor controls the exploration temperature
-                final_probs = (1.0 - epsilon) * probs_boltzmann + epsilon * random_probs
-                final_probs = probs_boltzmann
 
-                final_actions[indices] = torch.multinomial(final_probs, 1).squeeze(1)
+                # if random.random() < epsilon:
+                #     final_actions[indices] = torch.multinomial(random_probs, 1).squeeze(1)
+                # else:
+                final_actions[indices] = torch.multinomial(probs_boltzmann, 1).squeeze(1)
 
         return final_actions.tolist()
 
@@ -316,31 +347,48 @@ class D3QNAgent:
         loss = self.loss_fn(q_eval, q_target).mean()
         self.optimizer.zero_grad()
         loss.backward()
+        
+        # SCAFFOLD Gradient Correction
+        if self.use_scaffold:
+            with torch.no_grad():
+                # Identify which agents were in this batch
+                unique_ids = torch.unique(agent_ids)
+                
+                # Create mask for instances in batch: (num_instances, 1, 1, ...)
+                for i, p in enumerate(self.eval_net.get_base_params()):
+                    if p.grad is not None:
+                        # Create instance mask
+                        mask_dims = [self.num_instances] + [1] * (p.data.dim() - 1)
+                        mask = torch.zeros(mask_dims, device=self.device)
+                        mask[unique_ids] = 1.0
+                        
+                        raw_g = p.grad.data.clone()
+                        
+                        # Apply correction ONLY to active instances
+                        # For inactive instances, p.grad remains 0
+                        p.grad.data = raw_g + mask * (self.c_global[i] - self.c_i[i])
+                        
+                        # Update grad_sum for active instances
+                        self.grad_sum[i] += raw_g
+                
+                # Update step count per instance in batch
+                self.steps_in_round[unique_ids] += 1
+
         torch.nn.utils.clip_grad_norm_(self.eval_net.parameters(), max_norm=1.0)
         self.optimizer.step()
 
         # Update logging/target
         self.learn_step_counter += 1
-        
-        q_min = q_eval.min().item()
-        q_max = q_eval.max().item()
-        q_mean = q_eval.mean().item()
-
-        step=10
-        if self.node_type=="Terminal_Group":step=100
-        if self.learn_step_counter % step == 0:
-            print(f"[{self.node_type} Group] Step {self.learn_step_counter:5d} | TD Loss: {loss.item():.5f} | Q [Min: {q_min:.3f}, Max: {q_max:.3f}, Mean: {q_mean:.3f}]")
-        
         self._soft_update()
-        
+
         if self.logs_q:
             return {
-                "loss": loss.item(),
-                "q_min": q_min,
-                "q_max": q_max,
-                "q_mean": q_mean
+                "loss": loss.detach(),
+                "q_min": q_eval.min().detach(),
+                "q_max": q_eval.max().detach(),
+                "q_mean": q_eval.mean().detach()
             }
-        return loss.item()
+        return loss.detach()
 
     def _soft_update(self):
         with torch.no_grad():

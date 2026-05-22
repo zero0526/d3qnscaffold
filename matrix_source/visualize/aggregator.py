@@ -52,6 +52,7 @@ class MetricsAggregator:
         self.episode_remaining_tasks = []
         self.episode_assigned_list = []
         self.episode_failed_list = []
+        self.episode_realized_delay = []
         
         # Training/State tracking
         self.episode_upper_mf_losses = []
@@ -113,6 +114,12 @@ class MetricsAggregator:
         self.episode_remaining_tasks.append(info.get("remaining", 0))
         self.episode_assigned_list.append(info.get("num_tasks", 0))
         self.episode_failed_list.append(info.get("immediate_fails", 0) + info.get("expired_count", 0))
+        
+        r_delay = info.get("realized_delay", {})
+        if r_delay:
+            # Vectorized mean of all delays in the dict (each value is a tensor)
+            delays = [torch.mean(v) for v in r_delay.values()]
+            self.episode_realized_delay.append(torch.stack(delays).mean())
 
         # Failure reasons
         reasons = info.get("fail_reasons")
@@ -124,118 +131,81 @@ class MetricsAggregator:
         self.eps_backlog.append(backlog)
 
     def record_td_losses(self, upper_losses=None, lower_losses=None):
-        def _f(x):
-            if isinstance(x, dict): return float(x.get("loss", 0.0))
-            if hasattr(x, "item"): return x.item()
-            return float(x)
+        def _extract(x):
+            if isinstance(x, dict): x = x.get("loss", 0.0)
+            return x.detach() if hasattr(x, "detach") else torch.tensor(float(x))
         if upper_losses is not None:
-            val = np.mean([_f(l) for l in upper_losses]) if isinstance(upper_losses, list) else _f(upper_losses)
-            self.episode_upper_td_losses.append(val)
+            self.episode_upper_td_losses.append(_extract(upper_losses))
         if lower_losses is not None:
-            val = np.mean([_f(l) for l in lower_losses]) if isinstance(lower_losses, list) else _f(lower_losses)
-            self.episode_lower_td_losses.append(val)
+            self.episode_lower_td_losses.append(_extract(lower_losses))
 
     def record_zeta(self, lower, upper):
         self.curr_zeta_lower = lower
         self.curr_zeta_upper = upper
         
     def record_q_stats(self, node_type, q_min, q_max, q_mean):
-        def _f(x): return x.item() if hasattr(x, "item") else float(x)
         if node_type == "Edge_Group":
-            self.episode_upper_q_min.append(_f(q_min))
-            self.episode_upper_q_max.append(_f(q_max))
-            self.episode_upper_q_mean.append(_f(q_mean))
+            self.episode_upper_q_min.append(q_min.detach() if hasattr(q_min, "detach") else torch.tensor(q_min))
+            self.episode_upper_q_max.append(q_max.detach() if hasattr(q_max, "detach") else torch.tensor(q_max))
+            self.episode_upper_q_mean.append(q_mean.detach() if hasattr(q_mean, "detach") else torch.tensor(q_mean))
         else:
-            self.episode_lower_q_min.append(_f(q_min))
-            self.episode_lower_q_max.append(_f(q_max))
-            self.episode_lower_q_mean.append(_f(q_mean))
+            self.episode_lower_q_min.append(q_min.detach() if hasattr(q_min, "detach") else torch.tensor(q_min))
+            self.episode_lower_q_max.append(q_max.detach() if hasattr(q_max, "detach") else torch.tensor(q_max))
+            self.episode_lower_q_mean.append(q_mean.detach() if hasattr(q_mean, "detach") else torch.tensor(q_mean))
 
     def store_history(self):
-        """Processes collected episode metrics and stores them in history. Reset for next episode."""
-        def to_float_list(arr):
-            if not arr: return []
-            res = []
-            for v in arr:
-                if isinstance(v, torch.Tensor):
-                    res.append(float(v.detach().cpu().sum().item()))
-                elif isinstance(v, dict):
-                    res.append(sum(float(val.item() if hasattr(val, 'item') else val) for val in v.values()))
-                else: res.append(float(v))
-            return res
+        """Vectorized aggregation on GPU to avoid CPU sync points."""
+        def _get_avg(arr, key):
+            if not arr: return self.history[key][-1] if self.history[key] else 0.0
+            # Perform stack and mean on device
+            t = torch.stack([x if isinstance(x, torch.Tensor) else torch.tensor(x) for x in arr])
+            return float(t.float().mean().item())
 
-        # Rewards and Energy
-        u_rw = to_float_list(self.episode_upper_rewards)
-        l_rw = to_float_list(self.episode_lower_rewards)
-        self.history["total_reward"].append(float(np.sum(u_rw) + np.sum(l_rw)))
-        
-        energy_vals = to_float_list(self.episode_energy)
-        total_energy = float(np.sum(energy_vals))
-        self.history["total_energy"].append(total_energy)
+        def _get_sum(arr, key):
+            if not arr: return 0.0
+            t = torch.stack([x if isinstance(x, torch.Tensor) else torch.tensor(x) for x in arr])
+            return float(t.float().sum().item())
 
-        # Process step matrices (Batch average)
-        if self.eps_f_alloc:
-            # Stack all tensors and mean across time (dim 0)
-            self.eps_f_alloc = [x.detach().cpu() if hasattr(x, "detach") else torch.tensor(x) for x in self.eps_f_alloc]
-            self.eps_f_all = torch.stack(self.eps_f_alloc).mean(dim=0).numpy()
-            self.eps_arrivals = [x.detach().cpu() if hasattr(x, "detach") else torch.tensor(x) for x in self.eps_arrivals]
-            self.eps_arr_all = torch.stack(self.eps_arrivals).mean(dim=0).numpy()
-            self.eps_backlog = [x.detach().cpu() if hasattr(x, "detach") else torch.tensor(x) for x in self.eps_backlog]
-            self.eps_back_all = torch.stack(self.eps_backlog).mean(dim=0).numpy()
+        # Sync Rewards and Energy
+        total_u_rw = _get_sum(self.episode_upper_rewards, "u_rw")
+        total_l_rw = _get_sum(self.episode_lower_rewards, "l_rw")
+        self.history["total_reward"].append(total_u_rw + total_l_rw)
+        self.history["total_energy"].append(_get_sum(self.episode_energy, "total_energy"))
 
-        # Process failure reasons
-        for sr in self.episode_step_fail_reasons:
-            for k in ['deadline', 'hardware', 'queue_full', 'invalid_placement']:
-                v = sr.get(k, 0)
-                self.episode_fail_reasons[k] += float(v.item() if hasattr(v, "item") else v)
-            
-            # Service-specific hardware stats
-            hd, hc = sr.get("hw_deficit_per_svc"), sr.get("hw_fail_count_per_svc")
-            if hd is not None:
-                val = hd.detach().cpu().numpy() if hasattr(hd, "detach") else hd
-                if self.eps_hw_deficit is None: self.eps_hw_deficit = val.copy()
-                else: self.eps_hw_deficit += val
-            if hc is not None:
-                val = hc.detach().cpu().numpy() if hasattr(hc, "detach") else hc
-                if self.eps_hw_fail_count is None: self.eps_hw_fail_count = val.copy()
-                else: self.eps_hw_fail_count += val
-
-        # Training Averages
-        def _avg(arr, key):
-            if not arr: return self.history[key][-1] if self.history[key] else 0
-            return float(np.mean(arr))
-
-        self.history["avg_upper_mf_loss"].append(_avg(self.episode_upper_mf_losses, "avg_upper_mf_loss"))
-        self.history["avg_lower_mf_loss"].append(_avg(self.episode_lower_mf_losses, "avg_lower_mf_loss"))
-        self.history["avg_upper_td_loss"].append(_avg(self.episode_upper_td_losses, "avg_upper_td_loss"))
-        self.history["avg_lower_td_loss"].append(_avg(self.episode_lower_td_losses, "avg_lower_td_loss"))
+        # Training Averages (Vectorized)
+        self.history["avg_upper_mf_loss"].append(_get_avg(self.episode_upper_mf_losses, "avg_upper_mf_loss"))
+        self.history["avg_lower_mf_loss"].append(_get_avg(self.episode_lower_mf_losses, "avg_lower_mf_loss"))
+        self.history["avg_upper_td_loss"].append(_get_avg(self.episode_upper_td_losses, "avg_upper_td_loss"))
+        self.history["avg_lower_td_loss"].append(_get_avg(self.episode_lower_td_losses, "avg_lower_td_loss"))
         
         self.history["zeta_lower"].append(self.curr_zeta_lower)
         self.history["zeta_upper"].append(self.curr_zeta_upper)
 
         for k in ["upper_q_min", "upper_q_max", "upper_q_mean", "lower_q_min", "lower_q_max", "lower_q_mean"]:
-            self.history[k].append(_avg(getattr(self, f"episode_{k}"), k))
+            self.history[k].append(_get_avg(getattr(self, f"episode_{k}"), k))
 
         # QoS and Completion
-        s_list, v_list = to_float_list(self.episode_success_qos), to_float_list(self.episode_violate_qos)
-        s_sum, v_sum = np.sum(s_list), np.sum(v_list)
-        self.history["qos_success_rate"].append(s_sum / (s_sum + v_sum) if (s_sum + v_sum) > 0 else 0)
+        success = _get_sum(self.episode_success_qos, "success")
+        violate = _get_sum(self.episode_violate_qos, "violate")
+        self.history["qos_success_rate"].append(success / (success + violate) if (success + violate) > 0 else 0)
         
-        assigned = np.sum(to_float_list(self.episode_assigned_list))
-        failed = np.sum(to_float_list(self.episode_failed_list))
-        rem = self.episode_remaining_tasks[-1]
-        rem_val = float(rem.item() if hasattr(rem, "item") else rem)
+        assigned = _get_sum(self.episode_assigned_list, "assigned")
+        failed = _get_sum(self.episode_failed_list, "failed")
+        rem_val = float(self.episode_remaining_tasks[-1].item() if hasattr(self.episode_remaining_tasks[-1], "item") else self.episode_remaining_tasks[-1])
+        
         self.history["completion_rate"].append((assigned - failed - rem_val) / assigned if assigned > 0 else 0)
+        self.history["avg_backlog_drift"].append(_get_avg(self.episode_backlog_drift, "avg_backlog_drift"))
+        self.history["avg_remaining_tasks"].append(_get_avg(self.episode_remaining_tasks, "avg_remaining_tasks"))
+        self.history["avg_realized_delay"].append(_get_avg(self.episode_realized_delay, "avg_realized_delay"))
+        self.history["total_violations"].append(violate)
         
-        self.history["avg_backlog_drift"].append(_avg(to_float_list(self.episode_backlog_drift), "avg_backlog_drift"))
-        self.history["avg_remaining_tasks"].append(_avg(to_float_list(self.episode_remaining_tasks), "avg_remaining_tasks"))
-        self.history["qos_rate"].append(s_sum / (v_sum if v_sum > 0 else 1.0))
-        self.history["total_violations"].append(float(v_sum))
-        
+        # Additional metrics for restored plots
+        self.history["qos_rate"].append(success / (violate if violate > 0 else 1.0))
+
         self.episode_count += 1
         if self.episode_count % 50 == 0:
             self.plot_history(ep=self.episode_count)
             self.save_history_csv()
-        
         self.reset_episode()
 
     def report_episode(self, ep):
@@ -246,19 +216,42 @@ class MetricsAggregator:
         cr = self.history["completion_rate"][-1] if self.history["completion_rate"] else 0
         self.log(f"EP {ep:4d} | Rew: {tr:8.2f} | Energy: {en:8.2f} | QoS: {qos:6.2%} | Comp: {cr:6.2%}")
 
+    def _moving_average(self, data, window=10):
+        if len(data) < window: return data
+        return np.convolve(data, np.ones(window)/window, mode='valid')
+
     def plot_history(self, ep=None):
         if not self.history["total_reward"]: return
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        axes[0, 0].plot(self.history["total_reward"], label="Total Reward")
-        axes[0, 0].set_title("Reward Convergence")
-        axes[0, 1].plot(self.history["qos_success_rate"], label="QoS Success Rate", color='green')
-        axes[0, 1].set_title("QoS Stability")
-        axes[1, 0].plot(self.history["total_energy"], label="Total Energy", color='red')
-        axes[1, 0].set_title("Energy Consumption")
-        axes[1, 1].plot(self.history["completion_rate"], label="Completion Rate", color='blue')
-        axes[1, 1].set_title("Task Throughput")
-        for ax in axes.flat: ax.legend(); ax.grid(True)
-        plt.tight_layout()
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        plt.suptitle(f"Training Progress (Episode {len(self.history['total_reward'])})", fontsize=16)
+        
+        window = 10
+        metrics = [
+            ("total_reward", "Reward Convergence", "blue"),
+            ("avg_backlog_drift", "System Stability (Drift)", "green"),
+            ("total_energy", "Energy Consumption", "orange"),
+            ("avg_realized_delay", "Delay Evolution", "red"),
+            ("qos_success_rate", "QoS Satisfaction", "purple"),
+            ("completion_rate", "Task Throughput", "blue")
+        ]
+
+        for i, (key, title, color) in enumerate(metrics):
+            ax = axes[i // 3, i % 3]
+            data = self.history[key]
+            
+            # Plot raw data with transparency
+            ax.plot(data, color=color, alpha=0.3, label="Raw")
+            
+            # Plot MA-10
+            if len(data) >= window:
+                ma_data = self._moving_average(data, window)
+                ax.plot(range(window-1, len(data)), ma_data, color=color, linewidth=2, label=f"MA-{window}")
+            
+            ax.set_title(title)
+            ax.legend()
+            ax.grid(True)
+            
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.savefig(os.path.join(cfg.plot_dir, f"training_progress_{ep if ep else 'latest'}.png"))
         plt.close()
 
