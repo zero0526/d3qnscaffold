@@ -156,14 +156,18 @@ class MetricsAggregator:
     def store_history(self):
         """Vectorized aggregation on GPU to avoid CPU sync points."""
         def _get_avg(arr, key):
-            if not arr: return self.history[key][-1] if self.history[key] else 0.0
+            # Filter None values
+            arr = [x for x in arr if x is not None]
+            if not arr: return self.history[key][-1] if self.history.get(key) else 0.0
             # Perform stack and mean on device
-            t = torch.stack([x if isinstance(x, torch.Tensor) else torch.tensor(x) for x in arr])
+            t = torch.stack([x if isinstance(x, torch.Tensor) else torch.tensor(float(x), device=self.device if hasattr(self, 'device') else 'cpu') for x in arr])
             return float(t.float().mean().item())
 
         def _get_sum(arr, key):
+            # Filter None values
+            arr = [x for x in arr if x is not None]
             if not arr: return 0.0
-            t = torch.stack([x if isinstance(x, torch.Tensor) else torch.tensor(x) for x in arr])
+            t = torch.stack([x if isinstance(x, torch.Tensor) else torch.tensor(float(x), device=self.device if hasattr(self, 'device') else 'cpu') for x in arr])
             return float(t.float().sum().item())
 
         # Sync Rewards and Energy

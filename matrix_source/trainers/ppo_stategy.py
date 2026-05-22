@@ -153,10 +153,7 @@ class PPOStrategy(AlgorithmStrategy):
             placement_matrix = trainer.env.engine.placement_matrix
 
         placements = placement_matrix[:, s_idx]  # (num_nodes, ...)
-        if placements.dim() == 2:
-            return placements.T  # (num_reqs, num_nodes)
-        else:
-            return placements.unsqueeze(0).expand(num_reqs, -1)  # (num_reqs, num_nodes)
+        return placements.T  # (num_reqs, num_nodes)
 
     def calculate_lower_masks(self, trainer, t_idx, s_idx, tasks_min_accuracy, placement_matrix=None):
         num_reqs = len(t_idx)
@@ -226,7 +223,7 @@ class PPOStrategy(AlgorithmStrategy):
         norm_rew = log_transform(reward / (rew_divisor if rew_divisor != 0 else 1.0))
 
         # 3. Handle MF training and transition storage (only if NOT frozen and NOT evaluating)
-        avg_mf_loss = None
+        avg_mf_loss = 0.0
         is_frozen = (self.phase == 'UPPER_ONLY')
 
         if not is_frozen and not self.is_evaluating:
@@ -251,7 +248,7 @@ class PPOStrategy(AlgorithmStrategy):
         norm_rew = log_transform(reward / (rew_divisor if rew_divisor != 0 else 1.0))
 
         # 2. Handle MF training and transition storage (if NOT frozen and NOT evaluating)
-        avg_mf_loss = None
+        avg_mf_loss = 0.0
         is_frozen = (self.phase == 'LOWER_ONLY')
 
         # Safely extract edge_states for metric recording
