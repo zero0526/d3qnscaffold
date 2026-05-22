@@ -74,8 +74,8 @@ class MatrixSixGEnvironment:
             self.prof.clear()
 
         return {
-            "reward": results['reward'].item(),
-            "energy": results['energy'].item(),
+            "reward": results['reward'],
+            "energy": results['energy'],
             "violations": results['violations'],
             "obs": results['obs'],
             "info": results["info"],

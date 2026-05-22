@@ -119,13 +119,15 @@ class MetricsAggregator:
         if reasons: self.episode_step_fail_reasons.append(reasons)
 
     def add_step_matrices(self, f_alloc, arrivals, backlog):
-        def _n(x): return x.detach().cpu().numpy() if hasattr(x, "detach") else x
-        self.eps_f_alloc.append(_n(f_alloc))
-        self.eps_arrivals.append(_n(arrivals))
-        self.eps_backlog.append(_n(backlog))
+        self.eps_f_alloc.append(f_alloc)
+        self.eps_arrivals.append(arrivals)
+        self.eps_backlog.append(backlog)
 
     def record_td_losses(self, upper_losses=None, lower_losses=None):
-        def _f(x): return x.item() if hasattr(x, "item") else float(x)
+        def _f(x):
+            if isinstance(x, dict): return float(x.get("loss", 0.0))
+            if hasattr(x, "item"): return x.item()
+            return float(x)
         if upper_losses is not None:
             val = np.mean([_f(l) for l in upper_losses]) if isinstance(upper_losses, list) else _f(upper_losses)
             self.episode_upper_td_losses.append(val)
@@ -169,6 +171,16 @@ class MetricsAggregator:
         energy_vals = to_float_list(self.episode_energy)
         total_energy = float(np.sum(energy_vals))
         self.history["total_energy"].append(total_energy)
+
+        # Process step matrices (Batch average)
+        if self.eps_f_alloc:
+            # Stack all tensors and mean across time (dim 0)
+            self.eps_f_alloc = [x.detach().cpu() if hasattr(x, "detach") else torch.tensor(x) for x in self.eps_f_alloc]
+            self.eps_f_all = torch.stack(self.eps_f_alloc).mean(dim=0).numpy()
+            self.eps_arrivals = [x.detach().cpu() if hasattr(x, "detach") else torch.tensor(x) for x in self.eps_arrivals]
+            self.eps_arr_all = torch.stack(self.eps_arrivals).mean(dim=0).numpy()
+            self.eps_backlog = [x.detach().cpu() if hasattr(x, "detach") else torch.tensor(x) for x in self.eps_backlog]
+            self.eps_back_all = torch.stack(self.eps_backlog).mean(dim=0).numpy()
 
         # Process failure reasons
         for sr in self.episode_step_fail_reasons:
