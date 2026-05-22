@@ -202,8 +202,8 @@ class MatrixPhysicalEngine:
     def process_arrivals(self, terminal_indices, svc_indices, node_indices, model_indices, task_batch_sizes, task_deadlines, task_accuracies):
         t0 = time.perf_counter()
         # Update action history
-        self.prev_node_indices.index_copy_(0, terminal_indices.view(-1), node_indices.view(-1))
-        self.prev_model_indices.index_copy_(0, terminal_indices.view(-1), model_indices.view(-1))
+        self.prev_node_indices[terminal_indices.view(-1).long()] = node_indices.view(-1).long()
+        self.prev_model_indices[terminal_indices.view(-1).long()] = model_indices.view(-1).long()
 
         num_tasks = len(svc_indices)
         node_arrival_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
@@ -215,7 +215,7 @@ class MatrixPhysicalEngine:
         self.service_hw_deficit.zero_()
         self.service_hw_fail_count.zero_()
         self.arrival_counts_step.zero_()
-        self.arrival_counts_step.index_put_((node_indices, svc_indices), torch.ones_like(svc_indices, dtype=torch.float), accumulate=True)
+        self.arrival_counts_step.index_put_((node_indices.view(-1).long(), svc_indices.view(-1).long()), torch.ones_like(svc_indices.view(-1), dtype=torch.float), accumulate=True)
         self.current_task_reqs.zero_()
 
         if num_tasks == 0:

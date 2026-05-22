@@ -251,11 +251,11 @@ class D3QNAgent:
                     random_probs = random_probs / self.u_action_dim
 
                 if random.random() < epsilon:
-                    return random_probs
+                    final_actions[indices] = torch.multinomial(random_probs, 1).squeeze(1)
+                else:
+                    final_actions[indices] = torch.multinomial(probs_boltzmann, 1).squeeze(1)
 
-                final_actions[indices] = torch.multinomial(probs_boltzmann, 1).squeeze(1)
-
-        return final_actions.tolist()
+        return final_actions
 
     def store_transition_train_mf_batch(self, states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids, masks=None, next_masks=None):
         self.memory.add_batch(states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids, masks=masks, next_masks=next_masks)

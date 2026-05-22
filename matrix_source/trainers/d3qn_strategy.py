@@ -93,7 +93,7 @@ class D3QNStrategy(AlgorithmStrategy):
             agent_indices=torch.arange(trainer.num_terminals, device=trainer.device)
         )
         
-        a_ids = torch.tensor(batch_actions, device=trainer.device)
+        a_ids = batch_actions.view(-1).long()
         return a_ids // trainer.max_models, a_ids % trainer.max_models, masks
 
     @staticmethod
