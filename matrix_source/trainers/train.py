@@ -7,7 +7,7 @@ from matrix_source.trainers.ppo_stategy import PPOStrategy
 class Trainer:
     def __init__(self, strategy=None):
         self.config = cfg
-        self.device = cfg.hyper_neural.get('DEVICE', 'cpu')
+        self.device = cfg.hyper_neural.get('DEVICE', cfg.device)
         
         # 1. Initialize Environment & Workload
         self.env = MatrixSixGEnvironment(config=cfg, device=self.device)
