@@ -267,8 +267,8 @@ class D3QNAgent:
         pmf = prev_mf_batch.to(self.device) if torch.is_tensor(prev_mf_batch) else torch.FloatTensor(prev_mf_batch).to(self.device)
         gt_mf = ground_truth_mf_batch.to(self.device) if torch.is_tensor(ground_truth_mf_batch) else torch.FloatTensor(ground_truth_mf_batch).to(self.device)
         
-        pred_mf = self.mf_net(torch.cat([s, pmf], dim=-1), indices=agent_ids)
-        loss = self.loss_fn(pred_mf, gt_mf).mean()
+        pred_mf = self.mf_net(torch.cat([s[agent_ids], pmf[agent_ids]], dim=-1), indices=agent_ids)
+        loss = self.loss_fn(pred_mf, gt_mf[agent_ids]).mean()
         
         self.mf_optimizer.zero_grad()
         loss.backward()

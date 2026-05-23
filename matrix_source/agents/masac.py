@@ -10,7 +10,7 @@ import torch.optim as optim
 from matrix_source.agents.base import MultiInstanceLinear, MultiInstanceRMSNorm, MF
 from matrix_source.agents.buffer.sac_buffer import MultiAgentSACReplayBuffer
 
-DistType = Literal["gaussian", "dirichlet"]
+DistType = Literal["gaussian"]
 
 # -----------------------------
 # Networks
@@ -92,55 +92,6 @@ class MFGaussianActor(nn.Module):
         log_prob = normal.log_prob(z) - (2 * (math.log(2) - z - F.softplus(-2 * z)))
         log_prob = log_prob.sum(dim=-1, keepdim=True)
         return action, log_prob
-
-
-class MFDirichletActor(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, mf_dim:int= None, hidden_dim: int = 256, num_instances=1):
-        super().__init__()
-        self.action_dim = action_dim
-        self.num_instances = num_instances
-        if not mf_dim:
-            mf_dim=action_dim
-        self.l1 = MultiInstanceLinear(num_instances, state_dim + mf_dim, hidden_dim)
-        self.norm1 = MultiInstanceRMSNorm(num_instances, hidden_dim)
-        self.l2 = MultiInstanceLinear(num_instances, hidden_dim, hidden_dim)
-        self.norm2 = MultiInstanceRMSNorm(num_instances, hidden_dim)
-        
-        self.alpha_head = MultiInstanceLinear(num_instances, hidden_dim, action_dim)
-
-    def forward(self, state, pred_mf, indices=None):
-        x = torch.cat([state, pred_mf], dim=-1)
-        x = F.silu(self.norm1(self.l1(x, indices), indices))
-        x = F.silu(self.norm2(self.l2(x, indices), indices))
-        alpha = F.softplus(self.alpha_head(x, indices)) + 0.01
-        return alpha
-
-    def sample(self, state, pred_mf, indices=None, deterministic: bool = False):
-        alpha = self.forward(state, pred_mf, indices)
-
-        if deterministic:
-            alpha_sum = alpha.sum(dim=-1, keepdim=True)
-            mask = (alpha > 1).all(dim=-1, keepdim=True)
-            action_mode = (alpha - 1) / (alpha_sum - self.action_dim).clamp(min=1e-8)
-            action_mean = alpha / alpha_sum
-            action = torch.where(mask, action_mode, action_mean)
-            
-            dist = torch.distributions.Dirichlet(alpha)
-            log_prob = dist.log_prob(torch.clamp(action, 1e-6, 1.0 - 1e-6)).unsqueeze(-1)
-        else:
-            gamma_dist = torch.distributions.Gamma(alpha, 1.0)
-            gamma_sample = gamma_dist.rsample()
-            action = gamma_sample / gamma_sample.sum(dim=-1, keepdim=True)
-            action = torch.clamp(action, 1e-6, 1.0 - 1e-6)
-            action = action / action.sum(dim=-1, keepdim=True)
-            
-            log_prob = torch.distributions.Dirichlet(alpha).log_prob(action).unsqueeze(-1)
-
-        return action, log_prob
-
-
-
-
 
 class MFSACAgent:
     def __init__(

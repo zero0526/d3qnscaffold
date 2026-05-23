@@ -439,7 +439,7 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
             print(f"--- Global Metrics ---")
             print(f"Lower Samples: {trainer_obj.total_lower_steps} | Upper Samples: {trainer_obj.total_upper_steps}")
             print(f"Zeta Lower: {trainer_obj.zeta_lower:.4f} | Zeta Upper: {trainer_obj.zeta_upper:.4f}")
-            print(f"Current Epsilon (Edge N0): {trainer_obj.epsilons[0]:.4f}")
+            print(f"Current Epsilon (upper): {trainer_obj.eps_upper} (lower): {trainer_obj.lower_epsilons}")
 
         # Final Checkpoint Saving
         checkpoint_dir = getattr(trainer_obj.config, 'checkpoints', 'data/checkpoints')
