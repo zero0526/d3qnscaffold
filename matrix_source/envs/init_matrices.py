@@ -52,6 +52,7 @@ def init_static_matrices(config, device="cpu"):
         G.add_edge(link['source'], link['target'], weight=1.0, rate=rate)
     
     delay_matrix = torch.zeros((num_comp_nodes, num_comp_nodes), device=device)
+    hops = torch.zeros((num_comp_nodes, num_comp_nodes), device=device)
     for src_id, i in comp_node_id_to_idx.items():
         for dst_id, j in comp_node_id_to_idx.items():
             if src_id == dst_id:
@@ -63,6 +64,7 @@ def init_static_matrices(config, device="cpu"):
                 avg_rate = sum(rates) / len(rates) if rates else 1e9
                 num_hosts = max(len(path) - 1, 0)
                 delay_matrix[i, j] = num_hosts * (1.0 / avg_rate)
+                hops[i,j]= num_hosts
             except nx.NetworkXNoPath:
                 delay_matrix[i, j] = float('inf')
             
@@ -121,7 +123,8 @@ def init_static_matrices(config, device="cpu"):
         "edge_ids": edge_ids,
         "cloud_ids": cloud_ids,
         "agent_adj_matrix": agent_adj_matrix,
-        "edge_id_to_agent_idx": edge_id_to_agent_idx
+        "edge_id_to_agent_idx": edge_id_to_agent_idx,
+        "hops": hops,
     }
 
 def init_metadata_tensors(config, device="cpu"):

@@ -54,6 +54,10 @@ class MatrixPhysicalEngine:
         self.newly_placed_mask = torch.zeros((self.num_nodes, self.num_services), dtype=torch.bool, device=self.device)
         self.used_resources = torch.zeros((self.num_nodes, 4), device=self.device)
         
+        # New Q: Terminal ID tracking
+        self.terminal_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), dtype=torch.long, device=self.device) - 1
+        self.terminal_fail_counts = torch.zeros(self.num_terminals, device=self.device)
+        
         # Lower Level Action Tracking (for MARL)
         self.prev_node_indices = torch.zeros(self.num_terminals, dtype=torch.long, device=self.device)
         self.prev_model_indices = torch.zeros(self.num_terminals, dtype=torch.long, device=self.device)
@@ -99,6 +103,8 @@ class MatrixPhysicalEngine:
         self.fail_deadline.zero_()
         self.fail_hw.zero_()
         self.fail_queue.zero_()
+        self.terminal_fail_counts.zero_()
+        self.terminal_queue.fill_(-1)
         self.service_hw_deficit.zero_()
         self.service_hw_fail_count.zero_()
         self.arrival_counts_step.zero_()
@@ -216,6 +222,7 @@ class MatrixPhysicalEngine:
         self.fail_deadline.zero_()
         self.fail_hw.zero_()
         self.fail_queue.zero_()
+        self.terminal_fail_counts.zero_()
         self.service_hw_deficit.zero_()
         self.service_hw_fail_count.zero_()
         self.arrival_counts_step.zero_()
@@ -269,6 +276,7 @@ class MatrixPhysicalEngine:
             fs_p = svc_indices[~placement_mask]
             self.immediate_fails.index_put_((fn_p, fs_p), torch.ones_like(fs_p, dtype=torch.float), accumulate=True)
             self.fail_placement.index_put_((fn_p, fs_p), torch.ones_like(fs_p, dtype=torch.float), accumulate=True)
+            self.terminal_fail_counts.index_put_((terminal_indices[~placement_mask],), torch.ones_like(terminal_indices[~placement_mask], dtype=torch.float), accumulate=True)
 
         # Deadline calculation
         t_rem_raw = task_deadlines - trans_delays
@@ -282,6 +290,7 @@ class MatrixPhysicalEngine:
             fs = svc_indices[fails_idx]
             self.immediate_fails.index_put_((fn, fs), torch.ones_like(fs, dtype=torch.float), accumulate=True)
             self.fail_deadline.index_put_((fn, fs), torch.ones_like(fs, dtype=torch.float), accumulate=True)
+            self.terminal_fail_counts.index_put_((terminal_indices[fails_idx],), torch.ones_like(terminal_indices[fails_idx], dtype=torch.float), accumulate=True)
         
         if valid_mask.any():
             vn = node_indices[valid_mask]
@@ -304,6 +313,7 @@ class MatrixPhysicalEngine:
                 fhs = vs[fail_hw_mask]
                 self.immediate_fails.index_put_((fhn, fhs), torch.ones_like(fhs, dtype=torch.float), accumulate=True)
                 self.fail_hw.index_put_((fhn, fhs), torch.ones_like(fhs, dtype=torch.float), accumulate=True)
+                self.terminal_fail_counts.index_put_((vn[fail_hw_mask],), torch.ones_like(vn[fail_hw_mask], dtype=torch.float), accumulate=True)
                 
                 # Deficit Analysis
                 deficit = (vw[fail_hw_mask] / node_max_f[vn][fail_hw_mask]) - vq[fail_hw_mask]
@@ -348,6 +358,7 @@ class MatrixPhysicalEngine:
                     self.backlog_queue[vq_n, vq_s, vq_k] = v_hw_w[valid_queue_mask]
                     self.deadline_queue[vq_n, vq_s, vq_k] = v_hw_t[valid_queue_mask]
                     self.f_min_queue[vq_n, vq_s, vq_k] = v_hw_fmin[valid_queue_mask]
+                    self.terminal_queue[vq_n, vq_s, vq_k] = terminal_indices[valid_mask][hw_mask][sort_idx][valid_queue_mask]
                     
                     # Update counts: Need to find max relative rank per node-service + 1
                     # A safe way is to just use index_put with atomic add (not supported for max, but we can do it with a counts update)
@@ -360,6 +371,7 @@ class MatrixPhysicalEngine:
                     fq_n, fq_s = v_hw_n[~valid_queue_mask], v_hw_s[~valid_queue_mask]
                     self.immediate_fails.index_put_((fq_n, fq_s), torch.ones_like(fq_s, dtype=torch.float), accumulate=True)
                     self.fail_queue.index_put_((fq_n, fq_s), torch.ones_like(fq_s, dtype=torch.float), accumulate=True)
+                    self.terminal_fail_counts.index_put_((terminal_indices[valid_mask][hw_mask][sort_idx][~valid_queue_mask],), torch.ones_like(v_hw_n[~valid_queue_mask], dtype=torch.float), accumulate=True)
             
             node_arrival_matrix.index_put_((vn, vs), vw, accumulate=True)
             
@@ -378,20 +390,27 @@ class MatrixPhysicalEngine:
         self.cpu_alloc_matrix = self.solver.solve(G, Z, f_min, f_max, debug=False)
         self.prof['2_optimize'] += time.perf_counter() - t0
 
-    def execute_and_collect_metrics(self, node_arrival_matrix, trans_energy_total, cold_delays):
+    def execute_and_collect_metrics(self, node_arrival_matrix, trans_energy_total, cold_delays, is_discrete):
         t0 = time.perf_counter()
         current_backlog_total = self.backlog_queue.sum(dim=-1)
         count_before = self.backlog_counts.clone()
         prev_cpu_alloc = self.cpu_alloc_matrix.clone()
         
-        self.backlog_queue, actual_processed, in_slot_violation_mask = ops.deplete_float_queue(
-            self.backlog_queue, self.deadline_queue, self.cpu_alloc_matrix, self.slot_duration
+        # Terminal -> source node mapping (num_terminals,)
+        src_node_mapping = torch.argmax(self.terminal_to_node_map, dim=1).long()
+        
+        self.backlog_queue, actual_processed, local_processed, in_slot_violation_mask = ops.deplete_float_queue(
+            self.backlog_queue, self.deadline_queue, self.terminal_queue, src_node_mapping, self.cpu_alloc_matrix, self.slot_duration
         )
         
-        self.backlog_queue, self.deadline_queue, self.f_min_queue, expired_counts_tensor = ops.age_and_clean_dual_queue(
-            self.backlog_queue, self.deadline_queue, self.f_min_queue, in_slot_violation_mask, self.slot_duration
+        self.backlog_queue, self.deadline_queue, processed_aux, expired_counts_tensor, failed_terminal_ids = ops.age_and_clean_dual_queue(
+            self.backlog_queue, self.deadline_queue, in_slot_violation_mask, self.slot_duration, self.f_min_queue, self.terminal_queue
         )
+        self.f_min_queue, self.terminal_queue = processed_aux[0], processed_aux[1]
         
+        if failed_terminal_ids is not None and len(failed_terminal_ids) > 0:
+            self.terminal_fail_counts.index_put_((failed_terminal_ids.long(),), torch.ones_like(failed_terminal_ids, dtype=torch.float), accumulate=True)
+
         # Update counts
         self.backlog_counts = (self.backlog_queue > 1e-6).sum(dim=-1)
         
@@ -400,6 +419,9 @@ class MatrixPhysicalEngine:
         
         # Success count calculation
         success_qos_tensor = (count_before + self.arrival_counts_step - self.backlog_counts - violate_step_tensor).clamp(min=0)
+        # N x S: resources spent on tasks offloaded FROM other nodes
+        total_capacity_used = self.cpu_alloc_matrix * self.slot_duration
+        external_snack = (total_capacity_used - local_processed).clamp(min=0)
         
         total_drift = ops.calculate_lyapunov_drift(current_backlog_total, node_arrival_matrix, self.cpu_alloc_matrix * self.slot_duration)
         comp_energy = ops.compute_batch_energy(
@@ -417,17 +439,22 @@ class MatrixPhysicalEngine:
         reward = -(f1 + qos_penalty)
         obs = {
             "total_drift": total_drift,
+            # N x S
+            # N x S: CPU capacity spent on externally-offloaded tasks
+            "external_snack": external_snack.clone(),
             "task_reqs": self.current_task_reqs.clone(),
             "backlog": current_backlog_total.clone(),
             "cpu_alloc": self.cpu_alloc_matrix.clone()
         }
         info = {
             "num_tasks": self.current_num_tasks,
+            "external_snack": external_snack.clone(),
             "immediate_fails": self.immediate_fails.sum(),
             "expired_count": violate_step_tensor.sum() - self.immediate_fails.sum(),
             "remaining": self.backlog_counts.sum(),
             "success_qos": success_qos_tensor, 
             "violate_qos": violate_step_tensor,
+            "terminal_fail_counts": self.terminal_fail_counts.clone(),
             "arrival_matrix": self.arrival_counts_step.clone(),
             "fail_reasons": {
                 "deadline": self.fail_deadline.sum(),
@@ -439,6 +466,7 @@ class MatrixPhysicalEngine:
             }
         }
         res = {
+            "pre_reward": -total_energy,
             "reward": reward,
             "energy": total_energy,
             "violations": num_violations,

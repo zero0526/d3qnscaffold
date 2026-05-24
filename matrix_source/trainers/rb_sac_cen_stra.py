@@ -8,6 +8,7 @@ from matrix_source.trainers.train import Trainer
 from matrix_source.utils.math_utils import to_binary
 from matrix_source.trainers.train import log_transform
 
+
 class RB_SAC_CEN_STRA(AlgorithmStrategy):
 
     def initialize_agents(self, trainer: Trainer):
@@ -15,8 +16,8 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         self.upper_action_dim = trainer.upper_action_dim
 
         # historigram_task + historigram_dl + omega + task_size + f_allo_vs + back_log_vs
-        self.lower_state_dim = trainer.max_models + 3 + 1 + 1 + 2*trainer.num_nodes
-        self.lower_action_dim = trainer.max_models*trainer.num_nodes
+        self.lower_state_dim = trainer.max_models + 3 + 1 + 1 + 2 * trainer.num_nodes
+        self.lower_action_dim = trainer.max_models * trainer.num_nodes
 
         # Standard keys from metadata/static_matrices
         self.model_accuracies = trainer.env.metadata["model_accuracies"]
@@ -53,7 +54,7 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
             node_type="Offload_Group",
             state_dim=self.lower_state_dim,
             action_dim=self.lower_action_dim,
-            mf_dim= trainer.num_nodes,
+            mf_dim=trainer.num_nodes,
             mf_hidden_sizes=trainer.config.hyper_neural["MF_SAC_HIDDEN_LAYER"],
             hidden_sizes=trainer.config.hyper_neural["AGENT_HIDDEN_LAYER"],
             actor_lr=float(trainer.config.hyper_neural["LOWER_LR"]),
@@ -72,27 +73,28 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         )
 
     def build_upper_state(self, trainer, obs_upper):
-        actions = obs_upper['actions'] # (N, S)
-        phi = obs_upper['phi_prob']    # (N, S)
+        actions = obs_upper['actions']  # (N, S)
+        phi = obs_upper['phi_prob']  # (N, S)
         # Combine actions and phi for each node
         return torch.cat([actions, phi], dim=-1)
 
     def get_upper_actions(self, trainer, current_upper_state, obs_upper, deterministic=False):
         act_matrix = torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device)
-        sc_mfs = obs_upper.get('mean_fields', torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device))
-        
+        sc_mfs = obs_upper.get('mean_fields',
+                               torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device))
+
         edge_states = current_upper_state[trainer.edge_node_ids]
         edge_mfs = sc_mfs[trainer.edge_node_ids]
         instance_indices = torch.tensor(range(self.num_edges), device=trainer.device)
 
-        # For DQN, 'deterministic' usually means epsilon=0. 
+        # For DQN, 'deterministic' usually means epsilon=0.
         # But D3QNAgent.choose_action_batch uses Boltzmann (zeta).
         # We can simulate deterministic by using a very high zeta or modifying choose_action_batch.
         # Here we just pass a high zeta if deterministic is True.
         zeta = trainer.zeta_upper if not deterministic else 100.0
-        
+
         batch_a_ids = self.upper_agent.choose_action_batch(
-            edge_states, edge_mfs,epsilon=trainer.eps_upper,  zeta=zeta, agent_indices=instance_indices
+            edge_states, edge_mfs, epsilon=trainer.eps_upper, zeta=zeta, agent_indices=instance_indices
         )
 
         for i, nid in enumerate(trainer.edge_node_ids):
@@ -102,30 +104,32 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
             act_matrix[nid] = torch.ones(trainer.num_services, device=trainer.device)
         return act_matrix
 
-    def _build_lower_state_for_tasks(self, trainer, res_lower, t_idx, s_idx, tasks_min_accuracy, task_deadlines, data_sizes):
+    def _build_lower_state_for_tasks(self, trainer, res_lower, t_idx, s_idx, tasks_min_accuracy, task_deadlines,
+                                     data_sizes):
         T_E_map = trainer.env.static_matrices["terminal_to_comp_node_map"]
         task_edge_ids = T_E_map[t_idx].argmax(dim=1)
-        
+
         num_tasks = len(t_idx)
         num_services = trainer.num_services
         max_models = trainer.max_models
-        
+
         obs_dict = res_lower['obs']
         meta = trainer.env.metadata
-        
-        task_agent_ids = torch.tensor([self.edge_id_to_agent_idx.get(eid.item(), 0) for eid in task_edge_ids], device=trainer.device)
+
+        task_agent_ids = torch.tensor([self.edge_id_to_agent_idx.get(eid.item(), 0) for eid in task_edge_ids],
+                                      device=trainer.device)
         combined_indices = task_agent_ids * num_services + s_idx
         num_groups = self.num_edges * num_services
-        
+
         task_counts = torch.zeros(num_groups, device=trainer.device)
         task_counts.index_add_(0, combined_indices, torch.ones(num_tasks, device=trainer.device))
-        
+
         task_srv_dls = self.service_deadlines[s_idx]
         dl_match = (torch.abs(task_deadlines.view(-1, 1) - task_srv_dls) < 1e-4).float()
         dl_counts = torch.zeros((num_groups, 3), device=trainer.device)
         dl_counts.index_add_(0, combined_indices, dl_match)
         task_dl_hists = dl_counts / task_counts.view(-1, 1).clamp(min=1.0)
-        
+
         srv_accs_all = self.model_accuracies[s_idx]
         diffs = srv_accs_all - tasks_min_accuracy.view(-1, 1)
         diffs[diffs < 0] = float('inf')
@@ -133,18 +137,18 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         acc_one_hot = torch.zeros((num_tasks, max_models), device=trainer.device)
         valid_mask = diffs.min(dim=1).values != float('inf')
         acc_one_hot[torch.arange(num_tasks)[valid_mask], best_models[valid_mask]] = 1.0
-        
+
         acc_counts = torch.zeros((num_groups, max_models), device=trainer.device)
         acc_counts.index_add_(0, combined_indices, acc_one_hot)
         task_acc_hists = acc_counts / task_counts.view(-1, 1).clamp(min=1.0)
-        
+
         data_sums = torch.zeros(num_groups, device=trainer.device)
         data_sums.index_add_(0, combined_indices, data_sizes)
-        
+
         omegas = meta['service_omega'].squeeze(-1)
         s_cpus = obs_dict['cpu_alloc']
         s_backlogs = obs_dict['backlog']
-        
+
         full_omegas = omegas.unsqueeze(0).repeat(self.num_edges, 1).view(num_groups, 1)
         full_data_sums = data_sums.view(num_groups, 1)
 
@@ -161,24 +165,27 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         )
         full_state_tensor = torch.cat([
             task_acc_hists,
-            task_dl_hists, 
+            task_dl_hists,
             full_omegas,
-            full_data_sums/trainer.config.norm_data_size,
-            cpu_allo/trainer.config.norm_gflop,
-            backlog_coll/trainer.config.norm_gflop
+            full_data_sums / trainer.config.norm_data_size,
+            cpu_allo / trainer.config.norm_gflop,
+            backlog_coll / trainer.config.norm_gflop
         ], dim=-1)
         # num_agent x num_service x num_node
         state_3d = full_state_tensor.view(self.num_edges, num_services, -1)
         return state_3d, task_agent_ids, task_edge_ids
 
-    def get_lower_actions(self, trainer, res_lower, t_idx, s_idx, tasks_min_accuracy, task_deadlines, batch_sizes, deterministic=False):
+    def get_lower_actions(self, trainer, res_lower, t_idx, s_idx, tasks_min_accuracy, task_deadlines, batch_sizes,
+                          deterministic=False):
         meta = trainer.env.metadata
         unit_sizes = meta['service_input_size']
         data_sizes = batch_sizes * unit_sizes[s_idx].squeeze(-1)
-        state_3d, task_agent_ids, task_edge_ids = self._build_lower_state_for_tasks(trainer, res_lower, t_idx, s_idx, tasks_min_accuracy, task_deadlines, data_sizes)
-        
+        state_3d, task_agent_ids, task_edge_ids = self._build_lower_state_for_tasks(trainer, res_lower, t_idx, s_idx,
+                                                                                    tasks_min_accuracy, task_deadlines,
+                                                                                    data_sizes)
+
         # Aggregate terminal Mean Field to Edge Level
-        mf = res_lower['mean_field'] # (num_terminals, action_dim)
+        mf = res_lower['mean_field']  # (num_terminals, action_dim)
 
         num_edges = self.num_edges
         num_services = trainer.num_services
@@ -186,8 +193,10 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         flat_states = state_3d.view(num_edges * num_services, -1)
         # Repeat edge MF across all services
         #  num_agent, -> num_agent x 1 --> num_agent x num_service  --> num_agent_service
-        flat_agent_indices = torch.arange(num_edges, device=trainer.device).unsqueeze(1).expand(-1, num_services).reshape(-1)
-        
+        flat_agent_indices = torch.arange(num_edges, device=trainer.device).unsqueeze(1).expand(-1,
+                                                                                                num_services).reshape(
+            -1)
+
         all_probs = self.lower_agent.choose_action_batch(
             flat_states,
             mf,
@@ -196,17 +205,19 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         )
         all_probs = torch.as_tensor(all_probs, device=trainer.device, dtype=torch.float32)
 
-        node_ids, model_ids, masked_probs = self.heuristic(trainer, task_agent_ids, s_idx, all_probs, tasks_min_accuracy, task_deadlines, data_sizes)
+        node_ids, model_ids, masked_probs = self.heuristic(trainer, task_agent_ids, s_idx, all_probs,
+                                                           tasks_min_accuracy, task_deadlines, data_sizes)
         return node_ids, model_ids, task_agent_ids, masked_probs
 
-    def compute_next_mean_field(self, trainer:Trainer, source_edge_ids, s_idx, target_edge_ids, target_model_ids, batch_sizes):
+    def compute_next_mean_field(self, trainer: Trainer, source_edge_ids, s_idx, target_edge_ids, target_model_ids,
+                                batch_sizes):
         num_edges = self.num_edges
         num_services = trainer.num_services
-        num_nodes= trainer.num_nodes
-        model_workloads= trainer.env.metadata["model_workloads"]
-        actions= torch.zeros((num_edges, num_nodes, num_services), device=trainer.device)
+        num_nodes = trainer.num_nodes
+        model_workloads = trainer.env.metadata["model_workloads"]
+        actions = torch.zeros((num_edges, num_nodes, num_services), device=trainer.device)
         # num_edge x num_edge
-        task_workloads = model_workloads[s_idx, target_model_ids]*batch_sizes
+        task_workloads = model_workloads[s_idx, target_model_ids] * batch_sizes
         flat_indices = (
                 source_edge_ids * (num_nodes * num_services) +
                 target_edge_ids * num_services +
@@ -222,7 +233,7 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         action_mf = torch.einsum('ij,jnk->ink', normalized_adj, actions)
 
         action_mf = action_mf.permute(0, 2, 1).contiguous()
-        action_mf= action_mf.reshape(num_edges*num_services, -1)
+        action_mf = action_mf.reshape(num_edges * num_services, -1)
         row_sum = action_mf.sum(dim=-1, keepdim=True)
 
         normalized_action_mf = (
@@ -232,10 +243,13 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         # num_agent_service x num_node
         return normalized_action_mf
 
-    def store_lower_transitions(self, trainer, current_res, next_res, t_idx, s_idx, n_idx, m_idx, tasks_min_accuracy, task_deadlines, batch_sizes, all_probs):
-        state_3d, task_agent_ids, _ = self._build_lower_state_for_tasks(trainer, current_res, t_idx, s_idx, tasks_min_accuracy, task_deadlines, batch_sizes)
-        next_state_3d, _, _ = self._build_lower_state_for_tasks(trainer, next_res, t_idx, s_idx, tasks_min_accuracy, task_deadlines, batch_sizes)
-        
+    def store_lower_transitions(self, trainer, current_res, next_res, t_idx, s_idx, n_idx, m_idx, tasks_min_accuracy,
+                                task_deadlines, batch_sizes, all_probs):
+        state_3d, task_agent_ids, _ = self._build_lower_state_for_tasks(trainer, current_res, t_idx, s_idx,
+                                                                        tasks_min_accuracy, task_deadlines, batch_sizes)
+        next_state_3d, _, _ = self._build_lower_state_for_tasks(trainer, next_res, t_idx, s_idx, tasks_min_accuracy,
+                                                                task_deadlines, batch_sizes)
+
         mf_term = current_res['mean_field']
         ns_mf_term = next_res['mean_field']
 
@@ -252,26 +266,26 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         info = next_res['info']
         success_qos = info.get('success_qos', {})
         violate_qos = info.get('violate_qos', {})
-        
+
         # Flattened rewards for all (edge, service) pairs
         # Initialize with the continuous drift/energy base (norm_rew)
         rewards = torch.full((num_sample,), norm_rew, dtype=torch.float32, device=trainer.device)
-        
+
         # Add discrete success/fail rewards per agent-service group
         for e_idx in range(self.num_edges):
-            e_node_id = self.edge_ids[e_idx] # The physical node ID of this agent
-            
+            e_node_id = self.edge_ids[e_idx]  # The physical node ID of this agent
+
             # Robust retrieval: handle both dictionary and tensor formats
             if isinstance(success_qos, torch.Tensor):
-                node_succ = success_qos[e_node_id] if e_node_id < success_qos.shape[0] else [0]*trainer.num_services
+                node_succ = success_qos[e_node_id] if e_node_id < success_qos.shape[0] else [0] * trainer.num_services
             else:
-                node_succ = success_qos.get(e_node_id, [0]*trainer.num_services)
-                
+                node_succ = success_qos.get(e_node_id, [0] * trainer.num_services)
+
             if isinstance(violate_qos, torch.Tensor):
-                node_fail = violate_qos[e_node_id] if e_node_id < violate_qos.shape[0] else [0]*trainer.num_services
+                node_fail = violate_qos[e_node_id] if e_node_id < violate_qos.shape[0] else [0] * trainer.num_services
             else:
-                node_fail = violate_qos.get(e_node_id, [0]*trainer.num_services)
-            
+                node_fail = violate_qos.get(e_node_id, [0] * trainer.num_services)
+
             for s_idx in range(trainer.num_services):
                 local_idx = e_idx * trainer.num_services + s_idx
                 # +1 reward for success, -10 for violation (matching environment scaling)
@@ -281,17 +295,17 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
 
         # --- Q-Value Slope (Smooth Gradient) shaping ---
         # Penalize placing probability on unplaced nodes to guide the Q-Gradient
-        placement = trainer.env.engine.placement_matrix.T # (num_services, num_nodes)
+        placement = trainer.env.engine.placement_matrix.T  # (num_services, num_nodes)
         placed_mask = placement.unsqueeze(-1).expand(-1, -1, trainer.max_models).reshape(trainer.num_services, -1)
         placed_mask_all = placed_mask.unsqueeze(0).expand(self.num_edges, -1, -1).reshape(-1, self.lower_action_dim)
-        
+
         probs_for_penalty = all_probs
         if hasattr(trainer, "strategy") and getattr(trainer.strategy, "lower_agent", None):
             if trainer.strategy.lower_agent.dist_type == "gaussian":
                 # Note: all_probs passed here is now the masked_probs from heuristic (already normalized)
-                probs_for_penalty = all_probs 
-                
-        # 1. Placement penalty
+                probs_for_penalty = all_probs
+
+                # 1. Placement penalty
         invalid_mass = (probs_for_penalty * (1.0 - placed_mask_all)).sum(dim=-1)
         rewards = rewards - (invalid_mass * 5.0)
 
@@ -301,19 +315,19 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         agent_dist = self.distance_matrix[edge_node_row]  # (E, N)
 
         # service_input_size (S, 1), service_deadlines (S, 3) -> use mean column
-        svc_input = trainer.env.metadata["service_input_size"].squeeze(-1)    # (S,)
-        svc_dl    = trainer.env.metadata["service_deadlines"][:, 1]           # (S,) mean deadline
+        svc_input = trainer.env.metadata["service_input_size"].squeeze(-1)  # (S,)
+        svc_dl = trainer.env.metadata["service_deadlines"][:, 1]  # (S,) mean deadline
 
         # trans_delay (E, S, N) = dist (E,1,N) * input_size (1,S,1)
-        trans_delay  = agent_dist.unsqueeze(1) * svc_input.view(1, -1, 1)     # (E, S, N)
+        trans_delay = agent_dist.unsqueeze(1) * svc_input.view(1, -1, 1)  # (E, S, N)
         # remaining time ratio = clamp( (dl - delay) / dl )
-        safety       = (svc_dl.view(1,-1,1) - trans_delay).clamp(min=0)       # (E, S, N)
-        delay_score  = safety / (svc_dl.view(1,-1,1) + 1e-8)                  # (E, S, N) in [0,1]
+        safety = (svc_dl.view(1, -1, 1) - trans_delay).clamp(min=0)  # (E, S, N)
+        delay_score = safety / (svc_dl.view(1, -1, 1) + 1e-8)  # (E, S, N) in [0,1]
 
         # expand to (E*S, N*M) — same shape as probs_for_penalty
         delay_score_all = (
             delay_score.unsqueeze(-1)
-            .expand(-1, -1, -1, trainer.max_models)        # (E, S, N, M)
+            .expand(-1, -1, -1, trainer.max_models)  # (E, S, N, M)
             .reshape(self.num_edges * trainer.num_services, -1)  # (E*S, N*M)
         )
         # penalise probability mass placed on SLOW nodes  (1 - delay_score) ∈ [0,1]
@@ -321,21 +335,26 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         rewards = rewards - (slow_mass * 2.0)
         # -----------------------------------------------
 
-        done = torch.tensor([next_res.get("is_done", False)]*num_sample, dtype=torch.float32, device=trainer.device)
-        flat_agent_indices = torch.arange(self.num_edges, device=trainer.device).unsqueeze(1).expand(-1, trainer.num_services).reshape(-1)
-        flat_state= state_3d.view(-1, self.lower_state_dim)
-        next_flat_state= next_state_3d.view(-1, self.lower_state_dim)
+        done = torch.tensor([next_res.get("is_done", False)] * num_sample, dtype=torch.float32, device=trainer.device)
+        flat_agent_indices = torch.arange(self.num_edges, device=trainer.device).unsqueeze(1).expand(-1,
+                                                                                                     trainer.num_services).reshape(
+            -1)
+        flat_state = state_3d.view(-1, self.lower_state_dim)
+        next_flat_state = next_state_3d.view(-1, self.lower_state_dim)
         avg_mf_loss = self.lower_agent.store_transition_train_mf_batch(
             flat_state, mf_term, ns_mf_term, all_probs, rewards, next_flat_state, done, agent_ids=flat_agent_indices
         )
-        trainer.aggregator.add_lower(next_res, mf_loss=avg_mf_loss, state=state_3d.view(self.num_edges, -1)[0] if len(state_3d) > 0 else None)
+        trainer.aggregator.add_lower(next_res, mf_loss=avg_mf_loss,
+                                     state=state_3d.view(self.num_edges, -1)[0] if len(state_3d) > 0 else None)
         return avg_mf_loss
 
     def store_upper_transitions(self, trainer, s_all, ns_all, current_res, next_res, acts_matrix, is_done):
         # res_upper keys: 'actions', 'phi_prob', 'mean_fields', 'resources'
 
-        sc_mfs = current_res.get('mean_fields', torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device))
-        sc_ns_mfs = next_res.get('mean_fields', torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device))
+        sc_mfs = current_res.get('mean_fields',
+                                 torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device))
+        sc_ns_mfs = next_res.get('mean_fields',
+                                 torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device))
         reward = next_res['reward_global']
 
         edge_mfs = sc_mfs[trainer.edge_node_ids]
@@ -349,8 +368,9 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         # Actions for upper agent are placement vectors. For DQN, we need indices.
         # If upper agent is scalar SAC/DQN, we map placement matrix row to an index.
         # But Rainbow agents usually use discrete actions.
-        a_ids = acts_matrix[trainer.edge_node_ids].sum(dim=-1).long() # Placeholder logic
-        instance_indices = torch.tensor([trainer.node_to_instance[nid] for nid in trainer.edge_node_ids], device=trainer.device)
+        a_ids = acts_matrix[trainer.edge_node_ids].sum(dim=-1).long()  # Placeholder logic
+        instance_indices = torch.tensor([trainer.node_to_instance[nid] for nid in trainer.edge_node_ids],
+                                        device=trainer.device)
 
         loss = self.upper_agent.store_transition_train_mf_batch(
             s_all, edge_mfs, edge_ns_mfs, a_ids, rewards, ns_all, dones, instance_indices
@@ -361,40 +381,49 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         """
         # collect 100 eps random for lower agent
         train 1000 eps for stable lower agent
-        train upper agent from 1100 eps 
+        train upper agent from 1100 eps
         """
         num_eps = trainer_obj.config.hyper_neural['NUMOF_TRAIN_EP']
         max_slots = trainer_obj.env.time_manager.max_steps
-        print(colored("="*50, "blue", attrs=["bold"]))
+        print(colored("=" * 50, "blue", attrs=["bold"]))
         print(colored(f"RB-SAC-CEN Training ({num_eps} frames)", "blue", attrs=["bold"]))
-        print(colored("="*50, "blue", attrs=["bold"]))
+        print(colored("=" * 50, "blue", attrs=["bold"]))
 
         for ep in range(num_eps):
             res = trainer_obj.env.reset()
             obs_upper, prev_lower_res = res["upper"], res["lower"]
-            prev_lower_res["mean_field"]= torch.zeros((self.num_edges*trainer_obj.num_services, trainer_obj.num_nodes), device=trainer_obj.device)
+            prev_lower_res["mean_field"] = torch.zeros(
+                (self.num_edges * trainer_obj.num_services, trainer_obj.num_nodes), device=trainer_obj.device)
             current_upper_state = self.build_upper_state(trainer_obj, obs_upper)
-            
+
             for slot in range(max_slots):
                 if trainer_obj.env.time_manager.is_new_frame():
                     u_acts_matrix = self.get_upper_actions(trainer_obj, current_upper_state, obs_upper)
                     trainer_obj.env.step_upper(u_acts_matrix)
                     # Get tasks
-                t_idx, s_idx, batch_sizes, tasks_min_accuracy, task_deadlines  = trainer_obj.workload_gen.generate_step()
+                t_idx, s_idx, batch_sizes, tasks_min_accuracy, task_deadlines = trainer_obj.workload_gen.generate_step()
 
                 if len(t_idx) > 0:
-                    n_idx, m_idx, task_agent_ids, all_probs = self.get_lower_actions(trainer_obj, prev_lower_res, t_idx, s_idx, tasks_min_accuracy, task_deadlines, batch_sizes)
-                    next_res = trainer_obj.env.step_lower(t_idx, s_idx, batch_sizes, n_idx, m_idx, task_deadlines, tasks_min_accuracy)
-                    next_res["mean_field"] = self.compute_next_mean_field(trainer_obj, task_agent_ids, s_idx, n_idx, m_idx, batch_sizes)
+                    n_idx, m_idx, task_agent_ids, all_probs = self.get_lower_actions(trainer_obj, prev_lower_res, t_idx,
+                                                                                     s_idx, tasks_min_accuracy,
+                                                                                     task_deadlines, batch_sizes)
+                    next_res = trainer_obj.env.step_lower(t_idx, s_idx, batch_sizes, n_idx, m_idx, task_deadlines,
+                                                          tasks_min_accuracy)
+                    next_res["mean_field"] = self.compute_next_mean_field(trainer_obj, task_agent_ids, s_idx, n_idx,
+                                                                          m_idx, batch_sizes)
 
                     next_res["is_done"] = (slot == max_slots - 1)
-                    lower_train_metrics = self.store_lower_transitions(trainer_obj, prev_lower_res, next_res, t_idx, s_idx, n_idx, m_idx, tasks_min_accuracy, task_deadlines, batch_sizes, all_probs)
+                    lower_train_metrics = self.store_lower_transitions(trainer_obj, prev_lower_res, next_res, t_idx,
+                                                                       s_idx, n_idx, m_idx, tasks_min_accuracy,
+                                                                       task_deadlines, batch_sizes, all_probs)
 
                     learn_res = self.lower_agent.learn()
                     if learn_res:
                         trainer_obj.total_lower_steps += 1
                         if isinstance(learn_res, dict):
-                            trainer_obj.aggregator.record_q_stats("Lower", learn_res.get("q_min", 0.0), learn_res.get("q_max", 0.0), learn_res.get("q_mean", 0.0))
+                            trainer_obj.aggregator.record_q_stats("Lower", learn_res.get("q_min", 0.0),
+                                                                  learn_res.get("q_max", 0.0),
+                                                                  learn_res.get("q_mean", 0.0))
                             trainer_obj.aggregator.record_td_losses(lower_losses=learn_res.get("loss", 0.0))
                 else:
                     trainer_obj.env.time_manager.tick()
@@ -406,8 +435,9 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
                     is_ep_done = (slot == max_slots - 1)
                     mf_upper_loss = 0.0
                     if trainer_obj.total_lower_steps >= trainer_obj.lower_stable_threshold:
-                        mf_upper_loss = self.store_upper_transitions(trainer_obj, current_upper_state, ns_upper_state, obs_upper,
-                                                     next_res_upper, u_acts_matrix, is_ep_done)
+                        mf_upper_loss = self.store_upper_transitions(trainer_obj, current_upper_state, ns_upper_state,
+                                                                     obs_upper,
+                                                                     next_res_upper, u_acts_matrix, is_ep_done)
 
                     trainer_obj.aggregator.add_upper(next_res_upper, mf_loss=mf_upper_loss)
 
@@ -418,7 +448,8 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
                         trainer_obj.total_upper_steps += 1
                         if isinstance(res, dict):
                             loss = res["loss"]
-                            trainer_obj.aggregator.record_q_stats("Edge_Group", res["q_min"], res["q_max"], res["q_mean"])
+                            trainer_obj.aggregator.record_q_stats("Edge_Group", res["q_min"], res["q_max"],
+                                                                  res["q_mean"])
                         else:
                             loss = res
                         trainer_obj.aggregator.record_td_losses(upper_losses=loss)
@@ -444,7 +475,7 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         # Final Checkpoint Saving
         checkpoint_dir = getattr(trainer_obj.config, 'checkpoints', 'data/checkpoints')
         os.makedirs(checkpoint_dir, exist_ok=True)
-        
+
         self.lower_agent.save(os.path.join(checkpoint_dir, "lower_sac_final.pth"))
         self.upper_agent.save(os.path.join(checkpoint_dir, "upper_d3qn_final.pth"))
         print(colored(f"\n[Final] Checkpoints saved to {checkpoint_dir}", "green", attrs=["bold"]))
@@ -454,7 +485,7 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         if lower_path and os.path.exists(lower_path):
             self.lower_agent.load(lower_path)
             print(f"[RB_SAC_CEN_STRA] Lower SAC agent loaded from {lower_path}")
-        
+
         if upper_path and os.path.exists(upper_path):
             self.upper_agent.load(upper_path)
             print(f"[RB_SAC_CEN_STRA] Upper D3QN agent loaded from {upper_path}")
@@ -463,13 +494,14 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         """Runs a deterministic evaluation loop."""
         print(f"\n>>> Starting Evaluation SAC ({num_episodes} episodes) <<<")
         max_slots = trainer.env.time_manager.max_steps
-        
+
         for ep in range(num_episodes):
             res = trainer.env.reset()
             obs_upper, prev_lower_res = res["upper"], res["lower"]
-            prev_lower_res["mean_field"]= torch.zeros((self.num_edges*trainer.num_services, trainer.num_nodes), device=trainer.device)
+            prev_lower_res["mean_field"] = torch.zeros((self.num_edges * trainer.num_services, trainer.num_nodes),
+                                                       device=trainer.device)
             current_upper_state = self.build_upper_state(trainer, obs_upper)
-            
+
             for slot in range(max_slots):
                 if trainer.env.time_manager.is_new_frame():
                     u_acts_matrix = self.get_upper_actions(trainer, current_upper_state, obs_upper, deterministic=True)
@@ -477,10 +509,15 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
 
                 t_idx, s_idx, batch_sizes, tasks_min_accuracy, task_deadlines = trainer.workload_gen.generate_step()
                 if len(t_idx) > 0:
-                    n_idx, m_idx, task_agent_ids, all_probs = self.get_lower_actions(trainer, prev_lower_res, t_idx, s_idx, tasks_min_accuracy, task_deadlines, batch_sizes, deterministic=True)
-                    next_res = trainer.env.step_lower(t_idx, s_idx, batch_sizes, n_idx, m_idx, task_deadlines, tasks_min_accuracy)
-                    next_res["mean_field"] = self.compute_next_mean_field(trainer, task_agent_ids, s_idx, n_idx, m_idx, batch_sizes)
-                    
+                    n_idx, m_idx, task_agent_ids, all_probs = self.get_lower_actions(trainer, prev_lower_res, t_idx,
+                                                                                     s_idx, tasks_min_accuracy,
+                                                                                     task_deadlines, batch_sizes,
+                                                                                     deterministic=True)
+                    next_res = trainer.env.step_lower(t_idx, s_idx, batch_sizes, n_idx, m_idx, task_deadlines,
+                                                      tasks_min_accuracy)
+                    next_res["mean_field"] = self.compute_next_mean_field(trainer, task_agent_ids, s_idx, n_idx, m_idx,
+                                                                          batch_sizes)
+
                     trainer.aggregator.add_lower(next_res)
                     prev_lower_res = next_res
                 else:
@@ -490,25 +527,24 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
                     res_upper = trainer.env.collect_upper_metrics()
                     next_upper_state = self.build_upper_state(trainer, res_upper)
                     trainer.aggregator.add_upper(res_upper)
-                    
+
                     current_upper_state = next_upper_state
                     obs_upper = res_upper
 
             trainer.aggregator.store_history()
             trainer.aggregator.report_episode(ep)
-        
+
         print(f"\n>>> Evaluation Complete <<<")
 
-
     def heuristic(
-        self,
-        trainer: Trainer,
-        agent_ids,
-        service_ids,
-        probs,
-        accuracies,
-        deadlines,
-        data_sizes
+            self,
+            trainer: Trainer,
+            agent_ids,
+            service_ids,
+            probs,
+            accuracies,
+            deadlines,
+            data_sizes
     ):
         # 3:net 1:cloud [0,2]:edge
         # trainer.env.engine.placement_matrix
@@ -522,11 +558,11 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         """
         num_nodes = trainer.num_nodes
         max_models = trainer.max_models
-        num_tasks= len(service_ids)
+        num_tasks = len(service_ids)
         # group index
         indices = (
-            agent_ids * trainer.num_services +
-            service_ids
+                agent_ids * trainer.num_services +
+                service_ids
         )
         # (num_tasks, num_nodes*max_models)
         selected_probs = probs[indices]
@@ -540,16 +576,16 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         # Only assign tasks to nodes where the Upper Agent ACTUALLY placed the service
         # placement_matrix is (num_nodes, num_services) -> 0 or 1
         placement = trainer.env.engine.placement_matrix
-        placed_mask = placement.unsqueeze(-1).expand(-1, -1, max_models) # (N, S, max_models)
-        placed_mask = placed_mask.permute(1, 0, 2).reshape(trainer.num_services, -1) # (S, N*max_models)
-        selected_placed_mask = placed_mask[service_ids] # (num_tasks, N*max_models)
+        placed_mask = placement.unsqueeze(-1).expand(-1, -1, max_models)  # (N, S, max_models)
+        placed_mask = placed_mask.permute(1, 0, 2).reshape(trainer.num_services, -1)  # (S, N*max_models)
+        selected_placed_mask = placed_mask[service_ids]  # (num_tasks, N*max_models)
 
         # --------- deadline process---------------------
         edge_ids = torch.tensor([self.agent_id_to_edge_idx.get(eid.item()) for eid in agent_ids], device=trainer.device)
         # num_tasks x num_computing_node
-        transmissions_delay = self.distance_matrix[edge_ids]*data_sizes.unsqueeze(1)
+        transmissions_delay = self.distance_matrix[edge_ids] * data_sizes.unsqueeze(1)
         # num_tasks x num_computing_node_num_model
-        delay= (deadlines.unsqueeze(1) - transmissions_delay)
+        delay = (deadlines.unsqueeze(1) - transmissions_delay)
         delay = torch.clamp(delay, min=0)
         delay = delay.unsqueeze(-1).expand(
             -1,
@@ -559,13 +595,14 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         delay_score = delay / (deadlines.unsqueeze(1) + 1e-8)
 
         # num_tasks x num_computing_node_num_model
-        masked_probs= norm_prob(selected_probs * delay_score * selected_placed_mask)
-        selected_idx= torch.multinomial(masked_probs, num_samples=1).squeeze(1)
-        assigned_nodes= selected_idx//max_models
-        assigned_models= selected_idx%max_models
+        masked_probs = norm_prob(selected_probs * delay_score * selected_placed_mask)
+        selected_idx = torch.multinomial(masked_probs, num_samples=1).squeeze(1)
+        assigned_nodes = selected_idx // max_models
+        assigned_models = selected_idx % max_models
 
         # Expand masked_probs back to full (E*S, N*M) for buffer storage
-        full_masked_probs = torch.zeros((self.num_edges * trainer.num_services, trainer.num_nodes * trainer.max_models), device=trainer.device)
+        full_masked_probs = torch.zeros((self.num_edges * trainer.num_services, trainer.num_nodes * trainer.max_models),
+                                        device=trainer.device)
         full_masked_probs.index_add_(0, indices, masked_probs)
 
         return assigned_nodes, assigned_models, full_masked_probs

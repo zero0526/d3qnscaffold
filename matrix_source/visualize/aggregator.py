@@ -69,6 +69,8 @@ class MetricsAggregator:
         self.episode_lower_q_min = []
         self.episode_lower_q_max = []
         self.episode_lower_q_mean = []
+
+        self.episode_terminal_fails = None
         
         self.episode_step_fail_reasons = [] # Dicts of tensors
         self.curr_zeta_lower = 1.0
@@ -114,6 +116,13 @@ class MetricsAggregator:
         self.episode_remaining_tasks.append(info.get("remaining", 0))
         self.episode_assigned_list.append(info.get("num_tasks", 0))
         self.episode_failed_list.append(info.get("immediate_fails", 0) + info.get("expired_count", 0))
+        
+        term_fails = info.get("terminal_fail_counts")
+        if term_fails is not None:
+            if hasattr(term_fails, "detach"): term_fails = term_fails.detach().cpu().numpy()
+            if self.episode_terminal_fails is None:
+                self.episode_terminal_fails = np.zeros_like(term_fails)
+            self.episode_terminal_fails += term_fails
         
         r_delay = info.get("realized_delay", {})
         if r_delay:
@@ -219,6 +228,15 @@ class MetricsAggregator:
         qos = self.history["qos_success_rate"][-1] if self.history["qos_success_rate"] else 0
         cr = self.history["completion_rate"][-1] if self.history["completion_rate"] else 0
         self.log(f"EP {ep:4d} | Rew: {tr:8.2f} | Energy: {en:8.2f} | QoS: {qos:6.2%} | Comp: {cr:6.2%}")
+        
+        if self.episode_terminal_fails is not None and np.sum(self.episode_terminal_fails) > 0:
+            self.log(f" --- Per-Terminal Failure Breakdown ---")
+            header = " Term ID | Fail Count"
+            self.log(header)
+            self.log("-" * len(header))
+            for tid in range(len(self.episode_terminal_fails)):
+                if self.episode_terminal_fails[tid] > 0:
+                    self.log(f" {tid:<7} | {self.episode_terminal_fails[tid]:<10.0f}")
 
     def _moving_average(self, data, window=10):
         if len(data) < window: return data

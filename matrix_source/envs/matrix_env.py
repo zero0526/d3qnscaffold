@@ -49,7 +49,7 @@ class MatrixSixGEnvironment:
         self.prof['collect_upper'] += time.perf_counter() - t0
         return metrics
 
-    def step_lower(self, terminal_indices, svc_indices, task_batch_sizes, node_indices, model_indices, task_deadlines, tasks_min_accuracy):
+    def step_lower(self, terminal_indices, svc_indices, task_batch_sizes, node_indices, model_indices, task_deadlines, tasks_min_accuracy, is_discrete= False):
         t0 = time.perf_counter()
         # 1. Process Arrivals
         node_arrival_matrix, trans_energy_total, cold_delays, f_min_matrix = self.engine.process_arrivals(
@@ -60,7 +60,7 @@ class MatrixSixGEnvironment:
         self.engine.optimize_allocation(node_arrival_matrix, f_min_matrix)
         
         # 3. Execution & Metrics
-        results = self.engine.execute_and_collect_metrics(node_arrival_matrix, trans_energy_total, cold_delays)
+        results = self.engine.execute_and_collect_metrics(node_arrival_matrix, trans_energy_total, cold_delays, is_discrete)
         
         # 4. Finalize Slot
         self.time_manager.tick()
