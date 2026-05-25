@@ -56,7 +56,7 @@ class MatrixPhysicalEngine:
         
         # New Q: Terminal ID tracking
         self.terminal_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), dtype=torch.long, device=self.device) - 1
-        self.terminal_fail_counts = torch.zeros(self.num_terminals, device=self.device)
+        self.terminal_fail_counts = torch.zeros((self.num_terminals, self.num_services), device=self.device)
         
         # Lower Level Action Tracking (for MARL)
         self.prev_node_indices = torch.zeros(self.num_terminals, dtype=torch.long, device=self.device)
@@ -163,11 +163,13 @@ class MatrixPhysicalEngine:
     def get_lower_obs(self):
         mean_field_terminals = self._calc_terminal_mean_field()
         obs = {
+            "external_snack": torch.zeros((self.num_nodes, self.num_services), device=self.device),
             "task_reqs": self.current_task_reqs.clone(),
             "backlog": self.backlog_queue.sum(dim=-1).clone(),
             "cpu_alloc": self.cpu_alloc_matrix.clone()
         }
         return {
+            "pre_reward": 0,
             "obs": obs,
             "mean_field": mean_field_terminals,
             "prev_actions": {
@@ -274,9 +276,10 @@ class MatrixPhysicalEngine:
         if (~placement_mask).any():
             fn_p = node_indices[~placement_mask]
             fs_p = svc_indices[~placement_mask]
+            ft_p = terminal_indices[~placement_mask]
             self.immediate_fails.index_put_((fn_p, fs_p), torch.ones_like(fs_p, dtype=torch.float), accumulate=True)
             self.fail_placement.index_put_((fn_p, fs_p), torch.ones_like(fs_p, dtype=torch.float), accumulate=True)
-            self.terminal_fail_counts.index_put_((terminal_indices[~placement_mask],), torch.ones_like(terminal_indices[~placement_mask], dtype=torch.float), accumulate=True)
+            self.terminal_fail_counts.index_put_((ft_p, fs_p), torch.ones_like(ft_p, dtype=torch.float), accumulate=True)
 
         # Deadline calculation
         t_rem_raw = task_deadlines - trans_delays
@@ -288,9 +291,10 @@ class MatrixPhysicalEngine:
         if fails_idx.any():
             fn = node_indices[fails_idx]
             fs = svc_indices[fails_idx]
+            ft = terminal_indices[fails_idx]
             self.immediate_fails.index_put_((fn, fs), torch.ones_like(fs, dtype=torch.float), accumulate=True)
             self.fail_deadline.index_put_((fn, fs), torch.ones_like(fs, dtype=torch.float), accumulate=True)
-            self.terminal_fail_counts.index_put_((terminal_indices[fails_idx],), torch.ones_like(terminal_indices[fails_idx], dtype=torch.float), accumulate=True)
+            self.terminal_fail_counts.index_put_((ft, fs), torch.ones_like(ft, dtype=torch.float), accumulate=True)
         
         if valid_mask.any():
             vn = node_indices[valid_mask]
@@ -311,9 +315,10 @@ class MatrixPhysicalEngine:
             if fail_hw_mask.any():
                 fhn = vn[fail_hw_mask]
                 fhs = vs[fail_hw_mask]
+                fht = vn[fail_hw_mask]
                 self.immediate_fails.index_put_((fhn, fhs), torch.ones_like(fhs, dtype=torch.float), accumulate=True)
                 self.fail_hw.index_put_((fhn, fhs), torch.ones_like(fhs, dtype=torch.float), accumulate=True)
-                self.terminal_fail_counts.index_put_((vn[fail_hw_mask],), torch.ones_like(vn[fail_hw_mask], dtype=torch.float), accumulate=True)
+                self.terminal_fail_counts.index_put_((fht, fhs), torch.ones_like(fht, dtype=torch.float), accumulate=True)
                 
                 # Deficit Analysis
                 deficit = (vw[fail_hw_mask] / node_max_f[vn][fail_hw_mask]) - vq[fail_hw_mask]
@@ -369,9 +374,10 @@ class MatrixPhysicalEngine:
                 # Queue Full Failures
                 if (~valid_queue_mask).any():
                     fq_n, fq_s = v_hw_n[~valid_queue_mask], v_hw_s[~valid_queue_mask]
+                    fq_t = terminal_indices[valid_mask][hw_mask][sort_idx][~valid_queue_mask]
                     self.immediate_fails.index_put_((fq_n, fq_s), torch.ones_like(fq_s, dtype=torch.float), accumulate=True)
                     self.fail_queue.index_put_((fq_n, fq_s), torch.ones_like(fq_s, dtype=torch.float), accumulate=True)
-                    self.terminal_fail_counts.index_put_((terminal_indices[valid_mask][hw_mask][sort_idx][~valid_queue_mask],), torch.ones_like(v_hw_n[~valid_queue_mask], dtype=torch.float), accumulate=True)
+                    self.terminal_fail_counts.index_put_((fq_t, fq_s), torch.ones_like(fq_t, dtype=torch.float), accumulate=True)
             
             node_arrival_matrix.index_put_((vn, vs), vw, accumulate=True)
             
@@ -403,13 +409,13 @@ class MatrixPhysicalEngine:
             self.backlog_queue, self.deadline_queue, self.terminal_queue, src_node_mapping, self.cpu_alloc_matrix, self.slot_duration
         )
         
-        self.backlog_queue, self.deadline_queue, processed_aux, expired_counts_tensor, failed_terminal_ids = ops.age_and_clean_dual_queue(
+        self.backlog_queue, self.deadline_queue, processed_aux, expired_counts_tensor, failed_terminal_ids, failed_svc_ids = ops.age_and_clean_dual_queue(
             self.backlog_queue, self.deadline_queue, in_slot_violation_mask, self.slot_duration, self.f_min_queue, self.terminal_queue
         )
         self.f_min_queue, self.terminal_queue = processed_aux[0], processed_aux[1]
         
         if failed_terminal_ids is not None and len(failed_terminal_ids) > 0:
-            self.terminal_fail_counts.index_put_((failed_terminal_ids.long(),), torch.ones_like(failed_terminal_ids, dtype=torch.float), accumulate=True)
+            self.terminal_fail_counts.index_put_((failed_terminal_ids.long(), failed_svc_ids.long()), torch.ones_like(failed_terminal_ids, dtype=torch.float), accumulate=True)
 
         # Update counts
         self.backlog_counts = (self.backlog_queue > 1e-6).sum(dim=-1)

@@ -87,7 +87,10 @@ class MetricsAggregator:
         self.episode_fail_reasons = {'deadline': 0, 'hardware': 0, 'queue_full': 0, 'invalid_placement': 0}
 
     def add_upper(self, step_output, mf_loss=0, state=None):
-        self.episode_upper_rewards.append(step_output.get("reward_global", 0))
+        if isinstance(step_output, dict):
+            self.episode_upper_rewards.append(step_output.get("reward_global", 0))
+        elif isinstance(step_output, torch.Tensor):
+            self.episode_upper_rewards.append(step_output)
         self.episode_upper_mf_losses.append(mf_loss)
         if state is not None:
             s = state.detach().cpu().numpy() if hasattr(state, "detach") else np.array(state)
@@ -204,7 +207,11 @@ class MetricsAggregator:
         
         assigned = _get_sum(self.episode_assigned_list, "assigned")
         failed = _get_sum(self.episode_failed_list, "failed")
-        rem_val = float(self.episode_remaining_tasks[-1].item() if hasattr(self.episode_remaining_tasks[-1], "item") else self.episode_remaining_tasks[-1])
+        
+        if self.episode_remaining_tasks:
+            rem_val = float(self.episode_remaining_tasks[-1].item() if hasattr(self.episode_remaining_tasks[-1], "item") else self.episode_remaining_tasks[-1])
+        else:
+            rem_val = 0.0
         
         self.history["completion_rate"].append((assigned - failed - rem_val) / assigned if assigned > 0 else 0)
         self.history["avg_backlog_drift"].append(_get_avg(self.episode_backlog_drift, "avg_backlog_drift"))

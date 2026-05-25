@@ -83,12 +83,21 @@ def age_and_clean_dual_queue(backlog, deadline, in_slot_violation_mask, slot_dur
     # NEW: Cần lấy thông tin các task bị fail TRƯỚC KHI XÓA
     # Giả sử queue cuối cùng trong aux_queues là terminal_queue
     failed_terminal_ids = None
+    failed_svc_ids = None
     if len(aux_queues) > 0:
         # Lấy queue cuối cùng (Terminal Queue)
         term_queue = aux_queues[-1]
         failed_terminal_ids = term_queue[total_violation_mask]
-        # Skip -1 values (empty slots that might be marked as violations if logic is loose)
-        failed_terminal_ids = failed_terminal_ids[failed_terminal_ids >= 0]
+        
+        # Lấy Service ID từ mask
+        # total_violation_mask: (N, S, K)
+        violation_indices = torch.nonzero(total_violation_mask) # (V, 3) -> [node, svc, k]
+        failed_svc_ids = violation_indices[:, 1]
+
+        # Skip -1 values (empty slots)
+        valid_mask = (failed_terminal_ids >= 0)
+        failed_terminal_ids = failed_terminal_ids[valid_mask]
+        failed_svc_ids = failed_svc_ids[valid_mask]
 
     # 3. Xóa Task vi phạm và làm sạch dữ liệu cũ
     backlog[total_violation_mask] = 0
@@ -113,7 +122,7 @@ def age_and_clean_dual_queue(backlog, deadline, in_slot_violation_mask, slot_dur
             q = torch.gather(q, dim=-1, index=indices)
             processed_aux.append(q)
     
-    return backlog, deadline, processed_aux, violation_counts, failed_terminal_ids
+    return backlog, deadline, processed_aux, violation_counts, failed_terminal_ids, failed_svc_ids
 
 
 # ==========================================

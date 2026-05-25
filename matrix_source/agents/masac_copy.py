@@ -1,5 +1,4 @@
 import math
-import numpy as np
 from typing import Literal
 
 import torch
@@ -7,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-from matrix_source.agents.base import MultiInstanceLinear, MultiInstanceRMSNorm, MF
+from matrix_source.agents.base import MultiInstanceLinear, MultiInstanceRMSNorm
 from matrix_source.agents.buffer.sac_buffer_copy import MultiAgentSACReplayBuffer
 
 DistType = Literal["gaussian"]
@@ -15,19 +14,34 @@ DistType = Literal["gaussian"]
 # -----------------------------
 # Networks
 # -----------------------------
+
+class MFNetwork(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_sizes, num_instances=1):
+        super().__init__()
+        h1, h2 = hidden_sizes
+        self.fc1 = MultiInstanceLinear(num_instances, input_dim, h1)
+        self.norm = MultiInstanceRMSNorm(num_instances, h1)
+        self.fc2 = MultiInstanceLinear(num_instances, h1, h2)
+        self.out = MultiInstanceLinear(num_instances, h2, output_dim)
+
+    def forward(self, x, indices=None):
+        x = F.silu(self.norm(self.fc1(x, indices), indices))
+        x = F.silu(self.fc2(x, indices))
+        return torch.sigmoid(self.out(x, indices))  # Constrain MF to [0, 1] range
+
 class MFCritic(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256, num_instances=1):
+    def __init__(self, state_dim: int, action_dim: int, mf_dim:int, hidden_dim: int = 256, num_instances=1):
         super().__init__()
         self.num_instances = num_instances
 
-        self.q1_l1 = MultiInstanceLinear(num_instances, state_dim + action_dim, hidden_dim) # Action + MF Action
+        self.q1_l1 = MultiInstanceLinear(num_instances, state_dim + action_dim + mf_dim, hidden_dim) # Action + MF Action
         self.q1_norm1 = MultiInstanceRMSNorm(num_instances, hidden_dim)
         self.q1_l2 = MultiInstanceLinear(num_instances, hidden_dim, hidden_dim)
         self.q1_norm2 = MultiInstanceRMSNorm(num_instances, hidden_dim)
         self.q1_l3 = MultiInstanceLinear(num_instances, hidden_dim, 1)
 
         # Q2 architecture
-        self.q2_l1 = MultiInstanceLinear(num_instances, state_dim + action_dim, hidden_dim)
+        self.q2_l1 = MultiInstanceLinear(num_instances, state_dim + action_dim + mf_dim, hidden_dim)
         self.q2_norm1 = MultiInstanceRMSNorm(num_instances, hidden_dim)
         self.q2_l2 = MultiInstanceLinear(num_instances, hidden_dim, hidden_dim)
         self.q2_norm2 = MultiInstanceRMSNorm(num_instances, hidden_dim)
@@ -47,14 +61,14 @@ class MFCritic(nn.Module):
         return q1, q2
 
 class MFGaussianActor(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256, num_instances=1, log_std_min: float = -20, log_std_max: float = 2):
+    def __init__(self, state_dim: int, action_dim: int, mf_dim: int, hidden_dim: int = 256, num_instances=1, log_std_min: float = -20, log_std_max: float = 2):
         super().__init__()
         self.action_dim = action_dim
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
         self.num_instances = num_instances
 
-        self.l1 = MultiInstanceLinear(num_instances, state_dim, hidden_dim) # State
+        self.l1 = MultiInstanceLinear(num_instances, state_dim + mf_dim, hidden_dim) # State
         self.norm1 = MultiInstanceRMSNorm(num_instances, hidden_dim)
         self.l2 = MultiInstanceLinear(num_instances, hidden_dim, hidden_dim)
         self.norm2 = MultiInstanceRMSNorm(num_instances, hidden_dim)
@@ -62,8 +76,8 @@ class MFGaussianActor(nn.Module):
         self.mean = MultiInstanceLinear(num_instances, hidden_dim, action_dim)
         self.log_std = MultiInstanceLinear(num_instances, hidden_dim, action_dim)
 
-    def forward(self, state, indices=None):
-        x = state
+    def forward(self, state, mf, indices=None):
+        x = torch.cat([state, mf], dim=-1)
         x = F.silu(self.norm1(self.l1(x, indices), indices))
         x = F.silu(self.norm2(self.l2(x, indices), indices))
         
@@ -71,8 +85,8 @@ class MFGaussianActor(nn.Module):
         log_std = torch.clamp(self.log_std(x, indices), self.log_std_min, self.log_std_max)
         return mean, log_std
 
-    def sample(self, state, indices=None, deterministic: bool = False):
-        mean, log_std = self.forward(state, indices)
+    def sample(self, state, mf, indices=None, deterministic: bool = False):
+        mean, log_std = self.forward(state, mf, indices)
         std = log_std.exp()
 
         normal = torch.distributions.Normal(mean, std)
@@ -96,6 +110,8 @@ class MFSACAgent:
         num_comp_node: int,
         state_dim: int,
         action_dim: int,
+        mf_dim: int,
+        mf_hidden_sizes=(50, 50),
         hidden_sizes=(256, 256),
         actor_lr: float = 1e-4,
         critic_lr: float = 3e-4,
@@ -137,21 +153,23 @@ class MFSACAgent:
         self.critic = MFCritic(state_dim, self.action_dim, mf_dim, hidden_dim, num_instances).to(self.device)
         self.critic_target = MFCritic(state_dim, self.action_dim, mf_dim, hidden_dim, num_instances).to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
+        self.mf= MFNetwork(mf_dim + state_dim, mf_dim, mf_hidden_sizes, num_instances)
 
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=critic_lr)
+        self.mf_optimizer = optim.Adam(self.mf.parameters(), lr=actor_lr)
 
         self.log_alpha = torch.full((num_instances, 1), 1.5, device=self.device, requires_grad=True)
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=alpha_lr)
 
-        self.memory = MultiAgentSACReplayBuffer(num_instances, node_type, buffer_size, state_dim, num_comp_node, self.device)
+        self.memory = MultiAgentSACReplayBuffer(num_instances, node_type, buffer_size, state_dim, num_comp_node, mf_dim, self.device)
         self.learn_step_counter = 0
 
     @property
     def get_alpha(self):
         return self.log_alpha.exp()
 
-    def choose_action_batch(self, states_batch, agent_indices=None, deterministic: bool = False):
+    def choose_action_batch(self, states_batch, mf, agent_indices=None, deterministic: bool = False):
         # Zeta is ignored for continuous, passed for interface compatibility
         batch_size = states_batch.shape[0]
         if agent_indices is None:
@@ -186,19 +204,19 @@ class MFSACAgent:
             aid_subset = agent_indices[indices]
 
             with torch.no_grad():
-                action, _ = self.actor.sample(s_subset, indices=aid_subset, deterministic=deterministic)
+                action, _ = self.actor.sample(s_subset, mf, indices=aid_subset, deterministic=deterministic)
                 final_actions[indices] = action
 
         # MFSAC agent should return the batch of actions directly since it's continuous
         return final_actions.cpu().numpy()
 
-    def store_transition_train_mf_batch(self, states, actions, rewards, next_states, dones, agent_ids):
+    def store_transition_train_mf_batch(self, states, prev_mf, actions, rewards, curr_states, curr_mf, dones, agent_ids):
         if not torch.is_tensor(actions):
             actions = torch.tensor(actions, dtype=torch.float32, device=self.device)
         else:
             actions = actions.to(self.device).float()
             
-        self.memory.add_batch(states, actions, rewards, next_states, dones, agent_ids)
+        self.memory.add_batch(states, prev_mf, actions, rewards, curr_states, curr_mf, dones, agent_ids)
         return True
 
     def learn(self, agents_ids: torch.Tensor = None):
@@ -216,7 +234,7 @@ class MFSACAgent:
         if len(target_agents) == 0:
             return None
 
-        states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids = \
+        states, prev_mfs, actions, rewards, curr_states, curr_mfs, dones, agent_ids = \
             self.memory.sample(self.batch_size, agent_ids=target_agents)
 
         agent_ids = agent_ids.view(-1)
@@ -224,22 +242,29 @@ class MFSACAgent:
         if actions.shape[-1] == 1 and self.action_dim > 1: # Adjust shape if incorrectly recorded as 1D
             actions = actions.view(-1, self.action_dim)
 
+        # 1. Train MF Predictor
+        self.mf_optimizer.zero_grad()
+        combined_s_mf = torch.cat([states, prev_mfs], dim=-1)
+        pred_curr_mf = self.mf(combined_s_mf, agent_ids)
+        mf_loss = F.mse_loss(pred_curr_mf, curr_mfs)
+        mf_loss.backward()
+        self.mf_optimizer.step()
+
         # 2. Train Critic
         with torch.no_grad():
-            next_action, next_log_prob = self.actor.sample(next_states, indices=agent_ids)
+            # Use curr_mfs for next MF as it's the observed mean field in next state
+            pred_next_mf= self.mf(torch.cat([curr_states, curr_mfs], dim=-1), indices=agent_ids)
+            next_action, next_log_prob = self.actor.sample(curr_states, pred_next_mf, indices=agent_ids)
             
-            target_q1, target_q2 = self.critic_target(next_states, next_action, indices=agent_ids)
+            target_q1, target_q2 = self.critic_target(curr_states, next_action, pred_next_mf, indices=agent_ids)
             target_q = torch.min(target_q1, target_q2) - self.get_alpha[agent_ids] * next_log_prob
             target_q = rewards + (1.0 - dones) * self.gamma * target_q
 
-        current_q1, current_q2 = self.critic(states, actions, indices=agent_ids)
+        # Current Q uses the MF at state s: prev_mfs
+        pred_curr_mf= self.mf(torch.cat([states, prev_mfs], dim=-1), indices=agent_ids).detach()
+        current_q1, current_q2 = self.critic(states, actions, pred_curr_mf, indices=agent_ids)
         
-        td_error1 = current_q1 - target_q
-        td_error2 = current_q2 - target_q
-        
-        critic_loss1 = (0.5 * (td_error1 ** 2)).mean()
-        critic_loss2 = (0.5 * (td_error2 ** 2)).mean()
-        critic_loss = critic_loss1 + critic_loss2
+        critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
@@ -247,8 +272,9 @@ class MFSACAgent:
         self.critic_optimizer.step()
 
         # 3. Train Actor
-        new_action, log_prob = self.actor.sample(states, indices=agent_ids)
-        q1_new, q2_new = self.critic(states, new_action, indices=agent_ids)
+        # Actor usually learns based on the perceived/predicted MF to stay consistent
+        new_action, log_prob = self.actor.sample(states, pred_curr_mf, indices=agent_ids)
+        q1_new, q2_new = self.critic(states, new_action, pred_curr_mf, indices=agent_ids)
         q_new = torch.min(q1_new, q2_new)
 
         actor_loss = (self.get_alpha[agent_ids].detach() * log_prob - q_new).mean()
@@ -279,14 +305,15 @@ class MFSACAgent:
         step=10
         if self.node_type=="Offload_Group":step=100
         if self.learn_step_counter % step == 0:
-            print(f"[{self.node_type} Group] Step {self.learn_step_counter:5d} | C-Loss: {critic_loss.item():.5f} | A-Loss: {actor_loss.item():.5f} | Q [Min: {q_min:.3f}, Max: {q_max:.3f}, Mean: {q_mean:.3f}]")
+            print(f"[{self.node_type} Group] Step {self.learn_step_counter:5d} | MF-Loss: {mf_loss.item():.5f} | C-Loss: {critic_loss.item():.5f} | A-Loss: {actor_loss.item():.5f} | Q [Min: {q_min:.3f}, Max: {q_max:.3f}, Mean: {q_mean:.3f}]")
 
         if self.logs_q:
             return {
                 "loss": critic_loss.item(),
                 "q_min": q_min,
                 "q_max": q_max,
-                "q_mean": q_mean
+                "q_mean": q_mean,
+                "mf_loss": mf_loss.item()
             }
         return critic_loss.item()
 
@@ -295,8 +322,10 @@ class MFSACAgent:
             'actor': self.actor.state_dict(),
             'critic': self.critic.state_dict(),
             'critic_target': self.critic_target.state_dict(),
+            'mf': self.mf.state_dict(),
             'actor_opt': self.actor_optimizer.state_dict(),
             'critic_opt': self.critic_optimizer.state_dict(),
+            'mf_opt': self.mf_optimizer.state_dict(),
             'log_alpha': self.log_alpha,
             'alpha_opt': self.alpha_optimizer.state_dict(),
             'learn_step': self.learn_step_counter
@@ -308,8 +337,12 @@ class MFSACAgent:
         self.actor.load_state_dict(checkpoint['actor'])
         self.critic.load_state_dict(checkpoint['critic'])
         self.critic_target.load_state_dict(checkpoint['critic_target'])
+        if 'mf' in checkpoint:
+            self.mf.load_state_dict(checkpoint['mf'])
         self.actor_optimizer.load_state_dict(checkpoint['actor_opt'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_opt'])
+        if 'mf_opt' in checkpoint:
+            self.mf_optimizer.load_state_dict(checkpoint['mf_opt'])
         self.log_alpha.data.copy_(checkpoint['log_alpha'].data)
         self.alpha_optimizer.load_state_dict(checkpoint['alpha_opt'])
         self.learn_step_counter = checkpoint.get('learn_step', 0)
