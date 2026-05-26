@@ -677,19 +677,19 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
             if not group_mask_flat.any(): continue
 
             # SỬA LỖI CHÍNH Ở ĐÂY: Tính đúng flat index cho cặp (e_idx, s_idx)
-            task_indices_in_group = group_mask_flat.nonzero(as_tuple=True)[0]
-            true_agent_ids = flat_agent_indices[task_indices_in_group]
-            flat_es_idx = true_agent_ids * num_services + s_idx
+            task_indices_in_group = t_indices[group_mask_flat]
+            # All tasks in this group share the same agent_idx and s_idx
+            agent_idx = self.edge_id_to_agent_idx[e_idx]
+            group_idx = agent_idx * num_services + s_idx
+            
+            # Quota for this node v in this group (e_idx, s_idx)
+            # Both minium_wl and masked_probs in this context are indexed by group_idx
+            # Since all tasks in the group have the same masked_probs[task_idx], we use the first one
+            first_task_idx = task_indices_in_group[0]
+            quota_v = (minium_wl[group_idx] * masked_probs[first_task_idx, v]).item()
 
-            group_min_wl = minium_wl[flat_es_idx]
-            group_masked_probs = masked_probs[true_agent_ids]
-
-            quota_v = (group_min_wl * masked_probs[flat_es_idx])[v].item()
-            total_quota_for_nodes = (group_min_wl.unsqueeze(-1) * group_masked_probs).sum(dim=0)
-
-            used_v = actual_workloads[e_idx, s_idx, v].item()
+            used_v = actual_workloads[agent_idx, s_idx, v].item()
             slack = quota_v - used_v
-            quota_v = total_quota_for_nodes[v].item()
 
             if slack <= 1e-6: continue
 
