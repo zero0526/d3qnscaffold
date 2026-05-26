@@ -116,10 +116,12 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
 
         combined_indices = task_agent_ids * trainer.num_services + s_idx
         service_min_workloads.index_add_(0, combined_indices, min_workloads)
+        
+        active_indices = torch.unique(combined_indices)
 
-        return service_min_workloads
+        return service_min_workloads, active_indices
 
-    def _build_unified_state(self, trainer, res_lower, min_wl_flat):
+    def _build_unified_state(self, trainer, res_lower, min_wl_flat, active_indices=None):
         """State thống nhất: Bao gồm cả Omega, Hops, Backlog, CPU và WORKLOAD CẦN CHIA"""
         obs_dict = res_lower['obs']
         meta = trainer.env.metadata
@@ -147,7 +149,7 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
             .reshape(num_groups, -1)
         )
         # Concat: 2 + 4*N
-        return torch.cat([
+        state_all = torch.cat([
             full_omegas,
             wl_feat,
             avg_hops,
@@ -155,19 +157,26 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
             cpu_allo / trainer.config.norm_gflop,
             external_snack_feat/ trainer.config.norm_gflop,
         ], dim=-1)
+        
+        if active_indices is not None:
+            return state_all[active_indices], state_all
+        return state_all
 
-    def get_lower_actions(self, trainer, current_state, min_wl_flat, t_idx, s_idx, tasks_min_accuracy, task_deadlines,
+    def get_lower_actions(self, trainer, current_state, active_indices, min_wl_flat, t_idx, s_idx, tasks_min_accuracy, task_deadlines,
                           batch_sizes, deterministic=False):
         minium_wl = min_wl_flat.clone()
 
-        flat_agent_indices = torch.arange(self.num_edges, device=trainer.device).unsqueeze(1).expand(-1,
-                                                                                                     trainer.num_services).reshape(
-            -1)
-
-        all_probs = self.lower_agent.choose_action_batch(
-            current_state, self.distributed_task, agent_indices=flat_agent_indices, deterministic=deterministic
+        # Only get actions for active groups
+        active_agent_indices = active_indices // trainer.num_services
+        
+        active_probs = self.lower_agent.choose_action_batch(
+            current_state, self.distributed_task[active_indices], agent_indices=active_agent_indices, deterministic=deterministic
         )
-        all_probs = torch.as_tensor(all_probs, device=trainer.device, dtype=torch.float32)
+        active_probs = torch.as_tensor(active_probs, device=trainer.device, dtype=torch.float32)
+
+        # Map back to full group set for heuristic
+        all_probs = torch.zeros((self.num_edges * trainer.num_services, trainer.num_nodes), device=trainer.device)
+        all_probs[active_indices] = active_probs
 
         T_E_map = trainer.env.static_matrices["terminal_to_comp_node_map"]
         task_edge_ids = T_E_map[t_idx].argmax(dim=1)
@@ -184,7 +193,9 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         neighbor_rate=  self.agent_adj_matrix/self.agent_adj_matrix.sum(dim=-1)
         curr_mf=torch.einsum("ij, jsn -> isn", neighbor_rate, current_dist).flatten(0, 1)
         self.distributed_task = curr_mf
-        return node_ids, model_ids, task_agent_ids, all_probs, actual_workloads, curr_mf, invalid_logits_penalty
+        
+        # Return filtered values where possible, or full values if required by downstream logic
+        return node_ids, model_ids, task_agent_ids, active_probs, actual_workloads, curr_mf, invalid_logits_penalty
 
     def store_upper_transitions(self, trainer, s_all, ns_all, current_res, next_res, acts_matrix, is_done):
         # res_upper keys: 'actions', 'phi_prob', 'mean_fields', 'resources'
@@ -242,12 +253,12 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
                         [self.edge_id_to_agent_idx.get(eid.item(), 0) for eid in task_edge_ids],
                         device=trainer_obj.device)
 
-                    min_wl_flat = self._build_min_wl(trainer_obj, task_agent_ids, s_idx, tasks_min_accuracy,
-                                                     batch_sizes)
-                    current_state_t = self._build_unified_state(trainer_obj, prev_lower_res, min_wl_flat)
+                    min_wl_flat, active_indices = self._build_min_wl(trainer_obj, task_agent_ids, s_idx, tasks_min_accuracy,
+                                                                    batch_sizes)
+                    current_state_t, full_state_t = self._build_unified_state(trainer_obj, prev_lower_res, min_wl_flat, active_indices)
                     # get action
-                    n_idx, m_idx, _, all_probs, actual_wl, curr_mf, invalid_logits_penalty = self.get_lower_actions(
-                        trainer_obj, current_state_t, min_wl_flat, t_idx, s_idx, tasks_min_accuracy, task_deadlines,
+                    n_idx, m_idx, _, active_probs, actual_wl, curr_mf, invalid_logits_penalty = self.get_lower_actions(
+                        trainer_obj, current_state_t, active_indices, min_wl_flat, t_idx, s_idx, tasks_min_accuracy, task_deadlines,
                         batch_sizes
                     )
                     # step env
@@ -256,34 +267,38 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
                     trainer_obj.aggregator.add_lower(current_lower_res)
 
                     if transition_cache is not None:
-                        # 3. UNPACK THÊM CACHE_MASKS
-                        cache_S_t, cache_A_t, cache_R_t, cache_prev_mf, cache_curr_mf, cache_is_done, cache_masks = transition_cache
+                        # 3. UNPACK THÊM CACHE_MASKS VÀ CACHE_ACTIVE_INDICES
+                        cache_S_t, cache_A_t, cache_R_t, cache_prev_mf, cache_curr_mf, cache_is_done, cache_masks, cache_active_indices = transition_cache
 
-                        # current_state_t của slot hiện tại chính là S_{t+1} của slot cũ
-                        next_state_for_cache = current_state_t
+                        # next_state_for_cache của slot cũ là full_state_t hiện tại lọc theo index cũ
+                        next_state_for_cache = full_state_t[cache_active_indices]
 
-                        flat_agent_indices = torch.arange(self.num_edges, device=trainer_obj.device).unsqueeze(
-                            1).expand(-1, trainer_obj.num_services).reshape(-1)
+                        cache_flat_agent_indices = cache_active_indices // trainer_obj.num_services
 
-                        # 4. THÊM action_masks=cache_masks VÀO ĐÂY
                         self.lower_agent.memory.add_batch(
                             cache_S_t, cache_prev_mf, cache_A_t, cache_R_t.view(-1, 1),
                             next_state_for_cache, cache_curr_mf,
                             torch.full((cache_S_t.shape[0], 1), float(cache_is_done), device=trainer_obj.device),
-                            flat_agent_indices,
+                            cache_flat_agent_indices,
                             action_masks=cache_masks
                         )
                     rewards = self._calculate_reward(trainer_obj, current_lower_res, actual_wl, task_agent_ids, t_idx,
                                                      s_idx, invalid_logits_penalty)
 
-                    # 1. TÍNH MASK TẠI THỜI ĐIỂM HIỆN TẠI
+                    # 1. TÍNH MASK TẠI THỜI ĐIỂM HIỆN TẠI (Full 25 groups)
                     curr_masks = trainer_obj.env.engine.placement_matrix.T.unsqueeze(0).expand(self.num_edges, -1,
                                                                                                -1).reshape(-1,
                                                                                                            trainer_obj.num_nodes)
 
-                    # 2. ĐỈNH KÉM MASK VÀO CACHE (Tăng từ 6 lên 7 phần tử)
-                    transition_cache = (current_state_t, all_probs, rewards, prev_mf.clone(), curr_mf.clone(), is_done,
-                                        curr_masks)
+                    # 2. Lọc thông tin ACTIVE để lưu vào cache
+                    rewards_active = rewards[active_indices]
+                    prev_mf_active = prev_mf[active_indices]
+                    curr_mf_active = curr_mf[active_indices]
+                    curr_masks_active = curr_masks[active_indices]
+
+                    # Cache (Tăng thành 8 phần tử để lưu active_indices)
+                    transition_cache = (current_state_t, active_probs, rewards_active, prev_mf_active, curr_mf_active, is_done,
+                                        curr_masks_active, active_indices)
                     prev_mf = curr_mf.clone()
                     prev_lower_res = current_lower_res
 
@@ -323,20 +338,19 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
                         trainer_obj.aggregator.record_td_losses(upper_losses=loss)
 
             # XỬ LÝ CACHE CUỐI CÙNG CỦA EPISODE
-            # XỬ LÝ CACHE CUỐI CÙNG CỦA EPISODE
             if transition_cache is not None:
-                # 5. UNPACK THÊM CACHE_MASKS
-                cache_S_t, cache_A_t, cache_R_t, cache_prev_mf, cache_curr_mf, cache_is_done, cache_masks = transition_cache
+                # 5. UNPACK THÊM CACHE_MASKS VÀ CACHE_ACTIVE_INDICES
+                cache_S_t, cache_A_t, cache_R_t, cache_prev_mf, cache_curr_mf, cache_is_done, cache_masks, cache_active_indices = transition_cache
                 dummy_next_state = cache_S_t.clone().zero_()
-                flat_agent_indices = torch.arange(self.num_edges, device=trainer_obj.device).unsqueeze(
-                    1).expand(-1, trainer_obj.num_services).reshape(-1)
+                
+                cache_flat_agent_indices = cache_active_indices // trainer_obj.num_services
 
                 # 6. THÊM action_masks=cache_masks VÀO ĐÂY
                 self.lower_agent.memory.add_batch(
                     cache_S_t, cache_prev_mf, cache_A_t, cache_R_t.view(-1, 1),
                     dummy_next_state, cache_curr_mf,
                     torch.full((cache_S_t.shape[0], 1), 1.0, device=trainer_obj.device),  # Done = True
-                    flat_agent_indices,
+                    cache_flat_agent_indices,
                     action_masks=cache_masks
                 )
             trainer_obj.aggregator.store_history()
@@ -478,18 +492,18 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
                     task_agent_ids = torch.tensor(
                         [self.edge_id_to_agent_idx.get(eid.item(), 0) for eid in task_edge_ids], device=trainer.device)
 
-                    min_wl_flat = self._build_min_wl(trainer, task_agent_ids, s_idx, tasks_min_accuracy, batch_sizes)
+                    min_wl_flat, active_indices = self._build_min_wl(trainer, task_agent_ids, s_idx, tasks_min_accuracy, batch_sizes)
 
                     # ==========================================
                     # 2. XÂY DỰNG STATE ĐỂ RA QUYẾT ĐỊNH
                     # ==========================================
-                    current_state = self._build_unified_state(trainer, prev_lower_res, min_wl_flat)
+                    current_state, _ = self._build_unified_state(trainer, prev_lower_res, min_wl_flat, active_indices)
 
                     # ==========================================
                     # 3. LẤY HÀNH ĐỘNG (Sửa chữ ký khớp với bản mới)
                     # ==========================================
-                    n_idx, m_idx, _, all_probs, actual_wl, _, invalid_logits_penalty = self.get_lower_actions(
-                        trainer, current_state, min_wl_flat, t_idx, s_idx,
+                    n_idx, m_idx, _, active_probs, actual_wl, _, invalid_logits_penalty = self.get_lower_actions(
+                        trainer, current_state, active_indices, min_wl_flat, t_idx, s_idx,
                         tasks_min_accuracy, task_deadlines, batch_sizes, deterministic=True
                     )
 
@@ -585,7 +599,8 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
             w_base = w_bases[i].item()
 
             # 1. Tính hạn ngạch (Quota) cho các node (N,)
-            quotas = minium_wl[i] * masked_probs[i]
+            group_idx = e_idx * trainer.num_services + s_idx
+            quotas = minium_wl[group_idx] * masked_probs[i]
 
             # 2. Tính không gian còn trống và Kiểm tra điều kiện (Vectorized trên N nodes)
             space_left = quotas - actual_workloads[e_idx, s_idx]

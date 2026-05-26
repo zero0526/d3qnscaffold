@@ -202,9 +202,12 @@ class MFSACAgent:
             indices = policy_mask.nonzero(as_tuple=True)[0]
             s_subset = states_batch[indices]
             aid_subset = agent_indices[indices]
+            
+            # Sub-indices for Mean Field if it's a batch
+            mf_subset = mf[indices] if mf.dim() > 1 else mf
 
             with torch.no_grad():
-                action, _ = self.actor.sample(s_subset, mf, indices=aid_subset, deterministic=deterministic)
+                action, _ = self.actor.sample(s_subset, mf_subset, indices=aid_subset, deterministic=deterministic)
                 final_actions[indices] = action
 
         # MFSAC agent should return the batch of actions directly since it's continuous
