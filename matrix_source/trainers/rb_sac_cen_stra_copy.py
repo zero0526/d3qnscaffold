@@ -77,7 +77,7 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
             logs_q=True
         )
         # num_agent x num_node x num_service
-        self.distributed_task = torch.zeros((len(self.edge_ids), trainer.num_services, trainer.num_nodes), device=trainer.device)
+        self.distributed_task = torch.zeros((len(self.edge_ids)*trainer.num_services, trainer.num_nodes), device=trainer.device)
 
     def build_upper_state(self, trainer, obs_upper):
         actions = obs_upper['actions'] # (N, S)
@@ -165,7 +165,7 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
             -1)
 
         all_probs = self.lower_agent.choose_action_batch(
-            current_state, self.distributed_task.reshape(-1, trainer.num_nodes), agent_indices=flat_agent_indices, deterministic=deterministic
+            current_state, self.distributed_task, agent_indices=flat_agent_indices, deterministic=deterministic
         )
         all_probs = torch.as_tensor(all_probs, device=trainer.device, dtype=torch.float32)
 
@@ -174,7 +174,7 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         task_agent_ids = torch.tensor([self.edge_id_to_agent_idx.get(eid.item(), 0) for eid in task_edge_ids],
                                       device=trainer.device)
 
-        node_ids, model_ids, masked_probs, actual_workloads = self.heuristic(
+        node_ids, model_ids, masked_probs, actual_workloads, invalid_logits_penalty = self.heuristic(
             trainer, task_agent_ids, s_idx, all_probs, tasks_min_accuracy, task_deadlines, batch_sizes, minium_wl
         )
 
@@ -182,9 +182,9 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         sum_w = actual_workloads.sum(dim=-1, keepdim=True).clamp(min=1e-8)
         current_dist = actual_workloads / sum_w
         neighbor_rate=  self.agent_adj_matrix/self.agent_adj_matrix.sum(dim=-1)
-        self.distributed_task = current_dist
-
-        return node_ids, model_ids, task_agent_ids, all_probs, actual_workloads, torch.einsum("ij, jsn -> isn", neighbor_rate, current_dist).flatten(0, 1)
+        curr_mf=torch.einsum("ij, jsn -> isn", neighbor_rate, current_dist).flatten(0, 1)
+        self.distributed_task = curr_mf
+        return node_ids, model_ids, task_agent_ids, all_probs, actual_workloads, curr_mf, invalid_logits_penalty
 
     def store_upper_transitions(self, trainer, s_all, ns_all, current_res, next_res, acts_matrix, is_done):
         # res_upper keys: 'actions', 'phi_prob', 'mean_fields', 'resources'
@@ -246,16 +246,18 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
                                                      batch_sizes)
                     current_state_t = self._build_unified_state(trainer_obj, prev_lower_res, min_wl_flat)
                     # get action
-                    n_idx, m_idx, _, all_probs, actual_wl, curr_mf = self.get_lower_actions(
+                    n_idx, m_idx, _, all_probs, actual_wl, curr_mf, invalid_logits_penalty = self.get_lower_actions(
                         trainer_obj, current_state_t, min_wl_flat, t_idx, s_idx, tasks_min_accuracy, task_deadlines,
                         batch_sizes
                     )
                     # step env
                     current_lower_res = trainer_obj.env.step_lower(t_idx, s_idx, batch_sizes, n_idx, m_idx, task_deadlines, tasks_min_accuracy)
                     current_lower_res["is_done"] = is_done
+                    trainer_obj.aggregator.add_lower(current_lower_res)
 
                     if transition_cache is not None:
-                        cache_S_t, cache_A_t, cache_R_t, cache_prev_mf, cache_curr_mf, cache_is_done = transition_cache
+                        # 3. UNPACK THÊM CACHE_MASKS
+                        cache_S_t, cache_A_t, cache_R_t, cache_prev_mf, cache_curr_mf, cache_is_done, cache_masks = transition_cache
 
                         # current_state_t của slot hiện tại chính là S_{t+1} của slot cũ
                         next_state_for_cache = current_state_t
@@ -263,15 +265,25 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
                         flat_agent_indices = torch.arange(self.num_edges, device=trainer_obj.device).unsqueeze(
                             1).expand(-1, trainer_obj.num_services).reshape(-1)
 
+                        # 4. THÊM action_masks=cache_masks VÀO ĐÂY
                         self.lower_agent.memory.add_batch(
                             cache_S_t, cache_prev_mf, cache_A_t, cache_R_t.view(-1, 1),
                             next_state_for_cache, cache_curr_mf,
                             torch.full((cache_S_t.shape[0], 1), float(cache_is_done), device=trainer_obj.device),
-                            flat_agent_indices
+                            flat_agent_indices,
+                            action_masks=cache_masks
                         )
                     rewards = self._calculate_reward(trainer_obj, current_lower_res, actual_wl, task_agent_ids, t_idx,
-                                                     s_idx)
-                    transition_cache = (current_state_t, all_probs, rewards, prev_mf.clone(), curr_mf.clone(), is_done)
+                                                     s_idx, invalid_logits_penalty)
+
+                    # 1. TÍNH MASK TẠI THỜI ĐIỂM HIỆN TẠI
+                    curr_masks = trainer_obj.env.engine.placement_matrix.T.unsqueeze(0).expand(self.num_edges, -1,
+                                                                                               -1).reshape(-1,
+                                                                                                           trainer_obj.num_nodes)
+
+                    # 2. ĐỈNH KÉM MASK VÀO CACHE (Tăng từ 6 lên 7 phần tử)
+                    transition_cache = (current_state_t, all_probs, rewards, prev_mf.clone(), curr_mf.clone(), is_done,
+                                        curr_masks)
                     prev_mf = curr_mf.clone()
                     prev_lower_res = current_lower_res
 
@@ -294,7 +306,8 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
                         mf_upper_loss = self.store_upper_transitions(trainer_obj, prev_upper_state, current_upper_state, prev_upper_res, current_upper_res,
                                                      u_acts_matrix, is_ep_done)
                     prev_upper_state = current_upper_state
-                    prev_lower_res = current_lower_res
+                    if current_lower_res is not None:
+                        prev_lower_res = current_lower_res
                     trainer_obj.aggregator.add_upper(current_upper_res, mf_loss=mf_upper_loss)
 
                     # train upper
@@ -310,17 +323,21 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
                         trainer_obj.aggregator.record_td_losses(upper_losses=loss)
 
             # XỬ LÝ CACHE CUỐI CÙNG CỦA EPISODE
+            # XỬ LÝ CACHE CUỐI CÙNG CỦA EPISODE
             if transition_cache is not None:
-                cache_S_t, cache_A_t, cache_R_t, cache_prev_mf, cache_curr_mf, cache_is_done = transition_cache
+                # 5. UNPACK THÊM CACHE_MASKS
+                cache_S_t, cache_A_t, cache_R_t, cache_prev_mf, cache_curr_mf, cache_is_done, cache_masks = transition_cache
                 dummy_next_state = cache_S_t.clone().zero_()
                 flat_agent_indices = torch.arange(self.num_edges, device=trainer_obj.device).unsqueeze(
                     1).expand(-1, trainer_obj.num_services).reshape(-1)
 
+                # 6. THÊM action_masks=cache_masks VÀO ĐÂY
                 self.lower_agent.memory.add_batch(
                     cache_S_t, cache_prev_mf, cache_A_t, cache_R_t.view(-1, 1),
                     dummy_next_state, cache_curr_mf,
                     torch.full((cache_S_t.shape[0], 1), 1.0, device=trainer_obj.device),  # Done = True
-                    flat_agent_indices
+                    flat_agent_indices,
+                    action_masks=cache_masks
                 )
             trainer_obj.aggregator.store_history()
             trainer_obj.update_rates(ep)
@@ -338,7 +355,7 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         self.upper_agent.save(os.path.join(checkpoint_dir, "upper_d3qn_final.pth"))
         print(colored(f"\n[Final] Checkpoints saved to {checkpoint_dir}", "green", attrs=["bold"]))
 
-    def _calculate_reward(self, trainer, current_lower_res, actual_workloads, task_agent_ids, t_idx, s_idx):
+    def _calculate_reward(self, trainer, current_lower_res, actual_workloads, task_agent_ids, t_idx, s_idx, invalid_logits_penalty):
         """
         Tính toán Reward cho Lower Agent dựa trên 3 cột trụ:
         1. Năng lượng (Base)
@@ -408,9 +425,18 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
 
         # 4. Tính chỉ số Reward phẳng
         indices = task_agent_ids * trainer.num_services + s_idx  # Shape: (num_tasks,)
-
+        task_counts = torch.zeros(num_sample, device=device)
+        task_counts.index_add_(0, indices, torch.ones(len(indices), device=device))
+        qos_sum = torch.zeros(num_sample, device=device)
+        qos_sum.index_add_(0, indices, -qos_penalty)
         # 5. Cộng dồn vào mảng rewards (Shape khớp hoàn toàn: 20 và 20)
-        rewards.index_add_(0, indices, -qos_penalty)
+        rewards += qos_sum / task_counts.clamp(min=1.0)
+
+        LAMBDA_INVALID = 0.01
+        invalid_sum = torch.zeros(num_sample, device=device)
+        invalid_sum.index_add_(0, indices, invalid_logits_penalty)
+        rewards -= LAMBDA_INVALID * (invalid_sum / task_counts.clamp(min=1.0))
+
         rew_divisor = trainer.config.norm_lower_rw
         rewards = log_transform(rewards / rew_divisor if rew_divisor != 0 else 1.0)
 
@@ -462,7 +488,7 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
                     # ==========================================
                     # 3. LẤY HÀNH ĐỘNG (Sửa chữ ký khớp với bản mới)
                     # ==========================================
-                    n_idx, m_idx, _, all_probs, actual_wl, _ = self.get_lower_actions(
+                    n_idx, m_idx, _, all_probs, actual_wl, _, invalid_logits_penalty = self.get_lower_actions(
                         trainer, current_state, min_wl_flat, t_idx, s_idx,
                         tasks_min_accuracy, task_deadlines, batch_sizes, deterministic=True
                     )
@@ -510,7 +536,7 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         edge_ids = torch.tensor([self.agent_id_to_edge_idx[eid.item()] for eid in agent_ids], device=device)
 
         # Step 1: Masking & Softmax
-        masked_probs, indices = get_valid_probs(
+        masked_probs, indices, invalid_logits_penalty = get_valid_probs(
             probs, trainer.env.engine.placement_matrix, agent_ids, service_ids, num_nodes, trainer.num_services
         )
 
@@ -534,7 +560,7 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
         full_masked_probs = torch.zeros((self.num_edges * trainer.num_services, num_nodes), device=device)
         full_masked_probs.index_add_(0, indices, masked_probs)
 
-        return assigned_nodes, assigned_models, full_masked_probs, actual_workloads
+        return assigned_nodes, assigned_models, full_masked_probs, actual_workloads, invalid_logits_penalty
     # WATER-FILLING VECTORIZED
     def _fast_water_filling(self, sort_idx: torch.Tensor, edge_ids: torch.Tensor, service_ids: torch.Tensor,
                             masked_probs,
@@ -682,15 +708,25 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
 
         return assigned_models, actual_workloads
 
+
 def get_valid_probs(probs, placement, agent_ids, service_ids, num_nodes, num_services):
-    """Trả về xác suất đã qua masking và index tương ứng"""
+    """Trả về xác suất đã qua masking, index, và ĐỘ PHẠT LOGIT"""
     placed_mask = placement.T[service_ids]  # (T, N)
     indices = agent_ids * num_services + service_ids  # (T,)
-    selected_probs = probs.view(-1, num_nodes)[indices]  # (T, N)
 
-    # Mask các node không có service bằng -inf trước khi softmax
-    selected_probs = selected_probs.masked_fill(placed_mask == 0, float('-inf'))
-    masked_probs = torch.softmax(selected_probs, dim=-1)  # (T, N)
-    return masked_probs, indices
+    # Lấy logit thô từ Actor (có thể âm, dương)
+    raw_logits = probs.view(-1, num_nodes)[indices]  # (T, N)
+
+    # 1. TÍNH PHẠT MỀM (Dùng absolute value để ép mạng về 0)
+    invalid_penalty = (torch.abs(raw_logits) * (1.0 - placed_mask)).sum(dim=-1)  # Shape: (T,)
+
+    # 2. MASK CỨNG (Đẩy xuống -50 thay vì -inf để giữ gradient mỏng)
+    safe_logits = raw_logits.masked_fill(placed_mask == 0, -50.0)
+    masked_probs = torch.softmax(safe_logits, dim=-1)  # (T, N)
+
+    # Xử lý lỗi Nan (trường hợp cả N nodes đều invalid)
+    masked_probs = torch.nan_to_num(masked_probs, nan=0.0)
+
+    return masked_probs, indices, invalid_penalty
 
 

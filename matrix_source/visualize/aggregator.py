@@ -204,16 +204,16 @@ class MetricsAggregator:
         success = _get_sum(self.episode_success_qos, "success")
         violate = _get_sum(self.episode_violate_qos, "violate")
         self.history["qos_success_rate"].append(success / (success + violate) if (success + violate) > 0 else 0)
-        
-        assigned = _get_sum(self.episode_assigned_list, "assigned")
-        failed = _get_sum(self.episode_failed_list, "failed")
-        
+
+        # Completion rate: tasks successfully processed / all tasks that arrived
+        # rem_val = số task còn trong queue cuối episode (chưa xử lý xong)
         if self.episode_remaining_tasks:
             rem_val = float(self.episode_remaining_tasks[-1].item() if hasattr(self.episode_remaining_tasks[-1], "item") else self.episode_remaining_tasks[-1])
         else:
             rem_val = 0.0
-        
-        self.history["completion_rate"].append((assigned - failed - rem_val) / assigned if assigned > 0 else 0)
+
+        total_resolved = success + violate + rem_val
+        self.history["completion_rate"].append(success / total_resolved if total_resolved > 0 else 0.0)
         self.history["avg_backlog_drift"].append(_get_avg(self.episode_backlog_drift, "avg_backlog_drift"))
         self.history["avg_remaining_tasks"].append(_get_avg(self.episode_remaining_tasks, "avg_remaining_tasks"))
         self.history["avg_realized_delay"].append(_get_avg(self.episode_realized_delay, "avg_realized_delay"))

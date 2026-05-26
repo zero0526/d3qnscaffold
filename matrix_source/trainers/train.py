@@ -80,11 +80,19 @@ class Trainer:
         self.eps_lower = self.min_epsilon + (self.epsilon_start - self.min_epsilon) * \
                          math.exp(-self.total_lower_steps / 100 / self.annealing)
 
+        # zeta_upper: bắt đầu từ zeta_initial (=1.0), tăng dần lên zeta_max khi có nhiều upper steps
+        # Dùng (1 - exp) để tăng từ 0→1 thay vì exp giảm từ 1→0
         self.zeta_upper = self.zeta_initial_upper + (self.zeta_max_upper - self.zeta_initial_upper) * \
-                         math.exp(-self.total_upper_steps / 10 / self.annealing)
+                         (1.0 - math.exp(-self.total_upper_steps / 10 / self.annealing))
 
-        self.zeta_lower = self.zeta_initial_lower + (self.zeta_initial_lower - self.zeta_initial_lower) * \
-                         math.exp(-self.total_lower_steps / 100 / self.annealing)
+        # zeta_lower: giữ nguyên initial trong warmup eps, sau đó tăng từng bước nhỏ
+        if ep < self.zeta_lower_warmup:
+            self.zeta_lower = self.zeta_initial_lower
+        else:
+            self.zeta_lower = min(
+                self.zeta_initial_lower + self.zeta_lower_step * (ep - self.zeta_lower_warmup),
+                self.zeta_lower_max
+            )
 
 def log_transform(reward: float) -> float:
     return reward

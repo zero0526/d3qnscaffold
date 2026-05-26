@@ -1,4 +1,3 @@
-import math
 from typing import Literal
 
 import torch
@@ -95,11 +94,12 @@ class MFGaussianActor(nn.Module):
             z = mean
         else:
             z = normal.rsample()
-
-        action = torch.tanh(z)
-
-        log_prob = normal.log_prob(z) - (2 * (math.log(2) - z - F.softplus(-2 * z)))
-        log_prob = log_prob.sum(dim=-1, keepdim=True)
+        #
+        # action = torch.tanh(z)
+        #
+        # log_prob = normal.log_prob(z) - (2 * (math.log(2) - z - F.softplus(-2 * z)))
+        action= z
+        log_prob = normal.log_prob(z).sum(dim=-1, keepdim=True)
         return action, log_prob
 
 class MFSACAgent:
@@ -221,7 +221,7 @@ class MFSACAgent:
 
     def learn(self, agents_ids: torch.Tensor = None):
         ready_pool = (self.memory.buffer_sizes >= self.min_batch_size).nonzero(as_tuple=True)[0]
-        
+
         if agents_ids is not None:
             if not isinstance(agents_ids, torch.Tensor):
                 agents_ids = torch.tensor(agents_ids, device=self.device)
@@ -234,12 +234,15 @@ class MFSACAgent:
         if len(target_agents) == 0:
             return None
 
-        states, prev_mfs, actions, rewards, curr_states, curr_mfs, dones, agent_ids = \
+        # UNPACK THÊM ACTION MASK (Vị trí số 3)
+        states, prev_mfs, actions, action_masks, rewards, curr_states, curr_mfs, dones, agent_ids = \
             self.memory.sample(self.batch_size, agent_ids=target_agents)
 
         agent_ids = agent_ids.view(-1)
         actions = actions.float()
-        if actions.shape[-1] == 1 and self.action_dim > 1: # Adjust shape if incorrectly recorded as 1D
+        action_masks = action_masks.float()  # Đảm bảo dtype float
+
+        if actions.shape[-1] == 1 and self.action_dim > 1:
             actions = actions.view(-1, self.action_dim)
 
         # 1. Train MF Predictor
@@ -252,18 +255,22 @@ class MFSACAgent:
 
         # 2. Train Critic
         with torch.no_grad():
-            # Use curr_mfs for next MF as it's the observed mean field in next state
-            pred_next_mf= self.mf(torch.cat([curr_states, curr_mfs], dim=-1), indices=agent_ids)
-            next_action, next_log_prob = self.actor.sample(curr_states, pred_next_mf, indices=agent_ids)
-            
-            target_q1, target_q2 = self.critic_target(curr_states, next_action, pred_next_mf, indices=agent_ids)
+            # Target Action sinh ra từ Actor
+            next_action, next_log_prob = self.actor.sample(curr_states, curr_mfs, indices=agent_ids)
+
+            # QUAN TRỌNG: Mask Next Action trước khi đưa vào Target Critic
+            next_action_masked = next_action * action_masks
+
+            target_q1, target_q2 = self.critic_target(curr_states, next_action_masked, curr_mfs, indices=agent_ids)
             target_q = torch.min(target_q1, target_q2) - self.get_alpha[agent_ids] * next_log_prob
             target_q = rewards + (1.0 - dones) * self.gamma * target_q
 
-        # Current Q uses the MF at state s: prev_mfs
-        pred_curr_mf= self.mf(torch.cat([states, prev_mfs], dim=-1), indices=agent_ids).detach()
-        current_q1, current_q2 = self.critic(states, actions, pred_curr_mf, indices=agent_ids)
-        
+        # QUAN TRỌNG: Mask Current Action từ Buffer trước khi đưa vào Critic
+        # (Dù action trong buffer vốn đã qua Softmax ở -inf, nhưng nhân lại mask cho đảm bảo tuyệt đối 0.0)
+        curr_action_masked = actions * action_masks
+
+        current_q1, current_q2 = self.critic(states, curr_action_masked, prev_mfs, indices=agent_ids)
+
         critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
 
         self.critic_optimizer.zero_grad()
@@ -272,9 +279,14 @@ class MFSACAgent:
         self.critic_optimizer.step()
 
         # 3. Train Actor
-        # Actor usually learns based on the perceived/predicted MF to stay consistent
-        new_action, log_prob = self.actor.sample(states, pred_curr_mf, indices=agent_ids)
-        q1_new, q2_new = self.critic(states, new_action, pred_curr_mf, indices=agent_ids)
+        # QUAN TRỌNG: Dùng action GỐC (chưa mask) để tính log_prob.
+        # Nếu dùng mask ở đây, log_prob sẽ bị lỗi (NaN).
+        new_action, log_prob = self.actor.sample(states, prev_mfs, indices=agent_ids)
+
+        # Nhưng khi đưa hành động mới này cho Critic chấm điểm, PHẢI MASK nó
+        new_action_masked = new_action * action_masks
+
+        q1_new, q2_new = self.critic(states, new_action_masked, prev_mfs, indices=agent_ids)
         q_new = torch.min(q1_new, q2_new)
 
         actor_loss = (self.get_alpha[agent_ids].detach() * log_prob - q_new).mean()
@@ -297,15 +309,16 @@ class MFSACAgent:
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
         self.learn_step_counter += 1
-        
+
         q_min = q_new.min().item()
         q_max = q_new.max().item()
         q_mean = q_new.mean().item()
-        
-        step=10
-        if self.node_type=="Offload_Group":step=100
+
+        step = 10
+        if self.node_type == "Offload_Group": step = 100
         if self.learn_step_counter % step == 0:
-            print(f"[{self.node_type} Group] Step {self.learn_step_counter:5d} | MF-Loss: {mf_loss.item():.5f} | C-Loss: {critic_loss.item():.5f} | A-Loss: {actor_loss.item():.5f} | Q [Min: {q_min:.3f}, Max: {q_max:.3f}, Mean: {q_mean:.3f}]")
+            print(
+                f"[{self.node_type} Group] Step {self.learn_step_counter:5d} | MF-Loss: {mf_loss.item():.5f} | C-Loss: {critic_loss.item():.5f} | A-Loss: {actor_loss.item():.5f} | Q [Min: {q_min:.3f}, Max: {q_max:.3f}, Mean: {q_mean:.3f}]")
 
         if self.logs_q:
             return {
