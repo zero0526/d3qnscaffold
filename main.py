@@ -6,6 +6,6 @@ from matrix_source.trainers.d3qn_scaffold_strategy_v2 import D3QNScaffoldStrateg
 from matrix_source.trainers.rb_sac_cen_stra_copy import RB_SAC_CEN_STRA
 
 if __name__ == '__main__':
-    strategy = RB_SAC_CEN_STRA()
+    strategy = D3QNStrategy()
     trainer = Trainer(strategy=strategy)
     trainer.train()

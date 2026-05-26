@@ -385,7 +385,6 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
 
         # TWO-SIDED LYAPUNOV (Cân bằng Cung - Cầu)
         LAMBDA_OVER = 1.0
-        LAMBDA_UNDER = 0.1
 
         obs_dict = current_lower_res['obs']
         W = obs_dict['cpu_alloc']
@@ -400,15 +399,11 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
                 W_v = W[:, s_idx]  # Tài nguyên tại các Node cho Service(s). Shape: (N,)
                 Q_v = Q[:, s_idx]  # Hàng đợi tại các Node cho Service(s). Shape: (N,)
 
-                # Phạt quá tải: Q * max(A - W, 0) -> Ngăn chặn làm hàng đợi phình to
-                overload = torch.clamp(A_e - W_v, min=0)
+                # Phạt quá tải: Q * max(A - W, 0) ->
+                overload = A_e - W_v
                 penalty_over = (Q_v * overload).sum()
 
-                # Phạt dư thừa: max(W - A, 0) -> Ép sử dụng tài nguyên triệt để
-                underload = torch.clip(W_v - A_e, min=0)
-                penalty_under = underload.sum()
-
-                rewards[local_idx] -= (LAMBDA_OVER * penalty_over + LAMBDA_UNDER * penalty_under)
+                rewards[local_idx] -= (LAMBDA_OVER * penalty_over)
 
 
         violate_qos = current_lower_res["info"].get('terminal_fail_counts',
@@ -604,7 +599,7 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
 
             # 2. Tính không gian còn trống và Kiểm tra điều kiện (Vectorized trên N nodes)
             space_left = quotas - actual_workloads[e_idx, s_idx]
-            fits_mask = (space_left >= w_base - 1e-6) & (valid_mask[i]>1e-6)
+            fits_mask = (space_left >= w_base - 1e-6) & (valid_mask[i]>1e-3)
 
             # 3. Lấy khoảng cách truyền dẫn
             trans_delays = distance_matrix[self.edge_ids[e_idx]]  # (N,)

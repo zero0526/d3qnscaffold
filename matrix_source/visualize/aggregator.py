@@ -252,11 +252,13 @@ class MetricsAggregator:
             h_total = sum(float(r.get('hardware', 0)) for r in self.episode_step_fail_reasons)
             q_total = sum(float(r.get('queue_full', 0)) for r in self.episode_step_fail_reasons)
             p_total = sum(float(r.get('invalid_placement', 0)) for r in self.episode_step_fail_reasons)
+            e_total = sum(float(r.get('expired', 0)) for r in self.episode_step_fail_reasons)
             self.log(f" --- Fail Reason Breakdown ---")
             self.log(f"  Deadline exceeded : {d_total:.0f}")
             self.log(f"  Hardware (f_max)  : {h_total:.0f}")
             self.log(f"  Queue full        : {q_total:.0f}")
             self.log(f"  Invalid placement : {p_total:.0f}")
+            self.log(f"  Expired in Queue  : {e_total:.0f}")
 
     def _moving_average(self, data, window=10):
         if len(data) < window: return data

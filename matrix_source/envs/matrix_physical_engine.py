@@ -404,13 +404,14 @@ class MatrixPhysicalEngine:
         # Terminal -> source node mapping (num_terminals,)
         src_node_mapping = torch.argmax(self.terminal_to_node_map, dim=1).long()
         
-        self.backlog_queue, actual_processed, local_processed, in_slot_violation_mask = ops.deplete_float_queue(
+        self.backlog_queue, actual_processed, local_processed = ops.deplete_float_queue(
             self.backlog_queue, self.deadline_queue, self.terminal_queue, src_node_mapping, self.cpu_alloc_matrix, self.slot_duration
         )
         
         self.backlog_queue, self.deadline_queue, processed_aux, expired_counts_tensor, failed_terminal_ids, failed_svc_ids = ops.age_and_clean_dual_queue(
-            self.backlog_queue, self.deadline_queue, in_slot_violation_mask, self.slot_duration, self.f_min_queue, self.terminal_queue
+            self.backlog_queue, self.deadline_queue, self.slot_duration, self.f_min_queue, self.terminal_queue
         )
+
         self.f_min_queue, self.terminal_queue = processed_aux[0], processed_aux[1]
         
         if failed_terminal_ids is not None and len(failed_terminal_ids) > 0:
@@ -423,7 +424,10 @@ class MatrixPhysicalEngine:
         num_violations = violate_step_tensor.sum()
         
         # Success count calculation
-        success_qos_tensor = (count_before + self.arrival_counts_step - self.backlog_counts - violate_step_tensor).clamp(min=0)
+        # Cast to float to avoid precision loss and correct formula (remove arrival_counts_step)
+        count_before_f = count_before.float()
+        backlog_counts_f = self.backlog_counts.float()
+        success_qos_tensor = (count_before_f - backlog_counts_f - violate_step_tensor).clamp(min=0)
         # N x S: resources spent on tasks offloaded FROM other nodes
         total_capacity_used = self.cpu_alloc_matrix * self.slot_duration
         external_snack = (total_capacity_used - local_processed).clamp(min=0)
@@ -466,6 +470,7 @@ class MatrixPhysicalEngine:
                 "hardware": self.fail_hw.sum(),
                 "queue_full": self.fail_queue.sum(),
                 "invalid_placement": self.fail_placement.sum(),
+                "expired": expired_counts_tensor.sum(),
                 "hw_deficit_per_svc": self.service_hw_deficit,
                 "hw_fail_count_per_svc": self.service_hw_fail_count
             }
