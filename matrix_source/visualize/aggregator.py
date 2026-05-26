@@ -237,13 +237,26 @@ class MetricsAggregator:
         self.log(f"EP {ep:4d} | Rew: {tr:8.2f} | Energy: {en:8.2f} | QoS: {qos:6.2%} | Comp: {cr:6.2%}")
         
         if self.episode_terminal_fails is not None and np.sum(self.episode_terminal_fails) > 0:
-            self.log(f" --- Per-Terminal Failure Breakdown ---")
-            header = " Term ID | Fail Count"
-            self.log(header)
-            self.log("-" * len(header))
-            for tid in range(len(self.episode_terminal_fails)):
-                if self.episode_terminal_fails[tid] > 0:
-                    self.log(f" {tid:<7} | {self.episode_terminal_fails[tid]:<10.0f}")
+            pass
+            # self.log(f" --- Per-Terminal Failure Breakdown ---")
+            # header = " Term ID | Fail Count"
+            # self.log(header)
+            # self.log("-" * len(header))
+            # for tid in range(len(self.episode_terminal_fails)):
+            #     if np.any(self.episode_terminal_fails[tid] > 0):
+            #         self.log(f" {tid:<7} | {np.sum(self.episode_terminal_fails[tid]):<10.0f}")
+
+        # Log fail reason summary
+        if self.episode_step_fail_reasons:
+            d_total = sum(float(r.get('deadline', 0)) for r in self.episode_step_fail_reasons)
+            h_total = sum(float(r.get('hardware', 0)) for r in self.episode_step_fail_reasons)
+            q_total = sum(float(r.get('queue_full', 0)) for r in self.episode_step_fail_reasons)
+            p_total = sum(float(r.get('invalid_placement', 0)) for r in self.episode_step_fail_reasons)
+            self.log(f" --- Fail Reason Breakdown ---")
+            self.log(f"  Deadline exceeded : {d_total:.0f}")
+            self.log(f"  Hardware (f_max)  : {h_total:.0f}")
+            self.log(f"  Queue full        : {q_total:.0f}")
+            self.log(f"  Invalid placement : {p_total:.0f}")
 
     def _moving_average(self, data, window=10):
         if len(data) < window: return data

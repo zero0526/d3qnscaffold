@@ -314,7 +314,7 @@ class MatrixPhysicalEngine:
             if fail_hw_mask.any():
                 fhn = vn[fail_hw_mask]
                 fhs = vs[fail_hw_mask]
-                fht = terminal_indices[valid_mask][fail_hw_mask]
+                fht = vn[fail_hw_mask]
                 self.immediate_fails.index_put_((fhn, fhs), torch.ones_like(fhs, dtype=torch.float), accumulate=True)
                 self.fail_hw.index_put_((fhn, fhs), torch.ones_like(fhs, dtype=torch.float), accumulate=True)
                 self.terminal_fail_counts.index_put_((fht, fhs), torch.ones_like(fht, dtype=torch.float), accumulate=True)
@@ -489,10 +489,10 @@ class MatrixPhysicalEngine:
         # Reset newly_placed_mask after the first slot of the timeframe
         self.newly_placed_mask.zero_()
         
-        if self.profiling_step % 500 == 0:
-            print(f"\n--- Engine Profiling (Step {self.profiling_step}) ---")
-            for k, v in sorted(self.prof.items()):
-                print(f"  {k:20s}: {v*1000/500:8.3f} ms/step")
-            self.prof.clear()
+        # if self.profiling_step % 500 == 0:
+        #     print(f"\n--- Engine Profiling (Step {self.profiling_step}) ---")
+        #     for k, v in sorted(self.prof.items()):
+        #         print(f"  {k:20s}: {v*1000/500:8.3f} ms/step")
+        #     self.prof.clear()
             
         return res

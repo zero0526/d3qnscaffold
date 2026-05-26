@@ -255,6 +255,6 @@ class D3QNStrategy(AlgorithmStrategy):
             trainer.aggregator.report_episode(ep)
             print(f"--- Global Metrics ---")
             print(f"Lower Samples: {trainer.total_lower_steps} | Upper Samples: {trainer.total_upper_steps}")
-            print(f"Zeta Lower: {trainer.zeta_lower:.4f} | Zeta Upper: {trainer.zeta_upper:.4f}")
-            print(f"Current Epsilon upper: {trainer.eps_upper:.4f} lower: {trainer.eps_lower:.4f}")
+            # print(f"Zeta Lower: {trainer.zeta_lower:.4f} | Zeta Upper: {trainer.zeta_upper:.4f}")
+            # print(f"Current Epsilon upper: {trainer.eps_upper:.4f} lower: {trainer.eps_lower:.4f}")
 

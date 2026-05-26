@@ -353,9 +353,9 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
                     cache_flat_agent_indices,
                     action_masks=cache_masks
                 )
+            trainer_obj.aggregator.report_episode(ep)
             trainer_obj.aggregator.store_history()
             trainer_obj.update_rates(ep)
-            trainer_obj.aggregator.report_episode(ep)
             print(f"--- Global Metrics ---")
             print(f"Lower Samples: {trainer_obj.total_lower_steps} | Upper Samples: {trainer_obj.total_upper_steps}")
             print(f"Zeta Lower: {trainer_obj.zeta_lower:.4f} | Zeta Upper: {trainer_obj.zeta_upper:.4f}")
@@ -526,8 +526,8 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
                     current_upper_state = next_upper_state
                     obs_upper = res_upper
 
-            trainer.aggregator.store_history()
             trainer.aggregator.report_episode(ep)
+            trainer.aggregator.store_history()
 
         print(f"\n>>> Evaluation Complete <<<")
 
@@ -615,9 +615,9 @@ class RB_SAC_CEN_STRA(AlgorithmStrategy):
                 cost = torch.where(fits_mask, trans_delays, float('inf'))
                 target_node = cost.argmin().item()
             else:
-                # Overflow: Chọn node có phần dư (slack) lớn nhất
-                # (Gán -inf cho node không hợp lệ để argmax bỏ qua chúng)
-                cost = torch.where(valid_mask[i]<1e-6, space_left, float('-inf'))
+                # Overflow: Chọn node có phần dư (slack) lớn nhất (CHỈ TRÊN CÁC NODE HỢP LỆ)
+                # Gán -inf cho node không hợp lệ để argmax bỏ qua chúng
+                cost = torch.where(valid_mask[i] > 1e-6, space_left, float('-inf'))
                 target_node = cost.argmax().item()
 
             assigned_nodes[i] = target_node
@@ -735,7 +735,7 @@ def get_valid_probs(probs, placement, agent_ids, service_ids, num_nodes, num_ser
     # 1. TÍNH PHẠT MỀM (Dùng absolute value để ép mạng về 0)
     invalid_penalty = (torch.abs(raw_logits) * (1.0 - placed_mask)).sum(dim=-1)  # Shape: (T,)
 
-    # 2. MASK CỨNG (Đẩy xuống -50 thay vì -inf để giữ gradient mỏng)
+    # 2. MASK CỨNG (Sử dụng -50.0 đồng nhất theo yêu cầu)
     safe_logits = raw_logits.masked_fill(placed_mask == 0, -50.0)
     masked_probs = torch.softmax(safe_logits, dim=-1)  # (T, N)
 
