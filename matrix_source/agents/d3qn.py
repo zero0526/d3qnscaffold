@@ -324,13 +324,12 @@ class D3QNAgent:
         # Update logging/target
         self.learn_step_counter += 1
         
-        q_min = q_eval.min().item()
-        q_max = q_eval.max().item()
-        q_mean = q_eval.mean().item()
-
         step=10
         if self.node_type=="Terminal_Group":step=100
         if self.learn_step_counter % step == 0:
+            q_min = q_eval.min().item()
+            q_max = q_eval.max().item()
+            q_mean = q_eval.mean().item()
             print(f"[{self.node_type} Group] Step {self.learn_step_counter:5d} | TD Loss: {loss.item():.5f} | Q [Min: {q_min:.3f}, Max: {q_max:.3f}, Mean: {q_mean:.3f}]")
         
         self._soft_update()
@@ -338,9 +337,9 @@ class D3QNAgent:
         if self.logs_q:
             return {
                 "loss": loss.item(),
-                "q_min": q_min,
-                "q_max": q_max,
-                "q_mean": q_mean
+                "q_min": q_eval.min().item(),
+                "q_max": q_eval.max().item(),
+                "q_mean": q_eval.mean().item()
             }
         return loss.item()
 
