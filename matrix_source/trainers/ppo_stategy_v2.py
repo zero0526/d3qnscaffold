@@ -1,6 +1,9 @@
 import torch
 from matrix_source.agents.ppo import PPOAgent
+from matrix_source.agents.ppo_scaffold_v2 import PPOSCAFFOLDREPAgent
+
 from matrix_source.trainers.strategies import AlgorithmStrategy
+from matrix_source.trainers.train import log_transform
 from matrix_source.utils.math_utils import to_binary
 from tqdm import tqdm
 import os
@@ -38,7 +41,7 @@ def compute_gae(rewards, next_values, values, dones, agent_ids, gamma, lmbda):
     return advantages
 
 
-class PPOStrategy(AlgorithmStrategy):
+class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
     def __init__(self):
         super().__init__()
         self.lower_train_num = 0
@@ -54,7 +57,7 @@ class PPOStrategy(AlgorithmStrategy):
             2: {'lower': 10, 'upper': 7,  'zeta': 2.0, 'det': False},
             3: {'lower': 6,  'upper': 4,  'zeta': 1.0, 'det': True}
         }
-        
+
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
         self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 5}
 
@@ -97,7 +100,7 @@ class PPOStrategy(AlgorithmStrategy):
         )
 
         # 2. Lower Agent
-        trainer.shared_lower_agent = PPOAgent(
+        trainer.shared_lower_agent = PPOSCAFFOLDREPAgent(
             node_id=-1, node_type="Terminal_Group",
             state_dim=trainer.lower_state_dim,
             action_dim=trainer.lower_action_dim,
@@ -105,6 +108,7 @@ class PPOStrategy(AlgorithmStrategy):
             mf_hidden_sizes=tuple(trainer.config.hyper_neural["MF_HIDDEN_LAYER"]),
             mf_lr=float(trainer.config.hyper_neural['MF_LR']),
             buffer_min_size=self.lower_cfg['min_size'],
+            num_groups=trainer.num_edge_agents,  # Pass num_groups for SCAFFOLD
             target_entropy_ratio=0.5,
             target_entropy_end_ratio=0.01,
             total_train_steps=60,
@@ -118,7 +122,21 @@ class PPOStrategy(AlgorithmStrategy):
             num_instances=trainer.num_terminals,
             device=trainer.device
         )
-        # 3. Initial Phase Jump (if warmup is 0)
+
+        # 3. Compute Terminal-to-Group Mapping from Environment
+        # terminal_to_comp_node_map corresponds to (num_terminals, num_comp_nodes)
+        mapping_matrix = trainer.env.static_matrices['terminal_to_comp_node_map']
+        terminal_node_indices = mapping_matrix.argmax(dim=1)
+        
+        terminal_to_group = torch.zeros(trainer.num_terminals, dtype=torch.long, device=trainer.device)
+        for k in range(trainer.num_terminals):
+            node_idx = int(terminal_node_indices[k])
+            # Map node index to edge agent index using node_to_instance
+            terminal_to_group[k] = trainer.node_to_instance.get(node_idx, 0)
+            
+        trainer.terminal_to_group = terminal_to_group
+
+        # 4. Initial Phase Jump (if warmup is 0)
         if self.phase == 'LOWER_ONLY' and self.lower_warmup_steps == 0:
             self.phase = 'UPPER_ONLY'
             print(f"[Curriculum] Initial skip: LOWER_ONLY -> UPPER_ONLY")
@@ -182,94 +200,178 @@ class PPOStrategy(AlgorithmStrategy):
             masks[invalid_mask_rows] = 1.0
         return masks
 
-    def get_lower_actions(self, trainer, res_lower, t_idx, s_idx, tasks_min_accuracy, task_deadlines, batch_sizes):
-        obs_dict = res_lower['obs']
-        mf_terminals = res_lower['mean_field']
-        meta = trainer.env.metadata
+    # ------------------------------------------------------------------
+    # Mean-field helpers
+    # ------------------------------------------------------------------
+    def build_lower_state(self, trainer, obs, t_idx, s_idx):
+        """Build a normalised state tensor from an obs dict for a batch of tasks.
 
-        data_sizes = batch_sizes * meta['service_input_size'][s_idx].squeeze(-1)
-        s_tasks = torch.stack(
-            [data_sizes, tasks_min_accuracy, task_deadlines, meta['service_omega'][s_idx].squeeze(-1)], dim=1).float()
-        # Get Current Placement to mask out stale values (especially on frame boundaries)
-        current_placement = trainer.env.engine.placement_matrix[:, s_idx]
-        num_reqs = states_rows = s_tasks.shape[0]
-        
-        # Use reshape(1, -1) to safely handle any dimensionality from s_idx indexing before expansion
-        s_backlogs = (obs_dict['backlog'][:, s_idx] * current_placement).T
-        s_cpus = (obs_dict['cpu_alloc'][:, s_idx] * current_placement).T
-        states = torch.cat([s_tasks, s_backlogs, s_cpus], dim=1)
+        Args:
+            obs   : observation dict returned by env (has 'task_reqs', 'backlog', 'cpu_alloc')
+            t_idx : 1-D LongTensor – terminal indices of each task
+            s_idx : 1-D LongTensor (same length as t_idx) – service index for each task
 
-        states[:, 0] /= trainer.config.norm_data_size
-        states[:, 1] /= 100.0
-        if states.shape[1] > 4:
-            states[:, 4:4 + 2 * trainer.num_nodes] /= trainer.config.norm_gflop
+        Returns:
+            states : (len(t_idx), state_dim) float tensor
+        """
+        placement = trainer.env.engine.placement_matrix[:, s_idx]   # (num_nodes, B)
+        b_masked = (obs['backlog'][:, s_idx]).T         # (B, num_nodes)
+        c_masked = (obs['cpu_alloc'][:, s_idx] * placement).T       # (B, num_nodes)
+        st = torch.cat([obs['task_reqs'][t_idx], b_masked, c_masked], dim=1)
+        st = st.clone()
+        st[:, 0] /= trainer.config.norm_data_size
+        st[:, 1] /= 100.0
+        if st.shape[1] > 4:
+            st[:, 4:4 + 2 * trainer.num_nodes] /= trainer.config.norm_gflop
+        return st
 
+    def compute_lower_mean_fields(self, trainer, t_idx, s_idx, n_idx, m_idx):
+        """Compute per-task **local** mean fields using two-hot action encoding.
+
+        For every unique service group in s_idx the tasks that share the same
+        service are treated as one cooperative group. The *global* mean field
+        of the group is the sum of two-hot vectors (n_idx one-hot ||  m_idx
+        one-hot). Each task's *local* mean field is then the group sum minus
+        its own vector, normalised by (group_size - 1).  Tasks that are alone
+        in their service group receive a zero mean field.
+
+        Args:
+            t_idx : (B,) terminal indices      (not used for MF calc, forwarded)
+            s_idx : (B,) service indices        – determines the groups
+            n_idx : (B,) chosen node indices    – first part of two-hot
+            m_idx : (B,) chosen model indices   – second part of two-hot
+
+        Returns:
+            local_mfs : (B, num_nodes + max_models) float tensor
+        """
+        B = len(t_idx)
+        mf_dim = trainer.num_nodes + trainer.max_models
+        device = trainer.device
+
+        # cal meanfield
+        two_hot = torch.zeros(B, mf_dim, device=device)
+        arange_b = torch.arange(B, device=device)
+        # node one-hot
+        two_hot[arange_b, n_idx.long()] = 1.0
+        # model one-hot
+        two_hot[arange_b, trainer.num_nodes + m_idx.long()] = 1.0
+
+        # num_services should cover all possible ids
+        num_services = int(s_idx.max().item()) + 1
+
+        # group_sizes[s] = number of tasks in service s
+        group_sizes = torch.bincount(
+            s_idx,
+            minlength=num_services
+        ).float()
+
+        # group_sums[s] = sum of all two_hot vectors in service s
+        group_sums = torch.zeros(
+            num_services,
+            mf_dim,
+            device=device
+        )
+
+        group_sums.index_add_(0, s_idx, two_hot)
+
+        sampled_group_sums = group_sums[s_idx]  # (B, mf_dim)
+        sampled_group_sizes = group_sizes[s_idx]  # (B,)
+
+        # local_mf_i = (group_sum - self) / (n - 1)
+        denom = (sampled_group_sizes - 1).clamp(min=1)
+
+        local_mfs = (sampled_group_sums - two_hot) / denom.unsqueeze(1)
+
+        # groups with only 1 member -> zero vector
+        local_mfs = torch.where(
+            (sampled_group_sizes > 1).unsqueeze(1),
+            local_mfs,
+            torch.zeros_like(local_mfs)
+        )
+
+        return local_mfs
+
+    def get_lower_actions(self, trainer, res_lower, mf, t_idx, s_idx, tasks_min_accuracy, task_deadlines, batch_sizes):
+        # Dùng hàm build_lower_state đã chuẩn hóa thay vì code lại
+        states = self.build_lower_state(trainer, res_lower['obs'], t_idx, s_idx)
         masks = self.calculate_lower_masks(trainer, t_idx, s_idx, tasks_min_accuracy)
-        mfs = mf_terminals[t_idx]
 
+        # Correctly slice MF and indices for the current batch
+        mfs = mf[t_idx] if mf.shape[0] == trainer.num_terminals else mf
+        
         # Use current curriculum config for deterministic flag and zeta
         cfg = self.cycle_configs.get(self.cycle_num, self.cycle_configs[1])
         is_det = self.is_evaluating or cfg['det']
         zeta = cfg['zeta']
 
+        # Get terminal-to-group mapping for shared actions
+        batch_group_indices = trainer.terminal_to_group[t_idx]
+
         batch_actions, log_probs, values = trainer.shared_lower_agent.choose_action_batch(
             states, mfs, masks_batch=masks,
-            agent_indices=torch.arange(trainer.num_terminals, device=trainer.device),
+            agent_indices=t_idx, group_indices=batch_group_indices,
             deterministic=is_det, zeta=zeta
         )
 
         a_ids = batch_actions.view(-1).long()
-        return a_ids // trainer.max_models, a_ids % trainer.max_models, masks, log_probs, values
+        n_idx = a_ids // trainer.max_models
+        m_idx = a_ids % trainer.max_models
 
-    def store_lower_transitions(self, trainer, current_res, next_res, t_idx, s_idx, n_idx, m_idx, masks, log_probs, values):
-        from matrix_source.trainers.train import log_transform
+        # Trả về thêm 'states' để lưu buffer, tránh lỗi Staleness
+        return n_idx, m_idx, masks, log_probs, values, states
 
-        # 1. Build states
-        def build_state(obs, tidx, sidx):
-            # Mask backlog and cpu_alloc with current placement to ensure consistency
-            placement = trainer.env.engine.placement_matrix[:, sidx]
-            num_reqs = obs['task_reqs'][tidx].shape[0]
-            
-            # Use reshape(1, -1) to safely handle any dimensionality from sidx indexing before expansion
-            b_masked = (obs['backlog'][:, sidx] * placement).T
-            c_masked = (obs['cpu_alloc'][:, sidx] * placement).T
-            
-            st = torch.cat([obs['task_reqs'][tidx], b_masked, c_masked], dim=1)
-            st[:, 0] /= trainer.config.norm_data_size
-            st[:, 1] /= 100.0
-            if st.shape[1] > 4: st[:, 4:4 + 2 * trainer.num_nodes] /= trainer.config.norm_gflop
-            return st
+    def store_lower_transitions(self, trainer, next_res,
+                                prev_state, prev_mf, curr_state, curr_mf,
+                                t_idx, n_idx, m_idx, masks, log_probs, values):
+        """Store a lower-level transition and optionally train the MF predictor.
 
-        c_obs, n_obs = current_res['obs'], next_res['obs']
-        states = build_state(c_obs, t_idx, s_idx)
-        next_states = build_state(n_obs, t_idx, s_idx)
+        Args:
+            next_res    : env result dict after step_lower (for reward / done / metrics)
+            prev_state  : (B, state_dim) – state *before* the action was taken
+            prev_mf     : (B, mf_dim)   – local mean field at previous state
+            curr_state  : (B, state_dim) – state *after* the action was taken
+            curr_mf     : (B, mf_dim)   – local mean field at current state
+            t_idx       : (B,) terminal indices
+            n_idx       : (B,) chosen node indices
+            m_idx       : (B,) chosen model indices
+            masks       : (B, action_dim) validity mask
+            log_probs   : (B,) log-probabilities from the actor
+            values      : (B,) critic values
+        """
 
-        # 2. Extract metrics and rewards
+        # 1. Extract metrics and rewards
         reward = next_res['reward']
         rew_divisor = trainer.config.norm_lower_rw
         norm_rew = log_transform(reward / (rew_divisor if rew_divisor != 0 else 1.0))
 
-        # 3. Handle MF training and transition storage
+        # 2. Handle MF training and transition storage
         avg_mf_loss = 0.0
         is_frozen = (self.phase == 'UPPER_ONLY')
 
         if not is_frozen and not self.is_evaluating:
             done = torch.tensor([next_res["new_frame"]] * len(t_idx), dtype=torch.float32, device=trainer.device)
-            c_mf, n_mf = current_res['mean_field'], next_res['mean_field']
             rewards = torch.full((len(t_idx),), norm_rew, dtype=torch.float32, device=trainer.device)
             a_ids = (n_idx * trainer.max_models + m_idx).long()
+            
+            # Get group_ids for MF training and storage
+            t_group_ids = trainer.terminal_to_group[t_idx]
 
-            avg_mf_loss = trainer.shared_lower_agent.store_transition_train_mf_batch(
-                states, c_mf[t_idx], n_mf[t_idx], a_ids, rewards, next_states, done, 
-                agent_ids=t_idx, log_prob=log_probs, value=values, masks=masks
+            # Explicitly train MF network if requested (returning item loss)
+            avg_mf_loss = trainer.shared_lower_agent.learn_mf_batch(
+                prev_state, prev_mf, curr_mf, t_group_ids
+            )
+            
+            # Store transition in agent memory
+            trainer.shared_lower_agent.memory.add_batch(
+                prev_state, prev_mf, curr_mf, a_ids, rewards, curr_state, done,
+                log_probs, values, agent_ids=t_idx, masks=masks
             )
 
-        # 4. ALWAYS record metrics!
-        trainer.aggregator.add_lower(next_res, mf_loss=avg_mf_loss, state=states[0] if len(states) > 0 else None)
+        # 3. ALWAYS record metrics!
+        trainer.aggregator.add_lower(next_res, mf_loss=avg_mf_loss,
+                                     state=curr_state[0] if len(curr_state) > 0 else None)
 
     def store_upper_transitions(self, trainer, s_all, ns_all, current_res, next_res, acts_matrix, log_probs, values, is_done):
-        from matrix_source.trainers.train import log_transform
-
         # 1. Extract global metrics
         reward = next_res['reward_global']
         rew_divisor = trainer.config.norm_upper_rw
@@ -328,12 +430,20 @@ class PPOStrategy(AlgorithmStrategy):
 
         pbar = tqdm(total=self.max_cycles, desc="Sequential Refinement Progress")
 
+        # mf_dim for lower agents = num_nodes + max_models (two-hot encoding)
+        lower_mf_dim = trainer.num_nodes + trainer.max_models
+
         while self.cycle_num <= self.max_cycles:
             obs = trainer.env.reset()
             obs_upper = obs['upper']
-            prev_lower_res = obs['lower']
-            prev_lower_res["mean_field"] = torch.zeros((trainer.num_terminals, trainer.lower_action_dim), device=trainer.device)
+            init_lower_obs = obs['lower']
             current_upper_state = self.build_upper_state(trainer, obs_upper)
+
+            # Persistent lower-level state and mean-field across steps
+            # Will be properly initialised on the first step with real tasks
+            prev_lower_obs   = init_lower_obs   # raw obs dict for state building
+            prev_lower_state = None             # (num_terminals, state_dim) – lazily initialised
+            prev_lower_mf    = None             # (num_terminals, mf_dim)
 
             for slot in range(max_slots):
                 if trainer.env.time_manager.is_new_frame():
@@ -342,13 +452,41 @@ class PPOStrategy(AlgorithmStrategy):
 
                 t_idx, s_idx, batch_sizes, tasks_min_accuracy, task_deadlines = trainer.workload_gen.generate_step()
                 if len(t_idx) > 0:
-                    n_idx, m_idx, masks, l_log_probs, l_values = self.get_lower_actions(trainer, prev_lower_res, t_idx, s_idx,
-                                                                 tasks_min_accuracy, task_deadlines, batch_sizes)
-                                                                 
+                    # --- (A) Build a temporary obs-dict so get_lower_actions can use prev obs ---
+                    # get_lower_actions reads mf from the obs dict we pass in
+                    prev_lower_mf = (
+                        prev_lower_mf if prev_lower_mf is not None
+                        else torch.zeros((trainer.num_terminals, lower_mf_dim), device=trainer.device)
+                    )
+                    prev_lower_obs['mean_field']= prev_lower_mf
+                    n_idx, m_idx, masks, l_log_probs, l_values, fresh_prev_states = self.get_lower_actions(
+                        trainer, prev_lower_obs, prev_lower_mf, t_idx, s_idx,
+                        tasks_min_accuracy, task_deadlines, batch_sizes)
+
+                    # --- (B) Compute local mean fields from the chosen actions ---
+                    curr_lower_mf = self.compute_lower_mean_fields(trainer, t_idx, s_idx, n_idx, m_idx)
+
+                    # --- (C) Step the environment ---
                     results = trainer.env.step_lower(t_idx, s_idx, batch_sizes, n_idx, m_idx, task_deadlines,
                                                      tasks_min_accuracy)
-                    
-                    self.store_lower_transitions(trainer, prev_lower_res, results, t_idx, s_idx, n_idx, m_idx, masks, l_log_probs, l_values)
+
+                    # --- (D) Build curr state from the environment's next obs ---
+                    curr_lower_state = self.build_lower_state(trainer, results['obs'], t_idx, s_idx)
+
+                    # --- (E) Slice prev state/mf for this batch's tasks ---
+                    if prev_lower_mf is None:
+                        # Very first step: no history yet → zeros for both
+                        _prev_mf    = torch.zeros(len(t_idx), lower_mf_dim, device=trainer.device)
+                    else:
+                        _prev_mf    = prev_lower_mf[t_idx]      # (B, mf_dim)
+
+                    # --- (F) Store transition with correctly paired (prev, curr) pairs ---
+                    self.store_lower_transitions(
+                        trainer, results,
+                        fresh_prev_states, _prev_mf,
+                        curr_lower_state, curr_lower_mf,
+                        t_idx, n_idx, m_idx, masks, l_log_probs, l_values
+                    )
 
                     trainer.aggregator.add_step_matrices(
                         f_alloc=trainer.env.engine.cpu_alloc_matrix,
@@ -356,7 +494,35 @@ class PPOStrategy(AlgorithmStrategy):
                         backlog=trainer.env.engine.backlog_queue.sum(dim=-1)
                     )
 
-                    prev_lower_res = results
+                    # --- (G) Roll prev ← curr: scatter back to (num_terminals, *) ---
+                    def scatter_update(base, idx, val):
+                        out = base.clone()
+                        out[idx] = val
+                        return out
+
+                    if prev_lower_state is None:
+                        prev_lower_state = torch.zeros(
+                            trainer.num_terminals,
+                            curr_lower_state.shape[1],
+                            device=trainer.device
+                        )
+                    if prev_lower_mf is None:
+                        prev_lower_mf = torch.zeros(
+                            trainer.num_terminals,
+                            lower_mf_dim,
+                            device=trainer.device
+                        )
+                    prev_lower_state = scatter_update(
+                        prev_lower_state,
+                        t_idx,
+                        curr_lower_state
+                    )
+                    prev_lower_mf = scatter_update(
+                        prev_lower_mf,
+                        t_idx,
+                        curr_lower_mf
+                    )
+                    prev_lower_obs = results
 
                     # 1. Train Lower Level (ONLY in Phase LOWER_ONLY)
                     if self.phase == 'LOWER_ONLY':
@@ -365,7 +531,8 @@ class PPOStrategy(AlgorithmStrategy):
                         zeta = cfg['zeta']
 
                         loss = trainer.shared_lower_agent.learn(
-                            torch.arange(trainer.num_terminals, device=trainer.device),
+                            agents_ids=torch.arange(trainer.num_terminals, device=trainer.device),
+                            group_ids=trainer.terminal_to_group,
                             zeta=zeta
                         )
                         if loss is not None:
@@ -424,7 +591,7 @@ class PPOStrategy(AlgorithmStrategy):
                                 # End of a full Lower-Upper pair cycle
                                 pbar.update(1)
                                 self.cycle_num += 1
-                                
+
                                 # Update parameters for next cycle if exists
                                 if self.cycle_num <= self.max_cycles:
                                     n_cfg = self.cycle_configs[self.cycle_num]
@@ -461,13 +628,16 @@ class PPOStrategy(AlgorithmStrategy):
             'success_rates': []
         }
 
+        lower_mf_dim = trainer.num_nodes + trainer.max_models
+
         for ep in range(num_episodes):
             res = trainer.env.reset()
-            obs_upper, prev_lower_res = res['upper'], res['lower']
-            
-            prev_lower_res["mean_field"] = torch.zeros((trainer.num_nodes * trainer.num_services, trainer.num_nodes), device=trainer.device)
-            
+            obs_upper, init_lower_obs = res['upper'], res['lower']
             current_upper_state = self.build_upper_state(trainer, obs_upper)
+
+            prev_lower_obs   = init_lower_obs
+            prev_lower_state = None             # (num_terminals, state_dim)
+            prev_lower_mf    = None             # (num_terminals, mf_dim)
 
             ep_reward = 0
             ep_backlog = []
@@ -480,17 +650,38 @@ class PPOStrategy(AlgorithmStrategy):
 
                 t_idx, s_idx, batch_sizes, tasks_min_accuracy, task_deadlines = trainer.workload_gen.generate_step()
                 if len(t_idx) > 0:
-                    n_idx, m_idx, masks, l_log_probs, l_vals = self.get_lower_actions(trainer, prev_lower_res, t_idx, s_idx,
-                                                                 tasks_min_accuracy, task_deadlines, batch_sizes)
-                    
+                    prev_lower_mf = (
+                        prev_lower_mf if prev_lower_mf is not None
+                        else torch.zeros((trainer.num_terminals, lower_mf_dim),
+                                         device=trainer.device)
+                    )
+                    prev_lower_obs['mean_field'] = prev_lower_mf  # Cập nhật MF vào obs dict
+
+                    # Thêm biến prev_lower_mf vào tham số gọi hàm
+                    n_idx, m_idx, masks, l_log_probs, l_vals, fresh_prev_state = self.get_lower_actions(
+                        trainer, prev_lower_obs, prev_lower_mf, t_idx, s_idx,  # <--- THÊM prev_lower_mf Ở ĐÂY
+                        tasks_min_accuracy, task_deadlines, batch_sizes)
+
+                    curr_lower_mf = self.compute_lower_mean_fields(trainer, t_idx, s_idx, n_idx, m_idx)
                     results = trainer.env.step_lower(t_idx, s_idx, batch_sizes, n_idx, m_idx, task_deadlines,
                                                      tasks_min_accuracy)
-                    
-                    # Record lower metrics
-                    self.store_lower_transitions(trainer, prev_lower_res, results, t_idx, s_idx, n_idx, m_idx, masks, l_log_probs, l_vals)
+                    curr_lower_state = self.build_lower_state(trainer, results['obs'], t_idx, s_idx)
+
+                    if prev_lower_mf is None:
+                        _prev_mf = torch.zeros(len(t_idx), lower_mf_dim,
+                                               device=trainer.device)
+                    else:
+                        _prev_mf = prev_lower_mf[t_idx]
+
+                    # Dùng fresh_prev_state thay vì _prev_state
+                    self.store_lower_transitions(
+                        trainer, results,
+                        fresh_prev_state, _prev_mf,
+                        curr_lower_state, curr_lower_mf,
+                        t_idx, n_idx, m_idx, masks, l_log_probs, l_vals
+                    )
 
                     # Record upper metrics
-                    # Use current_upper_state if available, results otherwise
                     self.store_upper_transitions(trainer, current_upper_state, None, obs_upper, results, u_acts_matrix,
                                                  None, None, (slot == max_slots - 1))
 
@@ -498,7 +689,21 @@ class PPOStrategy(AlgorithmStrategy):
                     ep_backlog.append(results['obs']['backlog'].sum().item())
                     ep_energy += results.get('energy', results['info'].get('energy', 0.0))
 
-                    prev_lower_res = results
+                    # --- Roll prev ← curr: scatter to (num_terminals, *) ---
+                    state_dim_eval = curr_lower_state.shape[1]
+                    full_st_eval = prev_lower_state if prev_lower_state is not None \
+                        else torch.zeros(trainer.num_terminals, state_dim_eval, device=trainer.device)
+                    full_st_eval = full_st_eval.clone()
+                    full_st_eval[t_idx] = curr_lower_state
+
+                    full_mf_eval = prev_lower_mf if prev_lower_mf is not None \
+                        else torch.zeros(trainer.num_terminals, lower_mf_dim, device=trainer.device)
+                    full_mf_eval = full_mf_eval.clone()
+                    full_mf_eval[t_idx] = curr_lower_mf
+
+                    prev_lower_obs   = results
+                    prev_lower_state = full_st_eval
+                    prev_lower_mf    = full_mf_eval
                 else:
                     trainer.env.time_manager.tick()
 

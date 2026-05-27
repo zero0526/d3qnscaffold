@@ -87,11 +87,22 @@ class MultiInstanceActor(nn.Module):
         x = F.silu(self.norm2(self.fc2(x, indices), indices))
         return self.actor_logits(x, indices)
 
-    def evaluate(self, state, mf, action, masks=None, indices=None):
+    def evaluate(self, state, mf, action, masks=None, indices=None, exclude_zero=False, zeta=1.0):
         logits = self.forward(state, mf, indices)
+
+        # Apply zeta (temperature scaling)
+        if zeta != 1.0:
+            logits = logits * zeta
 
         if masks is not None:
             logits = logits.masked_fill(masks == 0, -1e9)
+
+        # --- APPLY EXCLUDE_ZERO LOGIC ---
+        if exclude_zero and logits.shape[-1] > 1:
+            zero_mask = torch.zeros_like(logits, dtype=torch.bool)
+            zero_mask[:, 0] = True
+            logits = logits.masked_fill(zero_mask, -1e9)
+        # --------------------------------
 
         dist = Categorical(logits=logits)
         log_prob = dist.log_prob(action)
@@ -193,18 +204,19 @@ class PPOAgent:
                                              self.device)
         self.learn_step_counter = 0
 
-    def choose_action(self, state, prev_mf, epsilon, mask=None, agent_idx=0):
+    def choose_action(self, state, prev_mf, epsilon, mask=None, agent_idx=0, zeta=1.0):
         # Single agent usage
         idx_tensor = torch.tensor([agent_idx], device=self.device)
         actions, _, _ = self.choose_action_batch(
             state.unsqueeze(0) if not torch.is_tensor(state) else state.detach().unsqueeze(0),
             prev_mf.unsqueeze(0) if not torch.is_tensor(prev_mf) else prev_mf.detach().unsqueeze(0),
             masks_batch=mask.unsqueeze(0) if mask is not None else None,
-            agent_indices=idx_tensor
+            agent_indices=idx_tensor,
+            zeta=zeta
         )
         return int(actions[0])
 
-    def choose_action_batch(self, states, mfs, masks_batch=None, agent_indices=None, deterministic=False):
+    def choose_action_batch(self, states, mfs, masks_batch=None, agent_indices=None, deterministic=False, zeta=1.0):
         batch_size = states.shape[0]
         if agent_indices is None:
             agent_indices = torch.zeros(batch_size, dtype=torch.long, device=self.device)
@@ -227,10 +239,17 @@ class PPOAgent:
 
             # 3. Apply masks
             if masks_batch is not None:
-                logits = logits + (masks_batch - 1.0) * 1e10
+                logits = logits.masked_fill(masks_batch == 0, -1e9)
 
             if self.exclude_zero and self.u_action_dim > 1:
-                logits[:, 0] -= 1e10
+                # Tạo mask cho cột 0
+                zero_mask = torch.zeros_like(logits, dtype=torch.bool)
+                zero_mask[:, 0] = True
+                logits = logits.masked_fill(zero_mask, -1e9)
+
+            # Apply zeta (temperature scaling)
+            if zeta != 1.0:
+                logits = logits * zeta
 
             # 4. Sample actions
             if deterministic:
@@ -268,19 +287,16 @@ class PPOAgent:
         self.mf_optimizer.step()
         return loss.item()
 
-    def learn(self, agents_ids: torch.Tensor = None):
+    def learn(self, agents_ids: torch.Tensor = None, zeta=1.0):
         if agents_ids is not None:
             agents_ids = agents_ids.to(self.device).view(-1)
 
-        # PPO Learning from collected buffer
         data = self.memory.get_all_ready(min_size=self.min_batch_size, agent_ids_pool=agents_ids)
         if data is None:
             return None
 
-        # Unpack data
         states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, old_log_probs, old_values, masks, agent_ids = data
 
-        # Flatten inputs
         actions = actions.squeeze(-1)
         old_log_probs = old_log_probs.squeeze(-1)
         old_values = old_values.squeeze(-1)
@@ -292,11 +308,16 @@ class PPOAgent:
         # 1. Compute Advantages and Targets
         with torch.no_grad():
             from matrix_source.trainers.ppo_stategy import compute_gae
-            next_values = self.critic(next_states, curr_mfs, indices=agent_ids)
+
+            # --- SỬA BUG CRITICAL Ở ĐÂY: Re-predict MF ---
+            pred_mfs = self.mf_net(torch.cat([states, prev_mfs], dim=-1), indices=agent_ids)
+            next_pred_mfs = self.mf_net(torch.cat([next_states, curr_mfs], dim=-1), indices=agent_ids)
+            # ---------------------------------------------
+
+            next_values = self.critic(next_states, next_pred_mfs, indices=agent_ids)  # Dùng next_pred_mfs
             advantages = compute_gae(rewards, next_values, old_values, dones, agent_ids, self.gamma, self.lmbda)
             returns = advantages + old_values
 
-            # Normalize advantages
             if advantages.shape[0] > 1:
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
@@ -318,17 +339,23 @@ class PPOAgent:
                 batch_advantages = advantages[idx]
                 batch_returns = returns[idx]
                 batch_agent_ids = agent_ids[idx]
+                batch_masks = masks[idx]
 
-                # Predict MF for evaluation (in case it dynamically changes, though it's typically stable)
-                # It's better to use the curr_mfs from buffer to maintain consistency
-                log_probs, entropy = self.actor.evaluate(batch_states, batch_curr_mfs, batch_actions, masks=masks[idx],
-                                                         indices=batch_agent_ids)
-                values = self.critic(batch_states, batch_curr_mfs, indices=batch_agent_ids)
+                # --- Re-predict MF cho mini-batch ---
+                # Detach để tránh backward qua MF net 2 lần (do Actor và Critic đều dùng)
+                batch_pred_mfs = self.mf_net(torch.cat([batch_states, batch_prev_mfs], dim=-1), indices=batch_agent_ids).detach()
+                # -------------------------------------
 
-                # Ratio for clipping
+                # Dùng batch_pred_mfs thay vì batch_curr_mfs
+                log_probs, entropy = self.actor.evaluate(
+                    batch_states, batch_pred_mfs, batch_actions, masks=batch_masks,
+                    indices=batch_agent_ids, exclude_zero=self.exclude_zero,
+                    zeta=zeta
+                )
+                values = self.critic(batch_states, batch_pred_mfs, indices=batch_agent_ids)
+
                 ratio = torch.exp(log_probs - batch_old_log_probs)
 
-                # Actor Loss
                 surr1 = ratio * batch_advantages
                 surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * batch_advantages
                 actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy.mean()
@@ -338,7 +365,6 @@ class PPOAgent:
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=0.5)
                 self.optimizer_actor.step()
 
-                # Critic Loss (MSE)
                 critic_loss = F.mse_loss(values, batch_returns)
 
                 self.optimizer_critic.zero_grad()
@@ -349,32 +375,28 @@ class PPOAgent:
                 epoch_v_loss += critic_loss.item()
                 total_batches += 1
 
-        # 3. Automatic Dynamic Entropy Tuning Update
+        # 3. Entropy Tuning (Giữ nguyên, nhưng đổi sang dùng pred_mfs để tính entropy)
         with torch.no_grad():
-            # a. Compute dynamic target entropy based on valid actions in the current batch
-            # masks shape: (batch, action_dim)
             valid_action_counts = masks.sum(dim=-1).float().clamp(min=1.0)
-            
-            # b. Compute current entropy ratio based on progress
             progress = min(self.learn_step_counter / self.total_train_steps, 1.0)
-            current_ratio = self.target_entropy_ratio + (self.target_entropy_end_ratio - self.target_entropy_ratio) * progress
-            
-            # c. Compute per-sample target entropy and average it
+            current_ratio = self.target_entropy_ratio + (
+                        self.target_entropy_end_ratio - self.target_entropy_ratio) * progress
             sample_target_entropies = current_ratio * torch.log(valid_action_counts)
             target_entropy = sample_target_entropies.mean()
 
-            # d. Compute average current entropy for comparison
-            _, current_entropies = self.actor.evaluate(states, curr_mfs, actions, masks=masks, indices=agent_ids)
+            # Dùng pred_mfs thay vì curr_mfs
+            _, current_entropies = self.actor.evaluate(
+                states, pred_mfs, actions, masks=masks, indices=agent_ids, exclude_zero=self.exclude_zero
+            )
             avg_entropy = current_entropies.mean()
-            
+
         alpha_loss = (self.log_alpha * (target_entropy - avg_entropy).detach()).mean()
-        
+
         self.alpha_optimizer.zero_grad()
         alpha_loss.backward()
         self.alpha_optimizer.step()
-        
-        self.entropy_coef = self.log_alpha.exp().item()
 
+        self.entropy_coef = self.log_alpha.exp().item()
         self.learn_step_counter += 1
 
         log_freq = 10 if self.node_type == "Edge_Group" else 100
@@ -384,10 +406,7 @@ class PPOAgent:
             print(
                 f"[{self.node_type} PPO] Step {self.learn_step_counter:5d} | Value Loss: {avg_v_loss:.5f} | Avg Value: {avg_v:.3f}")
 
-        # Clear buffer after learning (PPO is on-policy)
         self.memory.clear()
-
-        # Return average value loss analogous to TD loss
         return epoch_v_loss / total_batches if total_batches > 0 else 0
 
     def save(self, path):
@@ -421,10 +440,3 @@ class PPOAgent:
                 param_group['lr'] *= factor
         print(
             f"[{self.node_type}] Learning rate scaled by {factor}. New Actor LR: {self.optimizer_actor.param_groups[0]['lr']:.6f}")
-
-    def update_entropy_coef(self, step: int):
-        T = self.total_train_steps
-
-        # c_e(t) = c_start + (c_end - c_start) * min(t / T, 1.0)
-        progress = min(step / T, 1.0)
-        self.entropy_coef = self.entropy_coef_start + (self.entropy_coef_end - self.entropy_coef_start) * progress
