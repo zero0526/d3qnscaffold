@@ -48,18 +48,20 @@ class PPOStrategy(AlgorithmStrategy):
         self.upper_mf_ema = None
         self.mf_ema_alpha = 0.7
 
-        # Hyperparams from user (Strict 3-Cycle Curriculum)
+        # Hyperparams from user (Strict 5-Cycle Curriculum)
         self.cycle_configs = {
             1: {'lower': 15, 'upper': 10, 'zeta': 1.0, 'det': False},
-            2: {'lower': 10, 'upper': 7,  'zeta': 2.0, 'det': False},
-            3: {'lower': 6,  'upper': 4,  'zeta': 1.0, 'det': True}
+            2: {'lower': 12, 'upper': 8,  'zeta': 1.5, 'det': False},
+            3: {'lower': 10, 'upper': 7,  'zeta': 2.0, 'det': False},
+            4: {'lower': 8,  'upper': 5,  'zeta': 2.5, 'det': False},
+            5: {'lower': 6,  'upper': 4,  'zeta': 3.0, 'det': True}
         }
         
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
         self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 5}
 
         self.cycle_num = 1
-        self.max_cycles = 3
+        self.max_cycles = 5
         
         # Initial settings for Cycle 1
         cfg = self.cycle_configs[self.cycle_num]
