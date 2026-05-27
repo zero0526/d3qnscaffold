@@ -1,5 +1,5 @@
 import torch
-from matrix_source.agents.d3qn_scaffold import D3QNAgent
+from matrix_source.agents.d3qn import D3QNAgent
 from matrix_source.agents.d3qn_scaffold_v2 import D3QNAgentV2
 from matrix_source.trainers.strategies import AlgorithmStrategy
 from matrix_source.utils.math_utils import to_binary

@@ -84,8 +84,6 @@ class PPOStrategy(AlgorithmStrategy):
             mf_hidden_sizes=tuple(trainer.config.hyper_neural["MF_HIDDEN_LAYER"]),
             mf_lr=float(trainer.config.hyper_neural['MF_LR']),
             buffer_min_size=self.upper_cfg['min_size'],
-            target_entropy_ratio=0.8,
-            target_entropy_end_ratio=0.05,
             total_train_steps=30,
             hidden_sizes=trainer.config.hyper_neural['AGENT_HIDDEN_LAYER'],
             lr=float(trainer.config.hyper_neural['UPPER_LR']),
@@ -108,8 +106,6 @@ class PPOStrategy(AlgorithmStrategy):
             mf_hidden_sizes=tuple(trainer.config.hyper_neural["MF_HIDDEN_LAYER"]),
             mf_lr=float(trainer.config.hyper_neural['MF_LR']),
             buffer_min_size=self.lower_cfg['min_size'],
-            target_entropy_ratio=0.5,
-            target_entropy_end_ratio=0.01,
             total_train_steps=60,
             hidden_sizes=tuple(trainer.config.hyper_neural['AGENT_HIDDEN_LAYER']),
             lr=float(trainer.config.hyper_neural['LOWER_LR']),
@@ -251,6 +247,7 @@ class PPOStrategy(AlgorithmStrategy):
         reward = next_res['reward']
         rew_divisor = trainer.config.norm_lower_rw
         norm_rew = log_transform(reward / (rew_divisor if rew_divisor != 0 else 1.0))
+        norm_rew -= 0.5*next_res["violations"]
 
         # 3. Handle MF training and transition storage
         avg_mf_loss = 0.0
@@ -269,6 +266,109 @@ class PPOStrategy(AlgorithmStrategy):
 
         # 4. ALWAYS record metrics!
         trainer.aggregator.add_lower(next_res, mf_loss=avg_mf_loss, state=states[0] if len(states) > 0 else None)
+    
+
+    def build_upper_state(self, trainer, obs_upper):
+        """
+        Builds a global state for the upper-level agent (Edge Group).
+        Expected input: obs_upper has 'resources' (N, 3), 'actions' (N, S), 'phi_prob' (N, S)
+        Returns: global_state (N, D)
+        """
+        acts = obs_upper['actions']
+        phi = obs_upper['phi_prob']
+        global_state = torch.cat([acts, phi], dim=1)
+        return global_state
+
+    # ------------------------------------------------------------------
+    # Mean-field helpers
+    # ------------------------------------------------------------------
+    def build_lower_state(self, trainer, obs, t_idx, s_idx):
+        """Build a normalised state tensor from an obs dict for a batch of tasks.
+
+        Args:
+            obs   : observation dict returned by env (has 'task_reqs', 'backlog', 'cpu_alloc')
+            t_idx : 1-D LongTensor – terminal indices of each task
+            s_idx : 1-D LongTensor (same length as t_idx) – service index for each task
+
+        Returns:
+            states : (len(t_idx), state_dim) float tensor
+        """
+        placement = trainer.env.engine.placement_matrix[:, s_idx]   # (num_nodes, B)
+        b_masked = (obs['backlog'][:, s_idx]).T         # (B, num_nodes)
+        c_masked = (obs['cpu_alloc'][:, s_idx] * placement).T       # (B, num_nodes)
+        st = torch.cat([obs['task_reqs'][t_idx], b_masked, c_masked], dim=1)
+        st = st.clone()
+        st[:, 0] /= trainer.config.norm_data_size
+        st[:, 1] /= 100.0
+        if st.shape[1] > 4:
+            st[:, 4:4 + 2 * trainer.num_nodes] /= trainer.config.norm_gflop
+        return st
+
+    def compute_lower_mean_fields(self, trainer, t_idx, s_idx, n_idx, m_idx):
+        """Compute per-task **local** mean fields using two-hot action encoding.
+
+        For every unique service group in s_idx the tasks that share the same
+        service are treated as one cooperative group. The *global* mean field
+        of the group is the sum of two-hot vectors (n_idx one-hot ||  m_idx
+        one-hot). Each task's *local* mean field is then the group sum minus
+        its own vector, normalised by (group_size - 1).  Tasks that are alone
+        in their service group receive a zero mean field.
+
+        Args:
+            t_idx : (B,) terminal indices      (not used for MF calc, forwarded)
+            s_idx : (B,) service indices        – determines the groups
+            n_idx : (B,) chosen node indices    – first part of two-hot
+            m_idx : (B,) chosen model indices   – second part of two-hot
+
+        Returns:
+            local_mfs : (B, num_nodes + max_models) float tensor
+        """
+        B = len(t_idx)
+        mf_dim = trainer.num_nodes + trainer.max_models
+        device = trainer.device
+
+        # cal meanfield
+        two_hot = torch.zeros(B, mf_dim, device=device)
+        arange_b = torch.arange(B, device=device)
+        # node one-hot
+        two_hot[arange_b, n_idx.long()] = 1.0
+        # model one-hot
+        two_hot[arange_b, trainer.num_nodes + m_idx.long()] = 1.0
+
+        # num_services should cover all possible ids
+        num_services = int(s_idx.max().item()) + 1
+
+        # group_sizes[s] = number of tasks in service s
+        group_sizes = torch.bincount(
+            s_idx,
+            minlength=num_services
+        ).float()
+
+        # group_sums[s] = sum of all two_hot vectors in service s
+        group_sums = torch.zeros(
+            num_services,
+            mf_dim,
+            device=device
+        )
+
+        group_sums.index_add_(0, s_idx, two_hot)
+
+        sampled_group_sums = group_sums[s_idx]  # (B, mf_dim)
+        sampled_group_sizes = group_sizes[s_idx]  # (B,)
+
+        # local_mf_i = (group_sum - self) / (n - 1)
+        denom = (sampled_group_sizes - 1).clamp(min=1)
+
+        local_mfs = (sampled_group_sums - two_hot) / denom.unsqueeze(1)
+
+        # groups with only 1 member -> zero vector
+        local_mfs = torch.where(
+            (sampled_group_sizes > 1).unsqueeze(1),
+            local_mfs,
+            torch.zeros_like(local_mfs)
+        )
+
+        return local_mfs
 
     def store_upper_transitions(self, trainer, s_all, ns_all, current_res, next_res, acts_matrix, log_probs, values, is_done):
         from matrix_source.trainers.train import log_transform

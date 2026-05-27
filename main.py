@@ -5,11 +5,7 @@ from matrix_source.trainers.d3qn_scaffold_strategy_v2 import D3QNScaffoldStrateg
 # from matrix_source.trainers.semi_distribute_task import PPOSCAFFOLDREPStrategy
 from matrix_source.trainers.ppo_stategy_v2 import PPOSCAFFOLDREPStrategy
 
-
-
-
-
 if __name__ == '__main__':
-    strategy = D3QNScaffoldStrategy()
+    strategy = PPOStrategy()
     trainer = Trainer(strategy=strategy)
     trainer.train()

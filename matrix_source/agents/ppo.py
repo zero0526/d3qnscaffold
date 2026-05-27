@@ -91,8 +91,8 @@ class MultiInstanceActor(nn.Module):
         logits = self.forward(state, mf, indices)
 
         # Apply zeta (temperature scaling)
-        if zeta != 1.0:
-            logits = logits * zeta
+        # if zeta != 1.0:
+        #     logits = logits * zeta
 
         if masks is not None:
             logits = logits.masked_fill(masks == 0, -1e9)
@@ -148,10 +148,10 @@ class MFNetwork(nn.Module):
 
 class PPOAgent:
     def __init__(self, node_id, node_type, state_dim, action_dim, u_action_dim,
-                 mf_hidden_sizes, mf_lr, buffer_min_size, target_entropy_ratio=0.8, target_entropy_end_ratio=0.05,
+                 mf_hidden_sizes, mf_lr, buffer_min_size,
                  total_train_steps=100, hidden_sizes=(128, 64),
                  lr=3e-4, gamma=0.99, alpha=0.005, buffer_size=100000, batch_size=64,
-                 lam=0.95, clip_eps=0.2, k_epochs=5, entropy_coef=0.01,
+                 lam=0.95, clip_eps=0.2, k_epochs=5, entropy_coef=0.05,
                  exclude_zero=False, num_instances=1, device=None):
 
         self.node_id = node_id
@@ -170,13 +170,11 @@ class PPOAgent:
         self.u_action_dim = u_action_dim  # Number of discrete actions
         self.exclude_zero = exclude_zero
         
-        # Dynamic Entropy Auto-tuning (SAC-style) with state-dependent target
-        self.target_entropy_ratio = target_entropy_ratio
-        self.target_entropy_end_ratio = target_entropy_end_ratio
-        self.total_train_steps = total_train_steps
-        
-        self.log_alpha = torch.tensor([np.log(entropy_coef)], requires_grad=True, device=self.device)
-        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=lr)
+        # --- ENTROPY DECAY THAY THẾ AUTO-TUNING ---
+        self.initial_entropy_coef = entropy_coef  # Lưu lại giá trị ban đầu (ví dụ 0.05)
+        self.entropy_coef = entropy_coef          # Giá trị đang dùng hiện tại
+        self.entropy_decay_rate = 0.9995          # Tốc độ giảm sau mỗi lần learn (thử 0.999 - 0.9999)
+        self.min_entropy_coef = 0.001             # Giá trị nhỏ nhất cho phép (không để nó bằng 0 hoàn toàn)
 
         # PPO Hyperparameters
         self.gamma = gamma
@@ -295,6 +293,10 @@ class PPOAgent:
         if data is None:
             return None
 
+        # === THÊM DÒNG NÀY: GIẢM ENTROPY COEF SAU MỖI LẦN UPDATE ===
+        self.entropy_coef = max(self.entropy_coef * self.entropy_decay_rate, self.min_entropy_coef)
+        # ============================================================
+
         states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, old_log_probs, old_values, masks, agent_ids = data
 
         actions = actions.squeeze(-1)
@@ -375,28 +377,6 @@ class PPOAgent:
                 epoch_v_loss += critic_loss.item()
                 total_batches += 1
 
-        # 3. Entropy Tuning (Giữ nguyên, nhưng đổi sang dùng pred_mfs để tính entropy)
-        with torch.no_grad():
-            valid_action_counts = masks.sum(dim=-1).float().clamp(min=1.0)
-            progress = min(self.learn_step_counter / self.total_train_steps, 1.0)
-            current_ratio = self.target_entropy_ratio + (
-                        self.target_entropy_end_ratio - self.target_entropy_ratio) * progress
-            sample_target_entropies = current_ratio * torch.log(valid_action_counts)
-            target_entropy = sample_target_entropies.mean()
-
-            # Dùng pred_mfs thay vì curr_mfs
-            _, current_entropies = self.actor.evaluate(
-                states, pred_mfs, actions, masks=masks, indices=agent_ids, exclude_zero=self.exclude_zero
-            )
-            avg_entropy = current_entropies.mean()
-
-        alpha_loss = (self.log_alpha * (target_entropy - avg_entropy).detach()).mean()
-
-        self.alpha_optimizer.zero_grad()
-        alpha_loss.backward()
-        self.alpha_optimizer.step()
-
-        self.entropy_coef = self.log_alpha.exp().item()
         self.learn_step_counter += 1
 
         log_freq = 10 if self.node_type == "Edge_Group" else 100
@@ -404,7 +384,9 @@ class PPOAgent:
             avg_v_loss = epoch_v_loss / total_batches if total_batches > 0 else 0
             avg_v = old_values.mean().item()
             print(
-                f"[{self.node_type} PPO] Step {self.learn_step_counter:5d} | Value Loss: {avg_v_loss:.5f} | Avg Value: {avg_v:.3f}")
+                f"[{self.node_type} PPO] Step {self.learn_step_counter:5d} | "
+                f"VLoss: {avg_v_loss:.5f} | AvgV: {avg_v:.3f} | "
+                f"EntCoef: {self.entropy_coef:.5f}")
 
         self.memory.clear()
         return epoch_v_loss / total_batches if total_batches > 0 else 0
@@ -417,7 +399,8 @@ class PPOAgent:
             'actor_opt': self.optimizer_actor.state_dict(),
             'critic_opt': self.optimizer_critic.state_dict(),
             'mf_opt': self.mf_optimizer.state_dict(),
-            'learn_step': self.learn_step_counter
+            'learn_step': self.learn_step_counter,
+            'entropy_coef': self.entropy_coef
         }
         torch.save(checkpoint, path)
 
@@ -430,6 +413,7 @@ class PPOAgent:
         self.optimizer_critic.load_state_dict(checkpoint['critic_opt'])
         self.mf_optimizer.load_state_dict(checkpoint['mf_opt'])
         self.learn_step_counter = checkpoint.get('learn_step', 0)
+        self.entropy_coef = checkpoint.get('entropy_coef', self.initial_entropy_coef)
 
     def set_lr_factor(self, factor):
         """
