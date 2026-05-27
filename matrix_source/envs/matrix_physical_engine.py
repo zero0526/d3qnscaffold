@@ -448,7 +448,7 @@ class MatrixPhysicalEngine:
         # Refined QoS penalty
         qos_penalty = self.omega_1 * torch.pow(num_violations.float(), 1.2)
         
-        reward = -(f1 + qos_penalty)
+        reward = -(f1)
         obs = {
             "total_drift": total_drift,
             # N x S

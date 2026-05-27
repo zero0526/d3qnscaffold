@@ -460,6 +460,7 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
 
             trainer.aggregator.store_history()
             trainer.aggregator.report_episode(ep)
+            trainer.aggregator.reset_episode()
             ep += 1
         pbar.close()
         self.run_evaluation(trainer, num_episodes=5)

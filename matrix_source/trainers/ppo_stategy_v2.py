@@ -609,6 +609,7 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
 
             trainer.aggregator.store_history()
             trainer.aggregator.report_episode(ep)
+            trainer.aggregator.reset_episode()
             print(f"--- Curriculum Status ---")
             print(
                 f"Cycle: {self.cycle_num} | Phase: {self.phase} | Phase Progress: {self.current_phase_updates}/{self.lower_warmup_steps if self.phase == 'LOWER_ONLY' else self.upper_warmup_steps}")
@@ -652,6 +653,28 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
 
                 t_idx, s_idx, batch_sizes, tasks_min_accuracy, task_deadlines = trainer.workload_gen.generate_step()
                 if len(t_idx) > 0:
+                    # --- Filter out services with no placement (all-zero mask) ---
+                    all_masks = trainer.env.engine.placement_matrix[:, s_idx]  # (num_nodes, B)
+                    valid_service_mask = all_masks.sum(dim=0) > 0  # (B,)
+                    
+                    if not valid_service_mask.all():
+                        valid_indices = torch.where(valid_service_mask)[0]
+                        if len(valid_indices) == 0:
+                            trainer.env.time_manager.tick()
+                            continue
+                        t_idx_filtered = t_idx[valid_indices]
+                        s_idx_filtered = s_idx[valid_indices]
+                        batch_sizes_filtered = batch_sizes  # batch_sizes is usually a scalar or handled per-task
+                        # Filter deadlines/accuracies if they are Tensors
+                        task_deadlines_filtered = task_deadlines[valid_indices] if isinstance(task_deadlines, torch.Tensor) else task_deadlines
+                        tasks_min_accuracy_filtered = tasks_min_accuracy[valid_indices] if isinstance(tasks_min_accuracy, torch.Tensor) else tasks_min_accuracy
+                    else:
+                        valid_indices = torch.arange(len(t_idx), device=trainer.device)
+                        t_idx_filtered = t_idx
+                        s_idx_filtered = s_idx
+                        task_deadlines_filtered = task_deadlines
+                        tasks_min_accuracy_filtered = tasks_min_accuracy
+
                     prev_lower_mf = (
                         prev_lower_mf if prev_lower_mf is not None
                         else torch.zeros((trainer.num_terminals, lower_mf_dim),
@@ -660,30 +683,36 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                     prev_lower_obs['mean_field'] = prev_lower_mf  # Cập nhật MF vào obs dict
 
                     # Thêm biến prev_lower_mf vào tham số gọi hàm
-                    n_idx, m_idx, masks, l_log_probs, l_vals, fresh_prev_state = self.get_lower_actions(
-                        trainer, prev_lower_obs, prev_lower_mf, t_idx, s_idx,  # <--- THÊM prev_lower_mf Ở ĐÂY
-                        tasks_min_accuracy, task_deadlines, batch_sizes)
+                    n_idx_f, m_idx_f, masks_f, l_log_probs_f, l_vals_f, fresh_prev_state_f = self.get_lower_actions(
+                        trainer, prev_lower_obs, prev_lower_mf, t_idx_filtered, s_idx_filtered,
+                        tasks_min_accuracy_filtered, task_deadlines_filtered, batch_sizes)
 
-                    curr_lower_mf = self.compute_lower_mean_fields(trainer, t_idx, s_idx, n_idx, m_idx)
-                    results = trainer.env.step_lower(t_idx, s_idx, batch_sizes, n_idx, m_idx, task_deadlines,
+                    curr_lower_mf_f = self.compute_lower_mean_fields(trainer, t_idx_filtered, s_idx_filtered, n_idx_f, m_idx_f)
+                    
+                    # Map filtered results back to full batch size for step_lower
+                    final_n_idx = torch.zeros(len(t_idx), dtype=torch.long, device=trainer.device)
+                    final_m_idx = torch.zeros(len(t_idx), dtype=torch.long, device=trainer.device)
+                    final_n_idx[valid_indices] = n_idx_f
+                    final_m_idx[valid_indices] = m_idx_f
+
+                    results = trainer.env.step_lower(t_idx, s_idx, batch_sizes, final_n_idx, final_m_idx, task_deadlines,
                                                      tasks_min_accuracy)
                     curr_lower_state = self.build_lower_state(trainer, results['obs'], t_idx, s_idx)
 
+                    # For storage/personalization, we only care about valid tasks
                     if prev_lower_mf is None:
-                        _prev_mf = torch.zeros(len(t_idx), lower_mf_dim,
-                                               device=trainer.device)
+                        _prev_mf = torch.zeros(len(t_idx_filtered), lower_mf_dim, device=trainer.device)
                     else:
-                        _prev_mf = prev_lower_mf[t_idx]
+                        _prev_mf = prev_lower_mf[t_idx_filtered]
 
-                    # Dùng fresh_prev_state thay vì _prev_state
                     self.store_lower_transitions(
                         trainer, results,
-                        fresh_prev_state, _prev_mf,
-                        curr_lower_state, curr_lower_mf,
-                        t_idx, n_idx, m_idx, masks, l_log_probs, l_vals
+                        fresh_prev_state_f, _prev_mf,
+                        curr_lower_state[valid_indices], curr_lower_mf_f,
+                        t_idx_filtered, n_idx_f, m_idx_f, masks_f, l_log_probs_f, l_vals_f
                     )
 
-                    # Record upper metrics
+                    # Record upper metrics using full results
                     self.store_upper_transitions(trainer, current_upper_state, None, obs_upper, results, u_acts_matrix,
                                                  None, None, (slot == max_slots - 1))
 
@@ -701,7 +730,8 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                     full_mf_eval = prev_lower_mf if prev_lower_mf is not None \
                         else torch.zeros(trainer.num_terminals, lower_mf_dim, device=trainer.device)
                     full_mf_eval = full_mf_eval.clone()
-                    full_mf_eval[t_idx] = curr_lower_mf
+                    # We only update MF for the active terminals
+                    full_mf_eval[t_idx_filtered] = curr_lower_mf_f
 
                     prev_lower_obs   = results
                     prev_lower_state = full_st_eval
