@@ -86,6 +86,15 @@ class MatrixPhysicalEngine:
         self.arrival_counts_step = torch.zeros((self.num_nodes, self.num_services), device=self.device)
         self.placement_violations = 0
         self.current_num_tasks = 0
+
+        # --- Virtual Queue (Augmented Lyapunov) ---
+        # Z_queue accumulates REJECTED workload (hw-limit, placement, deadline)
+        # to penalize agents that exploit the "kill task early" trick.
+        # Z decays each slot by the node's max capacity (virtual service rate).
+        self.Z_queue = torch.zeros((self.num_nodes, self.num_services), device=self.device)
+        self.beta_virtual = config.hyper_neural.get('BETA_VIRTUAL_DRIFT', 1.0)
+        # rejected_workload_step: filled each slot in process_arrivals
+        self.rejected_workload_step = torch.zeros((self.num_nodes, self.num_services), device=self.device)
         
         # Profiling
         self.prof = defaultdict(float)
@@ -115,6 +124,8 @@ class MatrixPhysicalEngine:
         self.prev_model_indices.zero_()
         self.current_task_reqs.zero_()
         self.current_num_tasks = 0
+        self.Z_queue.zero_()
+        self.rejected_workload_step.zero_()
         
         obs_upper = {
             "actions": self.placement_matrix.clone(),
@@ -210,6 +221,7 @@ class MatrixPhysicalEngine:
         self.arrival_counts_step.zero_()
         self.service_hw_deficit.zero_()
         self.service_hw_fail_count.zero_()
+        self.rejected_workload_step.zero_()
         
         # Update action history - Flattening strictly for CUDA
         t_idx_flat = terminal_indices.reshape(-1).long()
@@ -321,7 +333,12 @@ class MatrixPhysicalEngine:
                 self.immediate_fails.index_put_((fhn, fhs), torch.ones_like(fhs, dtype=torch.float), accumulate=True)
                 self.fail_hw.index_put_((fhn, fhs), torch.ones_like(fhs, dtype=torch.float), accumulate=True)
                 self.terminal_fail_counts.index_put_((fht, fhs), torch.ones_like(fht, dtype=torch.float), accumulate=True)
-                
+
+                # --- Virtual Queue: accumulate REJECTED workload (hw-fail) ---
+                # We count the full task workload as "rejected work"
+                self.rejected_workload_step.index_put_((fhn, fhs), vw[fail_hw_mask], accumulate=True)
+                # -------------------------------------------------------------
+
                 # Deficit Analysis
                 deficit = (vw[fail_hw_mask] / node_max_f[vn][fail_hw_mask]) - vq[fail_hw_mask]
                 self.service_hw_deficit.index_put_((fhs,), deficit, accumulate=True)
@@ -399,6 +416,11 @@ class MatrixPhysicalEngine:
         self.prof['2_optimize'] += time.perf_counter() - t0
 
     def execute_and_collect_metrics(self, node_arrival_matrix, trans_energy_total, cold_delays, is_discrete):
+        # --- Update Virtual Queue Z BEFORE depletion ---
+        # Z decays by max_node_capacity * slot_duration (virtual max throughput per slot)
+        f_max = self.resource_specs[:, 0].unsqueeze(1) * self.placement_matrix  # (N, S)
+        virtual_service = f_max * self.slot_duration   # max work node can do for each service
+        self.Z_queue = (self.Z_queue - virtual_service + self.rejected_workload_step).clamp(min=0)
         t0 = time.perf_counter()
         current_backlog_total = self.backlog_queue.sum(dim=-1)
         count_before = self.backlog_counts.clone()
@@ -436,13 +458,22 @@ class MatrixPhysicalEngine:
         external_snack = (total_capacity_used - local_processed).clamp(min=0)
         
         total_drift = ops.calculate_lyapunov_drift(current_backlog_total, node_arrival_matrix, self.cpu_alloc_matrix * self.slot_duration)
+
+        # --- Virtual Drift (Augmented Lyapunov) ---
+        # Penalizes accumulated rejected workload at each (node, service).
+        # virtual_drift = beta * sum(Z * rejected_workload_step)
+        # If an agent keeps sending tasks that die at hw limit, Z grows and
+        # this term keeps growing each slot -> agent cannot escape punishment.
+        virtual_drift = self.beta_virtual * (self.Z_queue * self.rejected_workload_step).sum()
+        # -----------------------------------------
+
         comp_energy = ops.compute_batch_energy(
             self.cpu_alloc_matrix, actual_processed, self.energy_coef, 
             cold_delays, epsilon_cold=self.energy_cold_start
         )
         total_energy = comp_energy + trans_energy_total
         
-        f1 = total_drift + self.lypa_coef * total_energy
+        f1 = total_drift + virtual_drift + self.lypa_coef * total_energy
         self.reward_global_accumulator += f1
         
         # Refined QoS penalty
@@ -451,7 +482,7 @@ class MatrixPhysicalEngine:
         reward = -(f1 +qos_penalty)
         obs = {
             "total_drift": total_drift,
-            # N x S
+            "virtual_drift": virtual_drift,
             # N x S: CPU capacity spent on externally-offloaded tasks
             "external_snack": external_snack.clone(),
             "task_reqs": self.current_task_reqs.clone(),

@@ -51,10 +51,10 @@ class PPOStrategy(AlgorithmStrategy):
         # Hyperparams from user (Strict 5-Cycle Curriculum)
         self.cycle_configs = {
             1: {'lower': 15, 'upper': 10, 'zeta': 1.0, 'det': False},
-            2: {'lower': 12, 'upper': 8,  'zeta': 1.5, 'det': False},
-            3: {'lower': 10, 'upper': 7,  'zeta': 2.0, 'det': False},
-            4: {'lower': 8,  'upper': 5,  'zeta': 2.5, 'det': False},
-            5: {'lower': 6,  'upper': 4,  'zeta': 3.0, 'det': True}
+            2: {'lower': 12, 'upper': 8,  'zeta': 1.0, 'det': False},
+            3: {'lower': 10, 'upper': 7,  'zeta': 1.0, 'det': False},
+            4: {'lower': 8,  'upper': 5,  'zeta': 1.0, 'det': False},
+            5: {'lower': 6,  'upper': 4,  'zeta': 1.0, 'det': True}
         }
         
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
