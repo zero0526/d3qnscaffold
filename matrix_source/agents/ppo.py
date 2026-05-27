@@ -173,7 +173,7 @@ class PPOAgent:
         # --- ENTROPY DECAY THAY THẾ AUTO-TUNING ---
         self.initial_entropy_coef = entropy_coef  # Lưu lại giá trị ban đầu (ví dụ 0.05)
         self.entropy_coef = entropy_coef          # Giá trị đang dùng hiện tại
-        self.entropy_decay_rate = 0.9995          # Tốc độ giảm sau mỗi lần learn (thử 0.999 - 0.9999)
+        self.entropy_decay_rate = 0.92          # Tốc độ giảm sau mỗi lần learn (thử 0.999 - 0.9999)
         self.min_entropy_coef = 0.001             # Giá trị nhỏ nhất cho phép (không để nó bằng 0 hoàn toàn)
 
         # PPO Hyperparameters
@@ -293,7 +293,6 @@ class PPOAgent:
         if data is None:
             return None
 
-        # === THÊM DÒNG NÀY: GIẢM ENTROPY COEF SAU MỖI LẦN UPDATE ===
         self.entropy_coef = max(self.entropy_coef * self.entropy_decay_rate, self.min_entropy_coef)
         # ============================================================
 
