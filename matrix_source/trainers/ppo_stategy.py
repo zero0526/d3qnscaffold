@@ -99,10 +99,11 @@ class PPOStrategy(AlgorithmStrategy):
         )
 
         # 2. Lower Agent
+        lower_mf_dim = trainer.num_nodes + trainer.max_models
         trainer.shared_lower_agent = PPOAgent(
             node_id=-1, node_type="Terminal_Group",
             state_dim=trainer.lower_state_dim,
-            action_dim=trainer.lower_action_dim,
+            action_dim=lower_mf_dim, # Chiều của Mean Field (8 node + 4 model)
             u_action_dim=trainer.lower_u_action_dim,
             mf_hidden_sizes=tuple(trainer.config.hyper_neural["MF_HIDDEN_LAYER"]),
             mf_lr=float(trainer.config.hyper_neural['MF_LR']),
@@ -334,7 +335,8 @@ class PPOStrategy(AlgorithmStrategy):
             obs = trainer.env.reset()
             obs_upper = obs['upper']
             prev_lower_res = obs['lower']
-            prev_lower_res["mean_field"] = torch.zeros((trainer.num_terminals, trainer.lower_action_dim), device=trainer.device)
+            lower_mf_dim = trainer.num_nodes + trainer.max_models
+            prev_lower_res["mean_field"] = torch.zeros((trainer.num_terminals, lower_mf_dim), device=trainer.device)
             current_upper_state = self.build_upper_state(trainer, obs_upper)
 
             for slot in range(max_slots):
@@ -350,8 +352,17 @@ class PPOStrategy(AlgorithmStrategy):
                     results = trainer.env.step_lower(t_idx, s_idx, batch_sizes, n_idx, m_idx, task_deadlines,
                                                      tasks_min_accuracy)
                     
+                    # Compute next mean field based on choices
+                    B = len(t_idx)
+                    mf_dim = trainer.num_nodes + trainer.max_models
+                    curr_lower_mf = self.compute_lower_mean_fields(trainer, t_idx, s_idx, n_idx, m_idx)
+                    
+                    # Update mean field in the results dict to carry it forward
+                    results['mean_field'] = prev_lower_res['mean_field'].clone()
+                    results['mean_field'][t_idx] = curr_lower_mf
+                    
                     self.store_lower_transitions(trainer, prev_lower_res, results, t_idx, s_idx, n_idx, m_idx, masks, l_log_probs, l_values)
-
+                    
                     trainer.aggregator.add_step_matrices(
                         f_alloc=trainer.env.engine.cpu_alloc_matrix,
                         arrivals=results['info']['arrival_matrix'],
@@ -467,7 +478,8 @@ class PPOStrategy(AlgorithmStrategy):
             res = trainer.env.reset()
             obs_upper, prev_lower_res = res['upper'], res['lower']
             
-            prev_lower_res["mean_field"] = torch.zeros((trainer.num_nodes * trainer.num_services, trainer.num_nodes), device=trainer.device)
+            lower_mf_dim = trainer.num_nodes + trainer.max_models
+            prev_lower_res["mean_field"] = torch.zeros((trainer.num_nodes * trainer.num_services, lower_mf_dim), device=trainer.device)
             
             current_upper_state = self.build_upper_state(trainer, obs_upper)
 
@@ -499,6 +511,11 @@ class PPOStrategy(AlgorithmStrategy):
                     ep_reward += results['reward_global']
                     ep_backlog.append(results['obs']['backlog'].sum().item())
                     ep_energy += results.get('energy', results['info'].get('energy', 0.0))
+
+                    # Compute and propagate mean field in evaluation too
+                    curr_lower_mf = self.compute_lower_mean_fields(trainer, t_idx, s_idx, n_idx, m_idx)
+                    results['mean_field'] = prev_lower_res['mean_field'].clone()
+                    results['mean_field'][t_idx] = curr_lower_mf
 
                     prev_lower_res = results
                 else:

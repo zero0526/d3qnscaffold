@@ -38,6 +38,7 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
         self.alt_train_num = 0
         self.alt_next = 'UPPER'
         self.upper_mf_ema = None
+        self.lower_mf_prev = None
         self.mf_ema_alpha = 0.7
 
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
@@ -55,11 +56,13 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
         self.lower_collect_size= 256
         self.lower_batch_size= 128
         self.lower_train_epochs= 4
+        self.model_workloads= None
 
     def initialize_agents(self, trainer):
         # ==========================================
         # 1. UPPER AGENT (GIỮ NGUYÊN 100%)
         # ==========================================
+        self.model_workloads = trainer.env.metadata["model_workloads"]
         trainer.shared_upper_agent = PPOAgent(
             node_id=-2, node_type="Edge_Group",
             state_dim=trainer.upper_state_dim,
@@ -85,15 +88,19 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
         lower_hidden_dim = trainer.config.hyper_neural['AGENT_HIDDEN_LAYER'][0]
         
         # Tính toán chiều của Global State cho Critic mới
-        # Gồm: Mask(num_nodes) + Q_final(num_nodes) + F(num_nodes) + Workload_sent(num_nodes) + MF(mf_dim)
+        # Gồm: Mask(num_nodes) + Q_final(num_nodes) + F(num_nodes) + Workload_sent(num_nodes)
+        # Bỏ MF (mf_dim) theo phản hồi user: Critic nhìn toàn cục workload đã gửi
         lower_mf_dim = trainer.num_nodes + trainer.max_models
-        critic_global_dim = (trainer.num_nodes * 4) + lower_mf_dim
+        critic_global_dim = (trainer.num_nodes * 4 + lower_mf_dim)
 
+        # Nhận state (P_i, Q_s, F_s, Workload_dist) và Mean Field
+        actor_state_dim = trainer.lower_state_dim + trainer.num_nodes
         trainer.shared_lower_agent = SequentialGRU_PPOAgent(
             agent_id=-1, node_type="Service_Sequential",
-            actor_state_dim=trainer.lower_state_dim, # P_i, Q_s, F_s, MF
+            actor_state_dim=actor_state_dim, # P_i, Q_s, F_s, Workload_dist, MF
             critic_global_dim=critic_global_dim,     # Trạng thái tổng hợp cuối timeslot
             mf_action_dim=lower_mf_dim,              # Chỉ số Mean Field
+            action_dim=trainer.lower_u_action_dim,
             mf_hidden_sizes=tuple(trainer.config.hyper_neural["MF_HIDDEN_LAYER"]),
             mf_lr=float(trainer.config.hyper_neural['MF_LR']),
             hidden_dim=lower_hidden_dim,              # 128
@@ -102,10 +109,13 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
             clip_eps=trainer.config.hyper_neural.get('CLIP_EPS', 0.2),
             k_epochs=self.lower_cfg['epochs'],
             entropy_coef=0.01,
-            target_entropy_ratio=0.5, target_entropy_end_ratio=0.01, total_train_steps=60,
+            target_entropy_ratio=0.5,  total_train_steps=60,
             num_instances=trainer.num_services,       # ĐỔI THÀNH SỐ SERVICE
             device=trainer.device
         )
+
+        if self.lower_mf_prev is None:
+            self.lower_mf_prev = torch.zeros(trainer.num_services, trainer.num_nodes, lower_mf_dim, device=trainer.device)
 
         if self.phase == 'LOWER_ONLY' and self.lower_warmup_steps == 0:
             self.phase = 'UPPER_ONLY'
@@ -171,23 +181,67 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
     # ==========================================
     def _get_service_mask(self, trainer, s_idx):
         """Lấy mask cho 1 service cụ thể"""
-        placement = trainer.env.engine.placement_matrix[:, s_idx].T # (1, num_nodes)
-        return placement.squeeze(0)
+        # placement_matrix[:, s_idx] trả về tensor 1D (num_nodes,) khi s_idx là scalar
+        return trainer.env.engine.placement_matrix[:, s_idx].float()
 
-    def _build_simulated_state(self, trainer, task_req, sim_backlog_s, sim_capacity_s, mf):
-        """Xây dựng state cho GRU từ dữ liệu mô phỏng (Qs đã bị thay đổi)"""
+    def _build_simulated_state(self, trainer, task_req, sim_backlog_s, sim_capacity_s, workload_sent_s):
+        """Xây dựng state cho GRU từ dữ liệu mô phỏng (Qs và Workload đã bị thay đổi)"""
         # Chuẩn hóa tương tự build_lower_state cũ
-        st = torch.cat([task_req, sim_backlog_s, sim_capacity_s], dim=-1).unsqueeze(0)
+        st = torch.cat([task_req, sim_backlog_s, sim_capacity_s, workload_sent_s], dim=-1).unsqueeze(0)
         st = st.clone()
         st[:, 0] /= trainer.config.norm_data_size
         st[:, 1] /= 100.0
         if st.shape[1] > 4:
-            st[:, 4:4 + 2 * trainer.num_nodes] /= trainer.config.norm_gflop
+            # Normalize Backlog, Capacity, and Workload Sent
+            st[:, 4:] /= trainer.config.norm_gflop
         return st
 
-    def _build_critic_global_state(self, trainer, mask_s, q_final_s, f_s, workload_sent_s, mf_s):
+    def _build_critic_global_state(self, trainer, mask_s, q_final_s, f_s, workload_sent_s, mean_mf_s):
         """Xây dựng Global State cho Critic cuối timeslot của 1 Service"""
-        return torch.cat([mask_s, q_final_s, f_s, workload_sent_s, mf_s])
+        return torch.cat([mask_s, q_final_s, f_s, workload_sent_s, mean_mf_s])
+
+    def _compute_node_wise_mfs(self, trainer, t_idx, s_idx, n_idx, m_idx, src_node_indices):
+        """
+        Tính toán Mean Field cho từng service, nhưng loại trừ nhóm task đến từ node đang xét.
+        Tham khảo logic compute_lower_mean_fields nhưng 'loại 1 nhóm'.
+        """
+        B = len(t_idx)
+        mf_dim = trainer.num_nodes + trainer.max_models
+        device = trainer.device
+        
+        # 1. Tạo two-hot actions
+        two_hot = torch.zeros(B, mf_dim, device=device)
+        two_hot[torch.arange(B), n_idx.long()] = 1.0
+        two_hot[torch.arange(B), trainer.num_nodes + m_idx.long()] = 1.0
+        
+        # 2. Gom tổng actions và số lượng task theo (service, src_node)
+        num_services = trainer.num_services
+        num_nodes = trainer.num_nodes
+        
+        # group_sums_sn[s][node_in]: tổng partial actions của service s tại source node node_in
+        group_sums_sn = torch.zeros(num_services, num_nodes, mf_dim, device=device)
+        group_counts_sn = torch.zeros(num_services, num_nodes, device=device)
+        
+        service_node_flat_idx = s_idx * num_nodes + src_node_indices
+        group_sums_sn.view(-1, mf_dim).index_add_(0, service_node_flat_idx, two_hot)
+        group_counts_sn.view(-1).index_add_(0, service_node_flat_idx, torch.ones(B, device=device))
+        
+        # 3. Tổng toàn cục theo service
+        group_sums_s = group_sums_sn.sum(dim=1) # (num_services, mf_dim)
+        group_counts_s = group_counts_sn.sum(dim=1) # (num_services)
+        
+        # 4. MF(service s, node_in i) = (Total_s - Sum_at_node_i) / (Total_count_s - Count_at_node_i)
+        denom = (group_counts_s.unsqueeze(1) - group_counts_sn).clamp(min=1)
+        node_wise_mfs = (group_sums_s.unsqueeze(1) - group_sums_sn) / denom.unsqueeze(2)
+        
+        # Nếu service đó chỉ có task ở đúng 1 node -> MF = 0
+        node_wise_mfs = torch.where(
+            (group_counts_s.unsqueeze(1) > group_counts_sn).unsqueeze(2),
+            node_wise_mfs,
+            torch.zeros_like(node_wise_mfs)
+        )
+        
+        return node_wise_mfs # (num_services, num_nodes, mf_dim)
 
     # ==========================================
     # MAIN TRAINING LOOP (THAY ĐỔI CORE LOGIC LOWER)
@@ -201,6 +255,7 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
         while self.cycle_num <= self.max_cycles:
             obs = trainer.env.reset()
             obs_upper = obs['upper']
+            obs_lower = obs['lower']
             current_upper_state = self.build_upper_state(trainer, obs_upper)
 
             for slot in range(max_slots):
@@ -212,80 +267,117 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                 t_idx, s_idx, batch_sizes, tasks_min_accuracy, task_deadlines = trainer.workload_gen.generate_step()
                 
                 if len(t_idx) > 0:
-                    # ==========================================
                     # A. SEQUENTIAL DRY-RUN (MO PHONG GRU)
-                    # ==========================================
                     trainer.shared_lower_agent.memory.start_episode()
                     
-                    # Tạo bản sao Backlog toàn cục để mô phỏng việc cập nhật Q_s
-                    sim_backlog = obs['lower']['backlog'].clone()
-                    sim_capacity = (obs['lower']['cpu_alloc'] * trainer.env.engine.placement_matrix).clone()
+                    # 1. Khởi tạo trạng thái mô phỏng toàn cục cho Timeslot này
+                    sim_backlog = obs_lower["obs"]['backlog'].clone()
+                    sim_capacity = (obs_lower["obs"]['cpu_alloc'] * trainer.env.engine.placement_matrix).clone()
                     
+                    # 2. Khởi tạo map cho Workload sent và Hidden state theo Service (Để duy trì trace)
+                    unique_services = torch.unique(s_idx)
+                    service_workload_sent = {int(s): torch.zeros(trainer.num_nodes, device=trainer.device) for s in unique_services}
+                    service_h_gru = {int(s): np.zeros(trainer.shared_lower_agent.actor.gru_cell.hidden_size) for s in unique_services}
+                    
+                    # 3. Gom tasks theo SOURCE EDGE NODE (theo yêu cầu user)
+                    src_node_indices = torch.argmax(trainer.env.engine.terminal_to_node_map[t_idx], dim=1)
+                    unique_src_nodes = torch.unique(src_node_indices)
+
                     # Mảng lưu action thật để đẩy xuống env
                     final_n_idx = torch.zeros(len(t_idx), dtype=torch.long, device=trainer.device)
                     final_m_idx = torch.zeros(len(t_idx), dtype=torch.long, device=trainer.device)
 
-                    # Duyệt theo từng SERVICE (Mỗi service là 1 GRU instance)
-                    unique_services = torch.unique(s_idx)
-                    
-                    for s_id in unique_services:
-                        # Lấy index của các task thuộc service hiện tại
-                        task_mask = (s_idx == s_id)
-                        curr_t_idx = t_idx[task_mask]
-                        curr_deadlines = task_deadlines[task_mask]
-                        curr_task_reqs = obs['lower']['task_reqs'][curr_t_idx]
+                    for node_id in unique_src_nodes:
+                        node_mask = (src_node_indices == node_id)
+                        services_at_node = torch.unique(s_idx[node_mask])
                         
-                        # SẮP XẾP THAM LAM THEO DEADLINE
-                        sorted_order = torch.argsort(curr_deadlines)
-                        curr_t_idx = curr_t_idx[sorted_order]
-                        curr_deadlines = curr_deadlines[sorted_order]
-                        curr_task_reqs = curr_task_reqs[sorted_order]
-                        
-                        # Lấy trạng thái cố định của service này
-                        mask_s = self._get_service_mask(trainer, s_id)
-                        q_s_sim = sim_backlog[:, s_id].clone() # Q_s của service này
-                        f_s = sim_capacity[:, s_id] * mask_s    # F_s của service này
-                        mf_s = torch.zeros(lower_mf_dim, device=trainer.device) # MF tạm thời
-                        
-                        # Khởi tạo Hidden State cho GRU của Service này
-                        h_gru = np.zeros(trainer.shared_lower_agent.actor.gru_cell.hidden_size)
-                        workload_sent_s = torch.zeros(trainer.num_nodes, device=trainer.device)
-                        
-                        # Duyệt tuần tự từng task
-                        for i in range(len(curr_t_idx)):
-                            state_k = self._build_simulated_state(trainer, curr_task_reqs[i], q_s_sim, f_s, mf_s)
+                        for s_id in services_at_node:
+                            sid_val = int(s_id.item())
+                            # Lấy các task của service này tại node này
+                            task_mask = node_mask & (s_idx == s_id)
+                            curr_t_idx = t_idx[task_mask]
+                            curr_deadlines = task_deadlines[task_mask]
+                            curr_task_reqs = obs_lower["obs"]['task_reqs'][curr_t_idx]
                             
-                            # GRU chọn hành động
-                            a_id, log_prob, h_gru = trainer.shared_lower_agent.choose_action(
-                                state_k, mf_s, h_gru, mask_s, agent_idx=int(s_id.item())
-                            )
+                            # SẮP XẾP THAM LAM THEO DEADLINE
+                            sorted_order = torch.argsort(curr_deadlines)
+                            curr_t_idx = curr_t_idx[sorted_order]
+                            curr_deadlines = curr_deadlines[sorted_order]
+                            curr_task_reqs = curr_task_reqs[sorted_order]
                             
-                            n_k = a_id // trainer.max_models
-                            m_k = a_id % trainer.max_models
+                            # Lấy mask gốc (num_nodes) cho các phép tính toán state
+                            mask_s_node = self._get_service_mask(trainer, sid_val)
+                            # Mở rộng mask cho Actor chọn hành động (num_nodes * max_models)
+                            mask_s_action = mask_s_node.repeat_interleave(trainer.max_models)
                             
-                            # Lưu vào Buffer
-                            trainer.shared_lower_agent.memory.add_step(
-                                int(s_id.item()), state_k.squeeze(0), h_gru, a_id, log_prob
-                            )
+                            q_s_sim = sim_backlog[:, sid_val] 
+                            f_s = sim_capacity[:, sid_val] * mask_s_node
                             
-                            # CẬP NHẬT Q_s NGAY LẬP TỨC (TRỌNG TÂM THUẬT TOÁN)
-                            load_k = curr_task_reqs[i, 0].item() / trainer.config.norm_gflop # Giả sử cột 0 là dung lượng
-                            q_s_sim[n_k] += load_k
-                            workload_sent_s[n_k] += load_k
+                            # Mean Field: Sử dụng prev_mf của node này (personalization)
+                            mf_s_input = self.lower_mf_prev[sid_val][node_id]
                             
-                            # Lưu lại hành động đúng vị trí ban đầu (trước khi sort)
-                            orig_idx = curr_t_idx[i]
-                            final_n_idx[orig_idx] = n_k
-                            final_m_idx[orig_idx] = m_k
+                            workload_sent_s = service_workload_sent[sid_val]
+                            h_gru = service_h_gru[sid_val]
+                            
+                            # Duyệt tuần tự từng task
+                            for i in range(len(curr_t_idx)):
+                                state_k = self._build_simulated_state(trainer, curr_task_reqs[i], q_s_sim, f_s, workload_sent_s)
+                                
+                                # GRU chọn hành động (Dùng mask_s_action)
+                                a_id, log_prob, h_gru = trainer.shared_lower_agent.choose_action(
+                                    state_k, mf_s_input, h_gru, mask_s_action, agent_idx=sid_val
+                                )
+                                
+                                n_k = a_id // trainer.max_models
+                                m_k = a_id % trainer.max_models
+                                
+                                # Lưu vào Buffer
+                                trainer.shared_lower_agent.memory.add_step(
+                                    sid_val, state_k.squeeze(0), h_gru, a_id, log_prob, mf_s_input
+                                )
+                                
+                                # CẬP NHẬT Q_s VÀ WORKLOAD (Dấu vết áp lực)
+                                orig_idx = curr_t_idx[i]
+                                b_k = batch_sizes[orig_idx]
+                                load_q_k = curr_task_reqs[i, 0].item() / trainer.config.norm_gflop 
+                                workload_k = self.model_workloads[sid_val][m_k] * b_k / trainer.config.norm_gflop 
+                                
+                                q_s_sim[n_k] += load_q_k
+                                workload_sent_s[n_k] += workload_k
+                                
+                                # Lưu lại hành động đúng vị trí ban đầu (trước khi sort)
+                                final_n_idx[orig_idx] = n_k
+                                final_m_idx[orig_idx] = m_k
+                            
+                            # Cập nhật lại h_gru cho service này để node tiếp theo dùng tiếp
+                            service_h_gru[sid_val] = h_gru
 
-                        # Kết thúc service: Tính Global State cho Critic và lưu vào buffer
+                    # 5. Tính toán CURRENT MF sau khi có toàn bộ hành động (Leave-one-node-out)
+                    src_node_indices_all = torch.argmax(trainer.env.engine.terminal_to_node_map[t_idx], dim=1)
+                    curr_slot_mfs = self._compute_node_wise_mfs(
+                        trainer, t_idx, s_idx, final_n_idx, final_m_idx, src_node_indices_all
+                    ) # Shape: (num_services, num_nodes, mf_dim)
+
+                    # 4. Khi tất cả các node xử lý xong, lưu Global State cho Critic cho từng Service
+                    for s_id in unique_services:
+                        sid_val = int(s_id.item())
+                        mask_s_node = self._get_service_mask(trainer, sid_val)
+                        mask_s_action = mask_s_node.repeat_interleave(trainer.max_models)
+                        q_final_s = sim_backlog[:, sid_val]
+                        f_s = sim_capacity[:, sid_val] * mask_s_node
+                        workload_final_s = service_workload_sent[sid_val]
+                        # MF trung bình của service (Critic nhìn toàn cục, không theo node)
+                        mean_mf_s = curr_slot_mfs[sid_val].mean(dim=0)
                         global_state_s = self._build_critic_global_state(
-                            trainer, mask_s, q_s_sim, f_s, workload_sent_s, mf_s
+                            trainer, mask_s_node, q_final_s, f_s, workload_final_s, mean_mf_s
                         )
-                        # Lưu tạm thời reward = 0, sẽ update bằng reward thật sau khi step env
+                        dummy_mf = torch.zeros(trainer.num_nodes + trainer.max_models, device=trainer.device)
                         trainer.shared_lower_agent.memory.end_episode(
-                            int(s_id.item()), mf_s, mask_s, global_state_s, reward=0.0
+                            sid_val, dummy_mf, mask_s_action, global_state_s, reward=0.0
                         )
+
+                    # Gán curr_mf cho prev_mf để các slot sau dùng làm context
+                    self.lower_mf_prev = curr_slot_mfs.clone()
 
                     # ==========================================
                     # B. THỰC SỰ TƯƠNG TÁC VỚI MÔI TRƯỜNG
@@ -294,6 +386,7 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                         t_idx, s_idx, batch_sizes, final_n_idx, final_m_idx, 
                         task_deadlines, tasks_min_accuracy
                     )
+                    obs_lower = results # CẬP NHẬT OBS ĐỂ SLOT SAU DÙNG ĐÚNG TRAN THAI THẬT
                     true_reward = results['reward']
                     norm_rew = log_transform(true_reward / (trainer.config.norm_lower_rw if trainer.config.norm_lower_rw != 0 else 1.0))
 
@@ -303,7 +396,8 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                     if self.phase == 'LOWER_ONLY' and not self.is_evaluating:
                         # Gán reward thật cho tất cả các service vừa xử lý
                         for s_id in unique_services:
-                            trainer.shared_lower_agent.memory.rewards[int(s_id.item())] = norm_rew
+                            sid_val = int(s_id.item())
+                            trainer.shared_lower_agent.memory.current_trajectory[sid_val]['reward'] = norm_rew
                         
                         # Gọi Learn (BPTT sẽ chạy ở đây)
                         trainer.shared_lower_agent.memory.finalize_episode()
@@ -334,6 +428,12 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                             trainer.shared_lower_agent.memory.clear()
 
                     trainer.aggregator.add_lower(results, mf_loss=0.0, state=None)
+                    
+                    # Log mỗi 1000 slot để người dùng thấy tiến độ
+                    if slot % 1000 == 0 and slot > 0:
+                        success = sum(trainer.aggregator.episode_success_qos)
+                        fail = sum(trainer.aggregator.episode_violate_qos)
+                        trainer.aggregator.log(f"  > Slot {slot:4d} | Partial OK: {success:5.0f} | FAIL: {fail:5.0f}")
                 else:
                     trainer.env.time_manager.tick()
 
@@ -359,6 +459,7 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                     obs_upper = res_upper
 
             trainer.aggregator.store_history()
+            trainer.aggregator.report_episode(ep)
             ep += 1
         pbar.close()
         self.run_evaluation(trainer, num_episodes=5)
@@ -385,42 +486,77 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
 
                 t_idx, s_idx, batch_sizes, tasks_min_accuracy, task_deadlines = trainer.workload_gen.generate_step()
                 if len(t_idx) > 0:
-                    # Tương tự như Training, nhưng không lưu buffer và không tính gradient
-                    sim_backlog = init_lower_obs['backlog'].clone()
-                    sim_capacity = (init_lower_obs['cpu_alloc'] * trainer.env.engine.placement_matrix).clone()
+                    # 1. Khởi tạo trạng thái mô phỏng toàn cục
+                    sim_backlog = init_lower_obs["obs"]['backlog'].clone()
+                    sim_capacity = (init_lower_obs["obs"]['cpu_alloc'] * trainer.env.engine.placement_matrix).clone()
+                    
+                    # 2. Map duy trì trace
+                    unique_services = torch.unique(s_idx)
+                    service_workload_sent = {int(s): torch.zeros(trainer.num_nodes, device=trainer.device) for s in unique_services}
+                    service_h_gru = {int(s): np.zeros(trainer.shared_lower_agent.actor.gru_cell.hidden_size) for s in unique_services}
+                    
+                    src_node_indices = torch.argmax(trainer.env.engine.terminal_to_node_map[t_idx], dim=1)
+                    unique_src_nodes = torch.unique(src_node_indices)
+
                     final_n_idx = torch.zeros(len(t_idx), dtype=torch.long, device=trainer.device)
                     final_m_idx = torch.zeros(len(t_idx), dtype=torch.long, device=trainer.device)
 
-                    unique_services = torch.unique(s_idx)
-                    for s_id in unique_services:
-                        task_mask = (s_idx == s_id)
-                        curr_t_idx = t_idx[task_mask]
-                        curr_deadlines = task_deadlines[task_mask]
-                        curr_task_reqs = init_lower_obs['task_reqs'][curr_t_idx]
+                    for node_id in unique_src_nodes:
+                        node_mask = (src_node_indices == node_id)
+                        services_at_node = torch.unique(s_idx[node_mask])
                         
-                        sorted_order = torch.argsort(curr_deadlines)
-                        curr_t_idx = curr_t_idx[sorted_order]
-                        curr_deadlines = curr_deadlines[sorted_order]
-                        curr_task_reqs = curr_task_reqs[sorted_order]
-                        
-                        mask_s = self._get_service_mask(trainer, s_id)
-                        q_s_sim = sim_backlog[:, s_id].clone()
-                        f_s = sim_capacity[:, s_id] * mask_s
-                        mf_s = torch.zeros(lower_mf_dim, device=trainer.device)
-                        h_gru = np.zeros(trainer.shared_lower_agent.actor.gru_cell.hidden_size)
-                        
-                        for i in range(len(curr_t_idx)):
-                            state_k = self._build_simulated_state(trainer, curr_task_reqs[i], q_s_sim, f_s, mf_s)
-                            a_id, _, h_gru = trainer.shared_lower_agent.choose_action(
-                                state_k, mf_s, h_gru, mask_s, agent_idx=int(s_id.item())
-                            )
-                            n_k = a_id // trainer.max_models
-                            m_k = a_id % trainer.max_models
-                            load_k = curr_task_reqs[i, 0].item() / trainer.config.norm_gflop
-                            q_s_sim[n_k] += load_k
-                            orig_idx = curr_t_idx[i]
-                            final_n_idx[orig_idx] = n_k
-                            final_m_idx[orig_idx] = m_k
+                        for s_id in services_at_node:
+                            sid_val = int(s_id.item())
+                            task_mask = node_mask & (s_idx == s_id)
+                            curr_t_idx = t_idx[task_mask]
+                            curr_deadlines = task_deadlines[task_mask]
+                            curr_task_reqs = init_lower_obs["obs"]['task_reqs'][curr_t_idx]
+                            
+                            sorted_order = torch.argsort(curr_deadlines)
+                            curr_t_idx = curr_t_idx[sorted_order]
+                            curr_deadlines = curr_deadlines[sorted_order]
+                            curr_task_reqs = curr_task_reqs[sorted_order]
+                            
+                            # Lấy mask
+                            mask_s_node = self._get_service_mask(trainer, sid_val)
+                            mask_s_action = mask_s_node.repeat_interleave(trainer.max_models)
+                            
+                            q_s_sim = init_lower_obs["obs"]['backlog'][:, sid_val]
+                            f_s = init_lower_obs["obs"]['cpu_alloc'][:, sid_val] * mask_s_node
+                            
+                            # Personalized MF
+                            mf_s_input = self.lower_mf_prev[sid_val][node_id]
+                            
+                            workload_sent_s = service_workload_sent[sid_val]
+                            h_gru = service_h_gru[sid_val]
+                            
+                            for i in range(len(curr_t_idx)):
+                                state_k = self._build_simulated_state(trainer, curr_task_reqs[i], q_s_sim, f_s, workload_sent_s)
+                                a_id, _, h_gru = trainer.shared_lower_agent.choose_action(
+                                    state_k, mf_s_input, h_gru, mask_s_action, agent_idx=sid_val
+                                )
+                                n_k = a_id // trainer.max_models
+                                m_k = a_id % trainer.max_models
+                                
+                                orig_idx = curr_t_idx[i]
+                                b_k = batch_sizes[orig_idx]
+                                load_q_k = curr_task_reqs[i, 0].item() / trainer.config.norm_gflop
+                                workload_k = self.model_workloads[sid_val][m_k] * b_k
+                                
+                                q_s_sim[n_k] += load_q_k
+                                workload_sent_s[n_k] += workload_k
+                                
+                                final_n_idx[orig_idx] = n_k
+                                final_m_idx[orig_idx] = m_k
+                            
+                            service_h_gru[sid_val] = h_gru
+
+                    # 5. Cập nhật Personalized MF cho Slot sau (Evaluation)
+                    src_node_indices_eval = torch.argmax(trainer.env.engine.terminal_to_node_map[t_idx], dim=1)
+                    curr_eval_mfs = self._compute_node_wise_mfs(
+                        trainer, t_idx, s_idx, final_n_idx, final_m_idx, src_node_indices_eval
+                    )
+                    self.lower_mf_prev = curr_eval_mfs.detach()
 
                     results = trainer.env.step_lower(t_idx, s_idx, batch_sizes, final_n_idx, final_m_idx, task_deadlines, tasks_min_accuracy)
                     init_lower_obs = results # Cập nhật obseravtion
