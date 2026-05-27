@@ -226,7 +226,6 @@ class MetricsAggregator:
         if self.episode_count % 50 == 0:
             self.plot_history(ep=self.episode_count)
             self.save_history_csv()
-        self.reset_episode()
 
     def report_episode(self, ep):
         """Prints summary. history[-1] contains processed results for current ep."""
@@ -234,7 +233,12 @@ class MetricsAggregator:
         en = self.history["total_energy"][-1] if self.history["total_energy"] else 0
         qos = self.history["qos_success_rate"][-1] if self.history["qos_success_rate"] else 0
         cr = self.history["completion_rate"][-1] if self.history["completion_rate"] else 0
-        self.log(f"EP {ep:4d} | Rew: {tr:8.2f} | Energy: {en:8.2f} | QoS: {qos:6.2%} | Comp: {cr:6.2%}")
+        
+        # Lấy số lượng tuyệt đối từ list hiện tại (trước khi reset)
+        total_success = sum(self.episode_success_qos)
+        total_failed = sum(self.episode_violate_qos)
+        
+        self.log(f"EP {ep:4d} | Rew: {tr:8.2f} | Energy: {en:8.2f} | QoS: {qos:6.2%} | Comp: {cr:6.2%} | OK: {total_success:4.0f} | FAIL: {total_failed:4.0f}")
         
         if self.episode_terminal_fails is not None and np.sum(self.episode_terminal_fails) > 0:
             pass
@@ -259,6 +263,8 @@ class MetricsAggregator:
             self.log(f"  Queue full        : {q_total:.0f}")
             self.log(f"  Invalid placement : {p_total:.0f}")
             self.log(f"  Expired in Queue  : {e_total:.0f}")
+
+        self.reset_episode()
 
     def _moving_average(self, data, window=10):
         if len(data) < window: return data

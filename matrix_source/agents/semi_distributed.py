@@ -1,9 +1,11 @@
 import torch
+import os
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
 import numpy as np
+import random
 
 # ==========================================
 # 1. CÁC LỚP MULTI-INSTANCE CƠ BẢN (Giữ nguyên từ code cũ)
@@ -196,17 +198,18 @@ class SequentialMultiAgentBuffer:
         """Gọi ở đầu mỗi time slot"""
         self.reset_current()
 
-    def add_step(self, agent_id, state, hidden, action, log_prob):
+    def add_step(self, agent_id, state, hidden, action, log_prob, mf):
         """Gọi tại mỗi bước k khi GRU chọn xong 1 task"""
         aid = int(agent_id)
         if 'states' not in self.current_trajectory[aid]:
             self.current_trajectory[aid] = {
-                'states': [], 'hiddens': [], 'actions': [], 'log_probs': []
+                'states': [], 'hiddens': [], 'actions': [], 'log_probs': [], 'mfs': []
             }
         self.current_trajectory[aid]['states'].append(state)
         self.current_trajectory[aid]['hiddens'].append(hidden)
         self.current_trajectory[aid]['actions'].append(action)
         self.current_trajectory[aid]['log_probs'].append(log_prob)
+        self.current_trajectory[aid]['mfs'].append(mf)
 
     def end_episode(self, agent_id, mf, mask, global_state, reward):
         """Gọi khi hết 1 service trong time slot"""
@@ -241,8 +244,8 @@ class SequentialMultiAgentBuffer:
 # 5. PPO AGENT CHÍNH
 # ==========================================
 class SequentialGRU_PPOAgent:
-    def __init__(self, agent_id, node_type, actor_state_dim, critic_global_dim, 
-                 mf_action_dim, mf_hidden_sizes, mf_lr, 
+    def __init__(self, agent_id, node_type, actor_state_dim, critic_global_dim,
+                 mf_action_dim, mf_hidden_sizes, mf_lr, action_dim= 32,
                  hidden_dim=128, critic_hidden=(256, 128), lr=3e-4, 
                  clip_eps=0.2, k_epochs=5, entropy_coef=0.01, 
                  target_entropy_ratio=0.8, total_train_steps=1000,
@@ -258,7 +261,7 @@ class SequentialGRU_PPOAgent:
         self.total_train_steps = total_train_steps
 
         # Networks
-        self.actor = SequentialGRUActor(actor_state_dim, mf_action_dim, mf_action_dim, hidden_dim, num_instances).to(self.device)
+        self.actor = SequentialGRUActor(actor_state_dim, mf_action_dim, action_dim, hidden_dim, num_instances).to(self.device)
         self.critic = GlobalAggregatedCritic(critic_global_dim, critic_hidden, num_instances).to(self.device)
         self.mf_net = MFNetwork(actor_state_dim + mf_action_dim, mf_action_dim, mf_hidden_sizes, num_instances).to(self.device)
 
@@ -276,22 +279,33 @@ class SequentialGRU_PPOAgent:
         self.entropy_coef = entropy_coef
 
     def choose_action(self, state, mf, hidden, mask, agent_idx=0):
-        """Dùng trong môi trường (Data Collection)"""
-        idx_tensor = torch.tensor([agent_idx], device=self.device)
-        state_t = torch.as_tensor(state, device=self.device, dtype=torch.float32).unsqueeze(0)
-        mf_t = torch.as_tensor(mf, device=self.device, dtype=torch.float32).unsqueeze(0)
-        hidden_t = torch.as_tensor(hidden, device=self.device, dtype=torch.float32).unsqueeze(0)
-        mask_t = torch.as_tensor(mask, device=self.device, dtype=torch.float32).unsqueeze(0)
+        """Dùng trong môi trường (Data Collection) - Single Instance"""
+        res = self.choose_action_batch(
+            torch.as_tensor(state, device=self.device, dtype=torch.float32).unsqueeze(0),
+            torch.as_tensor(mf, device=self.device, dtype=torch.float32).unsqueeze(0),
+            torch.as_tensor(hidden, device=self.device, dtype=torch.float32).unsqueeze(0),
+            torch.as_tensor(mask, device=self.device, dtype=torch.float32).unsqueeze(0),
+            torch.tensor([agent_idx], device=self.device)
+        )
+        return res[0][0].item(), res[1][0].item(), res[2][0].cpu().numpy()
 
+    def choose_action_batch(self, states, mfs, hiddens, masks, agent_indices):
+        """Dùng trong môi trường (Data Collection) - Phiên bản Vectorized"""
+        # states: (B, DIM)
+        # mfs: (B, MF_DIM)
+        # hiddens: (B, HIDDEN_DIM)
+        # masks: (B, ACTION_DIM)
+        # agent_indices: (B,)
+        
         with torch.no_grad():
-            logits, new_hidden = self.actor.forward_step(state_t, mf_t, hidden_t, idx_tensor)
-            logits = logits.masked_fill(mask_t == 0, -1e9)
+            logits, new_hiddens = self.actor.forward_step(states, mfs, hiddens, agent_indices)
+            logits = logits.masked_fill(masks == 0, -1e9)
             
             dist = Categorical(logits=logits)
-            action = dist.sample()
-            log_prob = dist.log_prob(action)
+            actions = dist.sample()
+            log_probs = dist.log_prob(actions)
 
-        return action.item(), log_prob.item(), new_hidden.squeeze(0).cpu().numpy()
+        return actions, log_probs, new_hiddens
 
     def learn_mf(self, state, prev_mf, ground_truth_mf, agent_ids):
         """Học Mean Field (Supervised)"""
@@ -306,6 +320,28 @@ class SequentialGRU_PPOAgent:
         self.mf_optimizer.zero_grad()
         loss.backward()
         self.mf_optimizer.step()
+
+    def save(self, checkpoint_path):
+        directory = os.path.dirname(checkpoint_path)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory)
+        torch.save({
+            'actor_state_dict': self.actor.state_dict(),
+            'critic_state_dict': self.critic.state_dict(),
+            'mf_net_state_dict': self.mf_net.state_dict(),
+            'optimizer_actor_state_dict': self.optimizer_actor.state_dict(),
+            'optimizer_critic_state_dict': self.optimizer_critic.state_dict(),
+            'mf_optimizer_state_dict': self.mf_optimizer.state_dict(),
+        }, checkpoint_path)
+
+    def load(self, checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.actor.load_state_dict(checkpoint['actor_state_dict'])
+        self.critic.load_state_dict(checkpoint['critic_state_dict'])
+        self.mf_net.load_state_dict(checkpoint['mf_net_state_dict'])
+        self.optimizer_actor.load_state_dict(checkpoint['optimizer_actor_state_dict'])
+        self.optimizer_critic.load_state_dict(checkpoint['optimizer_critic_state_dict'])
+        self.mf_optimizer.load_state_dict(checkpoint['mf_optimizer_state_dict'])
 
     def learn(self, batch_size=128, k_epochs=4):
         """Học PPO với BPTT qua chuỗi trên 1 batch dữ liệu"""
@@ -342,15 +378,21 @@ class SequentialGRU_PPOAgent:
                     h_gru = torch.zeros(1, self.actor.gru_cell.hidden_size, device=self.device)
                     total_actor_loss = 0
                     total_entropy = 0
-                    seq_len = data['states'].shape[0]
+                    seq_len = len(data['states'])
 
                     for k in range(seq_len):
                         state_k = data['states'][k].to(self.device).unsqueeze(0)
-                        action_k = data['actions'][k].to(self.device).unsqueeze(0)
-                        old_log_prob_k = data['old_log_probs'][k].to(self.device).unsqueeze(0)
+                        
+                        # Bọc action bằng torch.tensor (int)
+                        action_k = torch.as_tensor(data['actions'][k], device=self.device, dtype=torch.long).unsqueeze(0)
+                        
+                        # Đổi 'old_log_probs' thành 'log_probs' và bọc bằng tensor (float)
+                        old_log_prob_k = torch.as_tensor(data['log_probs'][k], device=self.device, dtype=torch.float32).unsqueeze(0)
 
+                        mf_k = data['mfs'][k].to(self.device).unsqueeze(0)
+                        
                         log_prob, entropy, h_gru = self.actor.evaluate(
-                            state_k, mf_const, h_gru, action_k, masks=mask_const, indices=idx
+                            state_k, mf_k, h_gru, action_k, masks=mask_const, indices=idx
                         )
 
                         ratio = torch.exp(log_prob - old_log_prob_k)

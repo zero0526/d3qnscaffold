@@ -149,14 +149,6 @@ class MatrixPhysicalEngine:
         self.phi_accumulator.zero_()
         self.reward_global_accumulator = 0.0
         self.current_num_tasks = 0
-        self.immediate_fails.zero_()
-        self.fail_placement.zero_()
-        self.fail_deadline.zero_()
-        self.fail_hw.zero_()
-        self.fail_queue.zero_()
-        self.service_hw_deficit.zero_()
-        self.service_hw_fail_count.zero_()
-        self.arrival_counts_step.zero_()
         return res
 
     def get_lower_obs(self):
@@ -208,6 +200,17 @@ class MatrixPhysicalEngine:
 
     def process_arrivals(self, terminal_indices, svc_indices, node_indices, model_indices, task_batch_sizes, task_deadlines, task_accuracies):
         t0 = time.perf_counter()
+        
+        # Reset slot-wise counters to prevent accumulation across slots
+        self.immediate_fails.zero_()
+        self.fail_placement.zero_()
+        self.fail_deadline.zero_()
+        self.fail_hw.zero_()
+        self.fail_queue.zero_()
+        self.arrival_counts_step.zero_()
+        self.service_hw_deficit.zero_()
+        self.service_hw_fail_count.zero_()
+        
         # Update action history - Flattening strictly for CUDA
         t_idx_flat = terminal_indices.reshape(-1).long()
         n_idx_flat = node_indices.reshape(-1).long()

@@ -1,0 +1,349 @@
+{
+    "nodes_data": [
+        {
+            "id": "N1",
+            "type": "cloud",
+            "coordinates": {
+                "x": "283.0",
+                "y": "248.0"
+            },
+            "specs": {
+                "cpu": 5600.0,
+                "ram": 80,
+                "hdd": 80,
+                "is_computing": true
+            }
+        },
+        {
+            "id": "N2",
+            "type": "network",
+            "coordinates": {
+                "x": "451.0",
+                "y": "201.0"
+            },
+            "specs": {
+                "cpu": 1060.9,
+                "ram": 10,
+                "hdd": 10,
+                "is_computing": true
+            }
+        },
+        {
+            "id": "N3",
+            "type": "relay",
+            "coordinates": {
+                "x": "516.0",
+                "y": "230.0"
+            },
+            "specs": {
+                "cpu": 0.0,
+                "ram": 0,
+                "hdd": 0,
+                "is_computing": false
+            }
+        },
+        {
+            "id": "N4",
+            "type": "relay",
+            "coordinates": {
+                "x": "324.0",
+                "y": "43.0"
+            },
+            "specs": {
+                "cpu": 0.0,
+                "ram": 0,
+                "hdd": 0,
+                "is_computing": false
+            }
+        },
+        {
+            "id": "N5",
+            "type": "edge",
+            "coordinates": {
+                "x": "459.0",
+                "y": "31.0"
+            },
+            "specs": {
+                "cpu": 3711.26,
+                "ram": 20,
+                "hdd": 10,
+                "is_computing": true
+            }
+        },
+        {
+            "id": "N6",
+            "type": "edge",
+            "coordinates": {
+                "x": "339.0",
+                "y": "151.0"
+            },
+            "specs": {
+                "cpu": 3921.66,
+                "ram": 20,
+                "hdd": 10,
+                "is_computing": true
+            }
+        },
+        {
+            "id": "N7",
+            "type": "edge",
+            "coordinates": {
+                "x": "185.0",
+                "y": "323.0"
+            },
+            "specs": {
+                "cpu": 3702.42,
+                "ram": 20,
+                "hdd": 10,
+                "is_computing": true
+            }
+        },
+        {
+            "id": "N8",
+            "type": "edge",
+            "coordinates": {
+                "x": "384.0",
+                "y": "298.0"
+            },
+            "specs": {
+                "cpu": 3276.3,
+                "ram": 20,
+                "hdd": 10,
+                "is_computing": true
+            }
+        },
+        {
+            "id": "N9",
+            "type": "relay",
+            "coordinates": {
+                "x": "318.0",
+                "y": "353.0"
+            },
+            "specs": {
+                "cpu": 0.0,
+                "ram": 0,
+                "hdd": 0,
+                "is_computing": false
+            }
+        },
+        {
+            "id": "N10",
+            "type": "network",
+            "coordinates": {
+                "x": "147.0",
+                "y": "403.0"
+            },
+            "specs": {
+                "cpu": 821.63,
+                "ram": 10,
+                "hdd": 10,
+                "is_computing": true
+            }
+        },
+        {
+            "id": "N11",
+            "type": "edge",
+            "coordinates": {
+                "x": "56.0",
+                "y": "132.0"
+            },
+            "specs": {
+                "cpu": 3427.02,
+                "ram": 20,
+                "hdd": 10,
+                "is_computing": true
+            }
+        },
+        {
+            "id": "N12",
+            "type": "edge",
+            "coordinates": {
+                "x": "253.0",
+                "y": "466.0"
+            },
+            "specs": {
+                "cpu": 3877.54,
+                "ram": 20,
+                "hdd": 10,
+                "is_computing": true
+            }
+        },
+        {
+            "id": "N13",
+            "type": "relay",
+            "coordinates": {
+                "x": "216.0",
+                "y": "59.0"
+            },
+            "specs": {
+                "cpu": 0.0,
+                "ram": 0,
+                "hdd": 0,
+                "is_computing": false
+            }
+        },
+        {
+            "id": "N14",
+            "type": "network",
+            "coordinates": {
+                "x": "97.0",
+                "y": "218.0"
+            },
+            "specs": {
+                "cpu": 945.37,
+                "ram": 10,
+                "hdd": 10,
+                "is_computing": true
+            }
+        },
+        {
+            "id": "N15",
+            "type": "relay",
+            "coordinates": {
+                "x": "463.0",
+                "y": "431.0"
+            },
+            "specs": {
+                "cpu": 0.0,
+                "ram": 0,
+                "hdd": 0,
+                "is_computing": false
+            }
+        }
+    ],
+    "links_data": [
+        {
+            "id": "L1",
+            "source": "N1",
+            "target": "N6",
+            "transmission_rate": 3293.2675
+        },
+        {
+            "id": "L2",
+            "source": "N1",
+            "target": "N7",
+            "transmission_rate": 1323.8002
+        },
+        {
+            "id": "L3",
+            "source": "N1",
+            "target": "N8",
+            "transmission_rate": 1887.9637
+        },
+        {
+            "id": "L4",
+            "source": "N2",
+            "target": "N3",
+            "transmission_rate": 2577.1284
+        },
+        {
+            "id": "L5",
+            "source": "N2",
+            "target": "N5",
+            "transmission_rate": 1397.0886
+        },
+        {
+            "id": "L6",
+            "source": "N2",
+            "target": "N6",
+            "transmission_rate": 1318.2718
+        },
+        {
+            "id": "L7",
+            "source": "N3",
+            "target": "N5",
+            "transmission_rate": 2937.5501
+        },
+        {
+            "id": "L8",
+            "source": "N3",
+            "target": "N8",
+            "transmission_rate": 2411.4991
+        },
+        {
+            "id": "L9",
+            "source": "N4",
+            "target": "N5",
+            "transmission_rate": 3132.5583
+        },
+        {
+            "id": "L10",
+            "source": "N4",
+            "target": "N6",
+            "transmission_rate": 2159.5575
+        },
+        {
+            "id": "L11",
+            "source": "N6",
+            "target": "N13",
+            "transmission_rate": 2154.8476
+        },
+        {
+            "id": "L12",
+            "source": "N7",
+            "target": "N10",
+            "transmission_rate": 2675.2572
+        },
+        {
+            "id": "L13",
+            "source": "N7",
+            "target": "N14",
+            "transmission_rate": 3355.0441
+        },
+        {
+            "id": "L14",
+            "source": "N8",
+            "target": "N9",
+            "transmission_rate": 1741.8629
+        },
+        {
+            "id": "L15",
+            "source": "N8",
+            "target": "N15",
+            "transmission_rate": 3254.3978
+        },
+        {
+            "id": "L16",
+            "source": "N9",
+            "target": "N10",
+            "transmission_rate": 1644.3297
+        },
+        {
+            "id": "L17",
+            "source": "N9",
+            "target": "N12",
+            "transmission_rate": 1336.6092
+        },
+        {
+            "id": "L18",
+            "source": "N9",
+            "target": "N15",
+            "transmission_rate": 2596.4257
+        },
+        {
+            "id": "L19",
+            "source": "N10",
+            "target": "N12",
+            "transmission_rate": 3433.3328
+        },
+        {
+            "id": "L20",
+            "source": "N11",
+            "target": "N13",
+            "transmission_rate": 3066.2877
+        },
+        {
+            "id": "L21",
+            "source": "N11",
+            "target": "N14",
+            "transmission_rate": 1489.0761
+        },
+        {
+            "id": "L22",
+            "source": "N13",
+            "target": "N14",
+            "transmission_rate": 1901.3773
+        }
+    ],
+    "topology": "atlanta_script_v2"
+}
