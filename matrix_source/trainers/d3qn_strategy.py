@@ -141,7 +141,6 @@ class D3QNStrategy(AlgorithmStrategy):
         rew_divisor = trainer.config.norm_lower_rw
         norm_rew = log_transform(reward / (rew_divisor if rew_divisor != 0 else 1.0))
         rewards = torch.full((len(t_idx),), norm_rew, dtype=torch.float32, device=trainer.device)
-        rewards -= 0.5*next_res["violations"]
         a_ids = (n_idx * trainer.max_models + m_idx).long()
         
         avg_mf_loss = trainer.shared_lower_agent.store_transition_train_mf_batch(
