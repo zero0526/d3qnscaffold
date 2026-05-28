@@ -71,7 +71,7 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
             mf_hidden_sizes=tuple(trainer.config.hyper_neural["MF_HIDDEN_LAYER"]),
             mf_lr=float(trainer.config.hyper_neural['MF_LR']),
             buffer_min_size=self.upper_cfg['min_size'],
-            target_entropy_ratio=0.8, target_entropy_end_ratio=0.05, total_train_steps=30,
+             total_train_steps=30,
             hidden_sizes=trainer.config.hyper_neural['AGENT_HIDDEN_LAYER'],
             lr=float(trainer.config.hyper_neural['UPPER_LR']),
             gamma=trainer.config.hyper_neural['DISCOUNT_FACTOR'],
@@ -403,6 +403,7 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                     )
                     obs_lower = results 
                     true_reward = results['reward']
+                    true_reward -= results['obs']['virtual_drift']
                     norm_rew = log_transform(true_reward / (trainer.config.norm_lower_rw if trainer.config.norm_lower_rw != 0 else 1.0))
 
                     if self.phase == 'LOWER_ONLY' and not self.is_evaluating:

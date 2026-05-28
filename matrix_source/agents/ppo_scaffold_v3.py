@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
 import numpy as np
-from matrix_source.agents.buffer.policy_replay_buffer import MultiAgentPolicyBuffer
+from matrix_source.agents.buffer.policy_replay_buffer_v3 import MultiAgentPolicyBuffer
 from matrix_source.trainers.ppo_stategy import compute_gae
 
 
@@ -107,11 +107,9 @@ class MultiInstanceActor(nn.Module):
         return log_prob, entropy
 
 
-
-
-
 class GroupedMFNetwork(nn.Module):
     """MF Network shared per Group (Edge). Each Edge node has its own model weights."""
+
     def __init__(self, num_groups, input_dim, output_dim, hidden_sizes):
         super().__init__()
         h1, h2 = hidden_sizes
@@ -141,6 +139,7 @@ class CriticBackbone(nn.Module):
         x = F.silu(self.norm2(self.fc2(x, indices), indices))
         return x
 
+
 class CriticHead(nn.Module):
     def __init__(self, h2, num_instances=1):
         super().__init__()
@@ -148,6 +147,7 @@ class CriticHead(nn.Module):
 
     def forward(self, x, indices=None):
         return self.value_head(x, indices).squeeze(-1)
+
 
 class FedRepCritic(nn.Module):
     def __init__(self, state_dim, mf_dim, hidden_sizes, num_instances):
@@ -159,6 +159,7 @@ class FedRepCritic(nn.Module):
     def forward(self, state, mf, agent_indices):
         latent = self.backbone(state, mf, agent_indices)
         return self.head(latent, agent_indices)
+
 
 class PPOSCAFFOLDREPAgent:
     def __init__(self, node_id, node_type, state_dim, action_dim, u_action_dim,
@@ -182,7 +183,7 @@ class PPOSCAFFOLDREPAgent:
         self.action_dim = action_dim
         self.u_action_dim = u_action_dim
         self.exclude_zero = exclude_zero
-        
+
         # Simplified Entropy Control
         self.initial_entropy_coef = entropy_coef
         self.entropy_coef = entropy_coef
@@ -199,23 +200,25 @@ class PPOSCAFFOLDREPAgent:
         self.alpha = alpha
 
         # Networks
-        self.actor = MultiInstanceActor(state_dim, action_dim, u_action_dim, hidden_sizes, num_instances).to(self.device)
+        self.actor = MultiInstanceActor(state_dim, action_dim, u_action_dim, hidden_sizes, num_instances).to(
+            self.device)
         self.critic = FedRepCritic(state_dim, action_dim, hidden_sizes, num_instances).to(self.device)
         self.mf_net = GroupedMFNetwork(num_groups, state_dim + action_dim, action_dim, mf_hidden_sizes).to(self.device)
 
         self.optimizer_actor = optim.Adam(self.actor.parameters(), lr=lr)
         self.bone_optimizer = optim.Adam(self.critic.backbone.parameters(), lr=lr)
-        self.head_optimizer  = optim.Adam(self.critic.head.parameters(), lr=lr)
-        self.mf_optimizer    = optim.Adam(self.mf_net.parameters(), lr=mf_lr)
+        self.head_optimizer = optim.Adam(self.critic.head.parameters(), lr=lr)
+        self.mf_optimizer = optim.Adam(self.mf_net.parameters(), lr=mf_lr)
 
         self.loss_fn = nn.SmoothL1Loss()
 
-        self.memory = MultiAgentPolicyBuffer(num_instances, buffer_size, state_dim, action_dim, u_action_dim, self.device)
+        self.memory = MultiAgentPolicyBuffer(num_instances, buffer_size, state_dim, action_dim, u_action_dim,
+                                             self.device)
         self.learn_step_counter = 0
 
         # SCAFFOLD Control Variates for Critic Backbone (Encoder)
         self.bone_params = list(self.critic.backbone.parameters())
-        self.c_b_local  = [torch.zeros_like(p, device=self.device) for p in self.bone_params]
+        self.c_b_local = [torch.zeros_like(p, device=self.device) for p in self.bone_params]
         self.c_b_global = [torch.zeros_like(p, device=self.device) for p in self.bone_params]
         self.grad_b_sum = [torch.zeros_like(p, device=self.device) for p in self.bone_params]
         self.steps_in_round = torch.zeros(num_instances, dtype=torch.long, device=self.device)
@@ -233,13 +236,14 @@ class PPOSCAFFOLDREPAgent:
         )
         return int(actions[0])
 
-    def choose_action_batch(self, states, mfs, masks_batch=None, agent_indices=None, group_indices=None, deterministic=False, zeta=1.0):
+    def choose_action_batch(self, states, mfs, masks_batch=None, agent_indices=None, group_indices=None,
+                            deterministic=False, zeta=1.0):
         batch_size = states.shape[0]
         if agent_indices is None:
             agent_indices = torch.zeros(batch_size, dtype=torch.long, device=self.device)
         if group_indices is None:
             group_indices = torch.zeros(batch_size, dtype=torch.long, device=self.device)
-        
+
         agent_indices = agent_indices.to(self.device).view(-1)
         group_indices = group_indices.to(self.device).view(-1)
         states = torch.as_tensor(states, device=self.device, dtype=torch.float32)
@@ -300,10 +304,10 @@ class PPOSCAFFOLDREPAgent:
             next_values = self.critic(next_states, next_pred_mfs, agent_indices=agent_ids)
             advantages = compute_gae(rewards, next_values, old_values, dones, agent_ids, self.gamma, self.lmbda)
             returns = advantages + old_values
-            
+
             if advantages.shape[0] > 1:
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                
+
         return pred_mfs, advantages, returns
 
     def save_base_initial(self):
@@ -340,9 +344,9 @@ class PPOSCAFFOLDREPAgent:
             for i in range(len(self.c_b_local)):
                 K = steps.view(-1, *([1] * (self.grad_b_sum[i].dim() - 1)))
                 self.c_b_local[i][active_ids] = (
-                    self.c_b_local[i][active_ids]
-                    - self.c_b_global[i][active_ids]
-                    + self.grad_b_sum[i][active_ids] / K
+                        self.c_b_local[i][active_ids]
+                        - self.c_b_global[i][active_ids]
+                        + self.grad_b_sum[i][active_ids] / K
                 )
 
     def learn(self, agents_ids: torch.Tensor = None, round_idx: int = 0, group_ids: torch.Tensor = None, zeta=1.0):
@@ -360,14 +364,14 @@ class PPOSCAFFOLDREPAgent:
         if data is None: return None
 
         states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, old_log_probs, old_values, masks, agent_ids = data
-        
+
         # Squeeze
         actions = actions.squeeze(-1)
         old_log_probs = old_log_probs.squeeze(-1)
         old_values = old_values.squeeze(-1)
         rewards = rewards.squeeze(-1)
         dones = dones.squeeze(-1)
-        
+
         batch_group_ids = group_ids[agent_ids].to(self.device)
 
         # 0. Save Base Initial: Reset grad accumulators and steps at start of round
@@ -388,7 +392,7 @@ class PPOSCAFFOLDREPAgent:
             for start in range(0, dataset_size, self.batch_size):
                 end = start + self.batch_size
                 idx = indices[start:end]
-                
+
                 b_states = states[idx]
                 b_prev_mfs = prev_mfs[idx]
                 b_actions = actions[idx]
@@ -405,7 +409,7 @@ class PPOSCAFFOLDREPAgent:
                 # --- Critic Update (Delayed Backbone, Direct Head) ---
                 self.bone_optimizer.zero_grad()
                 self.head_optimizer.zero_grad()
-                
+
                 v_curr = self.critic(b_states, b_pred_mfs, b_agent_ids)
                 v_loss = F.mse_loss(v_curr, b_returns)
                 v_loss.backward()
@@ -418,18 +422,19 @@ class PPOSCAFFOLDREPAgent:
                             # TÍCH LŨY GRADIENT THÔ (CHƯA SỬA)
                             self.grad_b_sum[i][u_ids] += p.grad.data[u_ids]
                     self.steps_in_round[u_ids] += 1
-                
+
                 # B. Update Head (STEP HEAD NORMALLY)
                 torch.nn.utils.clip_grad_norm_(self.critic.head.parameters(), max_norm=1.0)
                 self.head_optimizer.step()
-                
+
                 # Reset backbone grads so they don't accumulate in .grad attribute
                 self.bone_optimizer.zero_grad()
 
                 # --- Actor Update (PPO) ---
-                log_probs, entropy = self.actor.evaluate(b_states, b_pred_mfs, b_actions, masks=b_masks, indices=b_agent_ids, exclude_zero=self.exclude_zero, zeta=zeta)
+                log_probs, entropy = self.actor.evaluate(b_states, b_pred_mfs, b_actions, masks=b_masks,
+                                                         indices=b_agent_ids, exclude_zero=self.exclude_zero, zeta=zeta)
                 ratio = torch.exp(log_probs - b_old_log_probs)
-                
+
                 surr1 = ratio * b_advantages
                 surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * b_advantages
                 actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy.mean()
@@ -443,24 +448,25 @@ class PPOSCAFFOLDREPAgent:
                 total_batches += 1
 
         # 3. Post-PPO SCAFFOLD Update for Backbone (CHẠY 1 LẦN DUY NHẤT SAU LOOP)
-        self.update_local_cvariates(target_agents) # Cập nhật c_local dựa trên grad tích lũy
+        self.update_local_cvariates(target_agents)  # Cập nhật c_local dựa trên grad tích lũy
 
         with torch.no_grad():
             active_mask = self.steps_in_round > 0
             if active_mask.any():
                 active_ids = torch.where(active_mask)[0]
                 steps = self.steps_in_round[active_ids].float()
-                
+
                 # Tính gradient trung bình: g_avg = grad_sum / K
                 self.bone_optimizer.zero_grad()
                 for i, p in enumerate(self.bone_params):
                     K = steps.view(-1, *([1] * (p.dim() - 1)))
                     avg_grad = self.grad_b_sum[i][active_ids] / K
-                    
+
                     # Áp dụng công thức SCAFFOLD: g_corrected = g_avg + (c_global - c_local)
                     p.grad = torch.zeros_like(p)
-                    p.grad.data[active_ids] = avg_grad + (self.c_b_global[i][active_ids] - self.c_b_local[i][active_ids])
-                
+                    p.grad.data[active_ids] = avg_grad + (
+                                self.c_b_global[i][active_ids] - self.c_b_local[i][active_ids])
+
                 # STEP BACKBONE
                 torch.nn.utils.clip_grad_norm_(self.bone_params, max_norm=1.0)
                 self.bone_optimizer.step()

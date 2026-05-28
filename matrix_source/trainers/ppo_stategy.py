@@ -248,6 +248,7 @@ class PPOStrategy(AlgorithmStrategy):
 
         # 2. Extract metrics and rewards
         reward = next_res['reward']
+        reward -= next_res["obs"]["virtual_drift"]
         rew_divisor = trainer.config.norm_lower_rw
         norm_rew = log_transform(reward / (rew_divisor if rew_divisor != 0 else 1.0))
         norm_rew -= 0.5*next_res["violations"]

@@ -1,6 +1,6 @@
 import torch
 from matrix_source.agents.ppo import PPOAgent
-from matrix_source.agents.ppo_scaffold_v2 import PPOSCAFFOLDREPAgent
+from matrix_source.agents.ppo_scaffold_v3 import PPOSCAFFOLDREPAgent
 
 from matrix_source.trainers.strategies import AlgorithmStrategy
 from matrix_source.trainers.train import log_transform
@@ -54,10 +54,10 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
         # Hyperparams from user (Strict 5-Cycle Curriculum)
         self.cycle_configs = {
             1: {'lower': 15, 'upper': 10, 'zeta': 1.0, 'det': False},
-            2: {'lower': 12, 'upper': 8,  'zeta': 1.0, 'det': False},
-            3: {'lower': 10, 'upper': 7,  'zeta': 1.0, 'det': False},
-            4: {'lower': 8,  'upper': 5,  'zeta': 1.0, 'det': False},
-            5: {'lower': 6,  'upper': 4,  'zeta': 1.0, 'det': True}
+            2: {'lower': 12, 'upper': 8, 'zeta': 1.0, 'det': False},
+            3: {'lower': 10, 'upper': 7, 'zeta': 1.0, 'det': False},
+            4: {'lower': 8, 'upper': 5, 'zeta': 1.0, 'det': False},
+            5: {'lower': 6, 'upper': 4, 'zeta': 1.0, 'det': True}
         }
 
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
@@ -65,7 +65,7 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
 
         self.cycle_num = 1
         self.max_cycles = 5
-        
+
         # Initial settings for Cycle 1
         cfg = self.cycle_configs[self.cycle_num]
         self.lower_warmup_steps = cfg['lower']
@@ -77,8 +77,20 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
         self.entropy_decay_rate = 0.99
         self.is_evaluating = False
 
+        # Frame-level accumulators for Minimalist Upper State features (V_cum, V_nbr)
+        # These are reset at the start of each Time Frame (is_new_frame)
+        self._frame_arrivals = None   # (num_nodes,)  – total task arrivals per node
+        self._frame_hw_fails = None   # (num_nodes,)  – hardware-limit failures per node
+        self._frame_expired  = None   # (num_nodes,)  – queue-expired failures per node
+        # Cached spatio-temporal features (computed at end-of-frame, used next frame)
+        self._v_cum = None            # (num_nodes,)  – cumulative failure intensity
+        self._v_nbr = None            # (num_nodes,)  – peer-average failure intensity
+
     def initialize_agents(self, trainer):
-        # 1. Upper Agent
+        # 1. Upper Agent (Minimalist State: 2*S+1,  Augmented MF: S+2)
+        trainer.upper_state_dim  = trainer.num_services * 2 + 1
+        trainer.upper_action_dim = trainer.num_services + 2   # augmented MF dim
+
         trainer.shared_upper_agent = PPOAgent(
             node_id=-2, node_type="Edge_Group",
             state_dim=trainer.upper_state_dim,
@@ -99,38 +111,18 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
             device=trainer.device
         )
 
-        # 2. Lower Agent
-        trainer.shared_lower_agent = PPOSCAFFOLDREPAgent(
-            node_id=-1, node_type="Terminal_Group",
-            state_dim=trainer.lower_state_dim,
-            action_dim=trainer.lower_action_dim,
-            u_action_dim=trainer.lower_u_action_dim,
-            mf_hidden_sizes=tuple(trainer.config.hyper_neural["MF_HIDDEN_LAYER"]),
-            mf_lr=float(trainer.config.hyper_neural['MF_LR']),
-            buffer_min_size=self.lower_cfg['min_size'],
-            num_groups=trainer.num_edge_agents,  # Pass num_groups for SCAFFOLD
-            hidden_sizes=tuple(trainer.config.hyper_neural['AGENT_HIDDEN_LAYER']),
-            lr=float(trainer.config.hyper_neural['LOWER_LR']),
-            gamma=trainer.config.hyper_neural['DISCOUNT_FACTOR'],
-            lam=trainer.config.hyper_neural.get('LAMBDA', 0.95),
-            clip_eps=trainer.config.hyper_neural.get('CLIP_EPS', 0.2),
-            k_epochs=self.lower_cfg['epochs'],
-            batch_size=self.lower_cfg['batch'],
-            num_instances=trainer.num_terminals,
-            device=trainer.device
-        )
 
         # 3. Compute Terminal-to-Group Mapping from Environment
         # terminal_to_comp_node_map corresponds to (num_terminals, num_comp_nodes)
         mapping_matrix = trainer.env.static_matrices['terminal_to_comp_node_map']
         terminal_node_indices = mapping_matrix.argmax(dim=1)
-        
+
         terminal_to_group = torch.zeros(trainer.num_terminals, dtype=torch.long, device=trainer.device)
         for k in range(trainer.num_terminals):
             node_idx = int(terminal_node_indices[k])
             # Map node index to edge agent index using node_to_instance
             terminal_to_group[k] = trainer.node_to_instance.get(node_idx, 0)
-            
+
         trainer.terminal_to_group = terminal_to_group
 
         # 4. Initialize Cluster Mapping (Edge Node -> List of Terminals)
@@ -142,29 +134,96 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
 
         print(f"[PPOSCAFFOLDREPStrategy] Initialized {len(self.node_to_terminals)} SCAFFOLD clusters.")
 
-        # 5. Initial Phase Jump (if warmup is 0)
+        # 5. Initialise accumulators with env dimensions
+        num_nodes = trainer.num_nodes
+        dev = trainer.device
+        self._frame_arrivals = torch.zeros(num_nodes, device=dev)
+        self._frame_hw_fails = torch.zeros(num_nodes, device=dev)
+        self._frame_expired  = torch.zeros(num_nodes, device=dev)
+        self._v_cum = torch.zeros(num_nodes, device=dev)
+        self._v_nbr = torch.zeros(num_nodes, device=dev)
+
+        # 6. Initial Phase Jump (if warmup is 0)
         if self.phase == 'LOWER_ONLY' and self.lower_warmup_steps == 0:
             self.phase = 'UPPER_ONLY'
             print(f"[Curriculum] Initial skip: LOWER_ONLY -> UPPER_ONLY")
 
         if self.phase == 'UPPER_ONLY' and self.upper_warmup_steps == 0:
-            # Under new strategy, if both are 0 it might just loop or stop.
-            # We'll stick to the initialization defaults.
             pass
+
+    # ------------------------------------------------------------------
+    # Minimalist Upper State helpers
+    # ------------------------------------------------------------------
+    def build_upper_state(self, trainer, obs_upper):
+        """Returns (num_nodes, 2*S+1) state: [actions, phi_prob, cpu_total_util]."""
+        actions  = obs_upper['actions']   # (N, S)
+        phi      = obs_upper['phi_prob']  # (N, S)
+
+        # Total CPU utilisation = sum(cpu_alloc) / cpu_max  (scalar per node)
+        cpu_alloc = trainer.env.engine.cpu_alloc_matrix    # (N, S)
+        cpu_max   = trainer.env.engine.resource_specs[:, 0].clamp(min=1.0)  # (N,)
+        cpu_util  = cpu_alloc.sum(dim=1) / cpu_max         # (N,)
+        return torch.cat([actions, phi, cpu_util.unsqueeze(-1)], dim=-1)  # (N, 2S+1)
+
+    def _compute_upper_mf(self, trainer, obs_upper):
+        """Augmented mean field: [neighbor_avg_actions, V_cum, V_nbr]."""
+        # Env-provided neighbor-average placement actions (N, S)
+        env_mf = obs_upper.get(
+            'mean_fields',
+            torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device)
+        )  # (N, S)
+
+        # Spatio-temporal failure features (N,) → unsqueeze to (N,1)
+        v_cum = self._v_cum.unsqueeze(-1)  # (N, 1)
+        v_nbr = self._v_nbr.unsqueeze(-1)  # (N, 1)
+
+        return torch.cat([env_mf, v_cum, v_nbr], dim=-1)  # (N, S+2)
+
+    def _reset_frame_accumulators(self, trainer):
+        self._frame_arrivals.zero_()
+        self._frame_hw_fails.zero_()
+        self._frame_expired.zero_()
+
+    def _update_frame_accumulators(self, trainer, step_info):
+        """Accumulate per-step node-level metrics. Call after each step_lower."""
+        # arrivals: (N, S) → sum over services → (N,)
+        arrival_mat = step_info.get('arrival_matrix',
+                                    torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device))
+        self._frame_arrivals += arrival_mat.sum(dim=1)
+
+        # hw failures: fail_hw is (N, S)
+        fail_hw = trainer.env.engine.fail_hw  # (N, S) – already zeroed & filled inside process_arrivals
+        self._frame_hw_fails += fail_hw.sum(dim=1)
+
+        # expired in queue: violate_qos minus immediate_fails = expired count
+        violate_qos = step_info.get('violate_qos',
+                                    torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device))
+        immediate   = trainer.env.engine.immediate_fails   # (N, S)
+        expired_mat = (violate_qos - immediate).clamp(min=0)
+        self._frame_expired += expired_mat.sum(dim=1)
+
+    def _finalize_frame_features(self, trainer):
+        """Compute V_cum and V_nbr at the end of a Time Frame."""
+        total_fails = self._frame_hw_fails + self._frame_expired   # (N,)
+        arrivals    = self._frame_arrivals.clamp(min=1.0)
+        self._v_cum = total_fails / arrivals                        # (N,)
+
+        adj         = trainer.env.engine.adj_matrix                # (N, N)
+        nbr_count   = adj.sum(dim=1).clamp(min=1.0)                # (N,)
+        self._v_nbr = (adj @ self._v_cum.unsqueeze(-1)).squeeze(-1) / nbr_count  # (N,)
 
     def get_upper_actions(self, trainer, current_upper_state, obs_upper):
         act_matrix = torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device)
 
-        # 1. Get Observed Mean Field and Update EMA
-        mf_global = obs_upper.get('mean_fields',
-                                  torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device))
+        # 1. Build augmented MF and update EMA
+        mf_augmented = self._compute_upper_mf(trainer, obs_upper)  # (N, S+2)
         if self.upper_mf_ema is None:
-            self.upper_mf_ema = mf_global.clone()
+            self.upper_mf_ema = mf_augmented.clone()
         else:
-            self.upper_mf_ema = (1 - self.mf_ema_alpha) * self.upper_mf_ema + self.mf_ema_alpha * mf_global
+            self.upper_mf_ema = (1 - self.mf_ema_alpha) * self.upper_mf_ema + self.mf_ema_alpha * mf_augmented
 
         edge_states = current_upper_state[trainer.edge_node_ids]
-        edge_mfs = self.upper_mf_ema[trainer.edge_node_ids]
+        edge_mfs    = self.upper_mf_ema[trainer.edge_node_ids]
         instance_indices = torch.tensor([trainer.node_to_instance[nid] for nid in trainer.edge_node_ids],
                                         device=trainer.device)
 
@@ -220,9 +279,9 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
         Returns:
             states : (len(t_idx), state_dim) float tensor
         """
-        placement = trainer.env.engine.placement_matrix[:, s_idx]   # (num_nodes, B)
-        b_masked = (obs['backlog'][:, s_idx]).T         # (B, num_nodes)
-        c_masked = (obs['cpu_alloc'][:, s_idx] * placement).T       # (B, num_nodes)
+        placement = trainer.env.engine.placement_matrix[:, s_idx]  # (num_nodes, B)
+        b_masked = (obs['backlog'][:, s_idx]).T  # (B, num_nodes)
+        c_masked = (obs['cpu_alloc'][:, s_idx] * placement).T  # (B, num_nodes)
         st = torch.cat([obs['task_reqs'][t_idx], b_masked, c_masked], dim=1)
         st = st.clone()
         st[:, 0] /= trainer.config.norm_data_size
@@ -304,7 +363,7 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
 
         # Correctly slice MF and indices for the current batch
         mfs = mf[t_idx] if mf.shape[0] == trainer.num_terminals else mf
-        
+
         # Use current curriculum config for deterministic flag and zeta
         cfg = self.cycle_configs.get(self.cycle_num, self.cycle_configs[1])
         is_det = self.is_evaluating or cfg['det']
@@ -359,7 +418,7 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
             done = torch.tensor([next_res["new_frame"]] * len(t_idx), dtype=torch.float32, device=trainer.device)
             rewards = torch.full((len(t_idx),), norm_rew, dtype=torch.float32, device=trainer.device)
             a_ids = (n_idx * trainer.max_models + m_idx).long()
-            
+
             # Get group_ids for MF training and storage
             t_group_ids = trainer.terminal_to_group[t_idx]
 
@@ -367,7 +426,7 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
             avg_mf_loss = trainer.shared_lower_agent.learn_mf_batch(
                 prev_state, prev_mf, curr_mf, t_group_ids
             )
-            
+
             # Store transition in agent memory
             trainer.shared_lower_agent.memory.add_batch(
                 prev_state, prev_mf, curr_mf, a_ids, rewards, curr_state, done,
@@ -378,7 +437,8 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
         trainer.aggregator.add_lower(next_res, mf_loss=avg_mf_loss,
                                      state=curr_state[0] if (curr_state is not None and len(curr_state) > 0) else None)
 
-    def store_upper_transitions(self, trainer, s_all, ns_all, current_res, next_res, acts_matrix, log_probs, values, is_done):
+    def store_upper_transitions(self, trainer, s_all, ns_all, current_res, next_res, acts_matrix, log_probs, values,
+                                is_done):
         # 1. Extract global metrics
         reward = next_res['reward_global']
         rew_divisor = trainer.config.norm_upper_rw
@@ -458,7 +518,7 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                 # Step 3: Aggregate backbone control variates to update the global correction term
                 c_b_local_slices = agent.get_c_b_local(t_ids)
                 # Global variate for the cluster is the average of local variates
-                c_b_new_global = [c.mean(dim=0, keepdim=True).expand(len(terminal_ids), *c.shape[1:]) 
+                c_b_new_global = [c.mean(dim=0, keepdim=True).expand(len(terminal_ids), *c.shape[1:])
                                   for c in c_b_local_slices]
                 agent.set_c_b_global(t_ids, c_b_new_global)
 
@@ -482,13 +542,14 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
 
             # Persistent lower-level state and mean-field across steps
             # Will be properly initialised on the first step with real tasks
-            prev_lower_obs   = init_lower_obs   # raw obs dict for state building
-            prev_lower_state = None             # (num_terminals, state_dim) – lazily initialised
-            prev_lower_mf    = None             # (num_terminals, mf_dim)
+            prev_lower_obs = init_lower_obs  # raw obs dict for state building
+            prev_lower_state = None  # (num_terminals, state_dim) – lazily initialised
+            prev_lower_mf = None  # (num_terminals, mf_dim)
 
             for slot in range(max_slots):
                 if trainer.env.time_manager.is_new_frame():
-                    u_acts_matrix, u_log_probs, u_values = self.get_upper_actions(trainer, current_upper_state, obs_upper)
+                    u_acts_matrix, u_log_probs, u_values = self.get_upper_actions(trainer, current_upper_state,
+                                                                                  obs_upper)
                     trainer.env.step_upper(u_acts_matrix)
 
                 t_idx, s_idx, batch_sizes, tasks_min_accuracy, task_deadlines = trainer.workload_gen.generate_step()
@@ -499,7 +560,7 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                         prev_lower_mf if prev_lower_mf is not None
                         else torch.zeros((trainer.num_terminals, lower_mf_dim), device=trainer.device)
                     )
-                    prev_lower_obs['mean_field']= prev_lower_mf
+                    prev_lower_obs['mean_field'] = prev_lower_mf
                     n_idx, m_idx, masks, l_log_probs, l_values, fresh_prev_states = self.get_lower_actions(
                         trainer, prev_lower_obs, prev_lower_mf, t_idx, s_idx,
                         tasks_min_accuracy, task_deadlines, batch_sizes)
@@ -517,9 +578,9 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                     # --- (E) Slice prev state/mf for this batch's tasks ---
                     if prev_lower_mf is None:
                         # Very first step: no history yet → zeros for both
-                        _prev_mf    = torch.zeros(len(t_idx), lower_mf_dim, device=trainer.device)
+                        _prev_mf = torch.zeros(len(t_idx), lower_mf_dim, device=trainer.device)
                     else:
-                        _prev_mf    = prev_lower_mf[t_idx]      # (B, mf_dim)
+                        _prev_mf = prev_lower_mf[t_idx]  # (B, mf_dim)
 
                     # --- (F) Store transition with correctly paired (prev, curr) pairs ---
                     self.store_lower_transitions(
@@ -608,7 +669,7 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                         # Get current zeta from config
                         cfg = self.cycle_configs.get(self.cycle_num, self.cycle_configs[1])
                         zeta = cfg['zeta']
-                        
+
                         loss = trainer.shared_upper_agent.learn(
                             torch.arange(trainer.num_edge_agents, device=trainer.device),
                             zeta=zeta
@@ -638,8 +699,10 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                                     n_cfg = self.cycle_configs[self.cycle_num]
                                     self.lower_warmup_steps = n_cfg['lower']
                                     self.upper_warmup_steps = n_cfg['upper']
-                                    print(f"\n[Curriculum] Cycle {self.cycle_num-1} Complete. Starting Cycle {self.cycle_num}")
-                                    print(f"Config: Lower={self.lower_warmup_steps}, Upper={self.upper_warmup_steps}, Zeta={n_cfg['zeta']}, Det={n_cfg['det']}")
+                                    print(
+                                        f"\n[Curriculum] Cycle {self.cycle_num - 1} Complete. Starting Cycle {self.cycle_num}")
+                                    print(
+                                        f"Config: Lower={self.lower_warmup_steps}, Upper={self.upper_warmup_steps}, Zeta={n_cfg['zeta']}, Det={n_cfg['det']}")
                                 else:
                                     print(f"\n[Curriculum] All {self.max_cycles} Cycles Complete.")
 
@@ -680,9 +743,9 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
             obs_upper, init_lower_obs = res['upper'], res['lower']
             current_upper_state = self.build_upper_state(trainer, obs_upper)
 
-            prev_lower_obs   = init_lower_obs
-            prev_lower_state = None             # (num_terminals, state_dim)
-            prev_lower_mf    = None             # (num_terminals, mf_dim)
+            prev_lower_obs = init_lower_obs
+            prev_lower_state = None  # (num_terminals, state_dim)
+            prev_lower_mf = None  # (num_terminals, mf_dim)
 
             ep_reward = 0
             ep_backlog = []
@@ -697,7 +760,7 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                 if len(t_idx) > 0:
                     # --- (A) Build temporary obs-dict for evaluation ---
                     prev_lower_mf = (
-                        prev_lower_mf if prev_lower_mf is not None 
+                        prev_lower_mf if prev_lower_mf is not None
                         else torch.zeros((trainer.num_terminals, lower_mf_dim), device=trainer.device)
                     )
                     prev_lower_obs['mean_field'] = prev_lower_mf
@@ -717,10 +780,10 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                     self.store_lower_transitions(
                         trainer, results,
                         fresh_prev_states, prev_lower_mf[t_idx],
-                        None, curr_lower_mf, # curr_state is only for storage
+                        None, curr_lower_mf,  # curr_state is only for storage
                         t_idx, n_idx, m_idx, masks, l_log_probs, l_vals
                     )
-                    
+
                     # Record upper metrics using full results
                     self.store_upper_transitions(trainer, current_upper_state, None, obs_upper, results, u_acts_matrix,
                                                  None, None, (slot == max_slots - 1))

@@ -62,8 +62,8 @@ class Trainer:
         self.edge_node_ids = [nid for nid in range(self.num_nodes)
                               if nid not in self.env.static_matrices.get("cloud_ids", [])]
         self.node_to_instance = {nid: i for i, nid in enumerate(self.edge_node_ids)}
-        self.num_edge_agents = len(self.edge_node_ids)
         self.max_epochs= 3000
+        self.num_edge_agents = len(self.edge_node_ids)
         # 2. Strategy Injection
         self.strategy = strategy if strategy is not None else PPOStrategy()
         self.strategy.initialize_agents(self)

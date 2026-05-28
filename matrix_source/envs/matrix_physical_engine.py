@@ -68,9 +68,9 @@ class MatrixPhysicalEngine:
         self.reward_global_accumulator = 0.0
         
         # Solver
-        f_max_all = self.resource_specs[:, 0].to(self.device).unsqueeze(1)
+        self.f_max_all = self.resource_specs[:, 0].to(self.device).unsqueeze(1)
         self.solver = KKTSolverADMM(
-            f_max_node=f_max_all,
+            f_max_node=self.f_max_all,
             rho=config.admm_rho,
             max_iter=config.admm_max_iter,
             tol=config.admm_tol
@@ -473,7 +473,7 @@ class MatrixPhysicalEngine:
         )
         total_energy = comp_energy + trans_energy_total
         
-        f1 = total_drift + virtual_drift + self.lypa_coef * total_energy
+        f1 = total_drift + self.lypa_coef * total_energy
         self.reward_global_accumulator += f1
         
         # Refined QoS penalty
@@ -481,6 +481,7 @@ class MatrixPhysicalEngine:
         
         reward = -(f1 +qos_penalty)
         obs = {
+            "virtual_drift": virtual_drift,
             "total_drift": total_drift,
             "virtual_drift": virtual_drift,
             # N x S: CPU capacity spent on externally-offloaded tasks
