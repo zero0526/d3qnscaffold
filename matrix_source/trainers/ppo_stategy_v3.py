@@ -111,6 +111,26 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
             device=trainer.device
         )
 
+        # 2. Lower Agent
+        trainer.shared_lower_agent = PPOSCAFFOLDREPAgent(
+            node_id=-1, node_type="Terminal_Group",
+            state_dim=trainer.lower_state_dim,
+            action_dim=trainer.lower_action_dim,
+            u_action_dim=trainer.lower_u_action_dim,
+            mf_hidden_sizes=tuple(trainer.config.hyper_neural["MF_HIDDEN_LAYER"]),
+            mf_lr=float(trainer.config.hyper_neural['MF_LR']),
+            buffer_min_size=self.lower_cfg['min_size'],
+            num_groups=trainer.num_edge_agents,
+            hidden_sizes=tuple(trainer.config.hyper_neural['AGENT_HIDDEN_LAYER']),
+            lr=float(trainer.config.hyper_neural['LOWER_LR']),
+            gamma=trainer.config.hyper_neural['DISCOUNT_FACTOR'],
+            lam=trainer.config.hyper_neural.get('LAMBDA', 0.95),
+            clip_eps=trainer.config.hyper_neural.get('CLIP_EPS', 0.2),
+            k_epochs=self.lower_cfg['epochs'],
+            batch_size=self.lower_cfg['batch'],
+            num_instances=trainer.num_terminals,
+            device=trainer.device
+        )
 
         # 3. Compute Terminal-to-Group Mapping from Environment
         # terminal_to_comp_node_map corresponds to (num_terminals, num_comp_nodes)
@@ -548,6 +568,11 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
 
             for slot in range(max_slots):
                 if trainer.env.time_manager.is_new_frame():
+                    # Finalize V_cum / V_nbr from the previous frame's data,
+                    # then reset counters for the new frame.
+                    self._finalize_frame_features(trainer)
+                    self._reset_frame_accumulators(trainer)
+
                     u_acts_matrix, u_log_probs, u_values = self.get_upper_actions(trainer, current_upper_state,
                                                                                   obs_upper)
                     trainer.env.step_upper(u_acts_matrix)
@@ -574,6 +599,9 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
 
                     # --- (D) Build curr state from the environment's next obs ---
                     curr_lower_state = self.build_lower_state(trainer, results['obs'], t_idx, s_idx)
+
+                    # --- (D1) Accumulate frame-level failure metrics for V_cum ---
+                    self._update_frame_accumulators(trainer, results['info'])
 
                     # --- (E) Slice prev state/mf for this batch's tasks ---
                     if prev_lower_mf is None:
@@ -753,8 +781,13 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
 
             for slot in range(max_slots):
                 if trainer.env.time_manager.is_new_frame():
+                    # Finalize and reset accumulators – same as training
+                    self._finalize_frame_features(trainer)
+                    self._reset_frame_accumulators(trainer)
+
                     u_acts_matrix, u_log_probs, u_val = self.get_upper_actions(trainer, current_upper_state, obs_upper)
                     trainer.env.step_upper(u_acts_matrix)
+
 
                 t_idx, s_idx, batch_sizes, tasks_min_accuracy, task_deadlines = trainer.workload_gen.generate_step()
                 if len(t_idx) > 0:
@@ -775,6 +808,9 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                     # --- (C) Step the environment ---
                     results = trainer.env.step_lower(t_idx, s_idx, batch_sizes, n_idx, m_idx, task_deadlines,
                                                      tasks_min_accuracy)
+
+                    # --- (C1) Accumulate frame-level failure metrics for V_cum ---
+                    self._update_frame_accumulators(trainer, results['info'])
 
                     # --- (D) ALWAYS record metrics (Skip storage during eval) ---
                     self.store_lower_transitions(
