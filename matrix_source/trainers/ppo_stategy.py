@@ -50,11 +50,16 @@ class PPOStrategy(AlgorithmStrategy):
 
         # Hyperparams from user (Strict 5-Cycle Curriculum)
         self.cycle_configs = {
-            1: {'lower': 15, 'upper': 10, 'zeta': 1.0, 'det': False},
-            2: {'lower': 12, 'upper': 8,  'zeta': 1.0, 'det': False},
-            3: {'lower': 10, 'upper': 7,  'zeta': 1.0, 'det': False},
-            4: {'lower': 8,  'upper': 5,  'zeta': 1.0, 'det': False},
-            5: {'lower': 6,  'upper': 4,  'zeta': 1.0, 'det': True}
+            1: {'lower': 10, 'upper': 10, 'zeta': 1.0, 'det': False},
+            2: {'lower': 10, 'upper': 10,  'zeta': 1.0, 'det': False},
+            3: {'lower': 10, 'upper': 10,  'zeta': 1.0, 'det': False},
+            4: {'lower': 8,  'upper': 8,  'zeta': 1.0, 'det': False},
+            5: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            6: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            7: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            8: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            9: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            10: {'lower': 8,  'upper': 8,  'zeta': 1.0, 'det': True}
         }
         
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
@@ -191,8 +196,7 @@ class PPOStrategy(AlgorithmStrategy):
             [data_sizes, tasks_min_accuracy, task_deadlines, meta['service_omega'][s_idx].squeeze(-1)], dim=1).float()
         # Get Current Placement to mask out stale values (especially on frame boundaries)
         current_placement = trainer.env.engine.placement_matrix[:, s_idx]
-        num_reqs = states_rows = s_tasks.shape[0]
-        
+
         # Use reshape(1, -1) to safely handle any dimensionality from s_idx indexing before expansion
         s_backlogs = (obs_dict['backlog'][:, s_idx] * current_placement).T
         s_cpus = (obs_dict['cpu_alloc'][:, s_idx] * current_placement).T
@@ -227,8 +231,7 @@ class PPOStrategy(AlgorithmStrategy):
         def build_state(obs, tidx, sidx):
             # Mask backlog and cpu_alloc with current placement to ensure consistency
             placement = trainer.env.engine.placement_matrix[:, sidx]
-            num_reqs = obs['task_reqs'][tidx].shape[0]
-            
+
             # Use reshape(1, -1) to safely handle any dimensionality from sidx indexing before expansion
             b_masked = (obs['backlog'][:, sidx] * placement).T
             c_masked = (obs['cpu_alloc'][:, sidx] * placement).T
@@ -390,14 +393,9 @@ class PPOStrategy(AlgorithmStrategy):
             dones = torch.full((trainer.num_edge_agents,), 1.0 if is_done else 0.0, dtype=torch.float32,
                                device=trainer.device)
 
-            # Use same EMA consistency logic for storage
             next_raw_mf = next_res['mean_fields']
-            if self.upper_mf_ema is None:
-                self.upper_mf_ema = next_raw_mf
-            next_ema = (1 - self.mf_ema_alpha) * self.upper_mf_ema + self.mf_ema_alpha * next_raw_mf
-
-            edge_c_mfs = self.upper_mf_ema[trainer.edge_node_ids]
-            edge_n_mfs = next_ema[trainer.edge_node_ids]
+            curr_raw_mf= current_res['mean_fields']
+            edge_c_mfs = curr_raw_mf[trainer.edge_node_ids]
             edge_acts = acts_matrix[trainer.edge_node_ids]
 
             pw2 = 2 ** torch.arange(trainer.num_services - 1, -1, -1, device=trainer.device).float()
@@ -578,8 +576,8 @@ class PPOStrategy(AlgorithmStrategy):
             res = trainer.env.reset()
             obs_upper, prev_lower_res = res['upper'], res['lower']
             
-            lower_mf_dim = trainer.num_nodes + trainer.max_models
-            prev_lower_res["mean_field"] = torch.zeros((trainer.num_nodes * trainer.num_services, lower_mf_dim), device=trainer.device)
+            lower_mf_dim = trainer.num_terminals + trainer.max_models
+            prev_lower_res["mean_field"] = torch.zeros((trainer.num_terminals + trainer.num_services, lower_mf_dim), device=trainer.device)
             
             current_upper_state = self.build_upper_state(trainer, obs_upper)
 

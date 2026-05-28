@@ -173,7 +173,7 @@ class PPOAgent:
         # --- ENTROPY DECAY THAY THẾ AUTO-TUNING ---
         self.initial_entropy_coef = entropy_coef  # Lưu lại giá trị ban đầu (ví dụ 0.05)
         self.entropy_coef = entropy_coef          # Giá trị đang dùng hiện tại
-        self.entropy_decay_rate = 0.92          # Tốc độ giảm sau mỗi lần learn (thử 0.999 - 0.9999)
+        self.entropy_decay_rate = 0.99          # Tốc độ giảm sau mỗi lần learn (thử 0.999 - 0.9999)
         self.min_entropy_coef = 0.001             # Giá trị nhỏ nhất cho phép (không để nó bằng 0 hoàn toàn)
 
         # PPO Hyperparameters
@@ -246,8 +246,8 @@ class PPOAgent:
                 logits = logits.masked_fill(zero_mask, -1e9)
 
             # Apply zeta (temperature scaling)
-            if zeta != 1.0:
-                logits = logits * zeta
+            # if zeta != 1.0:
+            #     logits = logits * zeta
 
             # 4. Sample actions
             if deterministic:
@@ -286,6 +286,8 @@ class PPOAgent:
         return loss.item()
 
     def learn(self, agents_ids: torch.Tensor = None, zeta=1.0):
+        from matrix_source.trainers.ppo_stategy import compute_gae
+
         if agents_ids is not None:
             agents_ids = agents_ids.to(self.device).view(-1)
 
@@ -308,10 +310,7 @@ class PPOAgent:
 
         # 1. Compute Advantages and Targets
         with torch.no_grad():
-            from matrix_source.trainers.ppo_stategy import compute_gae
-
             # --- SỬA BUG CRITICAL Ở ĐÂY: Re-predict MF ---
-            pred_mfs = self.mf_net(torch.cat([states, prev_mfs], dim=-1), indices=agent_ids)
             next_pred_mfs = self.mf_net(torch.cat([next_states, curr_mfs], dim=-1), indices=agent_ids)
             # ---------------------------------------------
 
