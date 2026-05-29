@@ -1,4 +1,5 @@
 import numpy as np
+import torch.nn.functional as F
 
 def to_binary(action_id, dim):
     """
@@ -26,3 +27,18 @@ def one_hot(idx, dim):
     if 0 <= idx < dim:
         vec[idx] = 1
     return vec
+
+def compute_kl(prop_logits, delta_logits, mask=None):
+    """KL(proposal ‖ final) — cả hai đều có gradient."""
+    final = prop_logits + delta_logits
+    if mask is not None:
+        prop_logits = prop_logits.masked_fill(mask == 0, -1e9)
+        final = final.masked_fill(mask == 0, -1e9)
+
+    log_p_prop = F.log_softmax(prop_logits, dim=-1)
+    log_p_final = F.log_softmax(final, dim=-1)
+    p_prop = F.softmax(prop_logits, dim=-1)
+
+    # KL = Σ p_prop * (log_p_prop - log_p_final)
+    kl = (p_prop * (log_p_prop - log_p_final)).sum(dim=-1).mean()
+    return kl

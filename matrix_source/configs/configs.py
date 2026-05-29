@@ -68,7 +68,7 @@ class BaseConfig(BaseSettings):
     neighbor_depth: int= Field(default=2)
     task_arrival_rate: float= Field(default=1)
     zipf_param: float= Field(default=0.8)
-    default_batch_size: int= Field(default=60)
+    default_batch_size: int= Field(default=20)
     task_max_batch: int= Field(default=20)
     task_min_batch: int= Field(default=20)
     hyper_neural: Dict[str, Any]= Field(default={})

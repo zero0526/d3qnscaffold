@@ -59,14 +59,19 @@ class PPOStrategy(AlgorithmStrategy):
             7: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
             8: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
             9: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
-            10: {'lower': 8,  'upper': 8,  'zeta': 1.0, 'det': True}
+            10: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            11: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            13: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            14: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            15: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            16: {'lower': 8,  'upper': 8,  'zeta': 1.0, 'det': True}
         }
         
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
         self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 5}
 
         self.cycle_num = 1
-        self.max_cycles = 5
+        self.max_cycles = 16
         
         # Initial settings for Cycle 1
         cfg = self.cycle_configs[self.cycle_num]
@@ -577,8 +582,8 @@ class PPOStrategy(AlgorithmStrategy):
             res = trainer.env.reset()
             obs_upper, prev_lower_res = res['upper'], res['lower']
             
-            lower_mf_dim = trainer.num_terminals + trainer.max_models
-            prev_lower_res["mean_field"] = torch.zeros((trainer.num_terminals + trainer.num_services, lower_mf_dim), device=trainer.device)
+            lower_mf_dim = trainer.num_nodes + trainer.max_models
+            prev_lower_res["mean_field"] = torch.zeros((trainer.num_terminals, lower_mf_dim), device=trainer.device)
             
             current_upper_state = self.build_upper_state(trainer, obs_upper)
 
