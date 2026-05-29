@@ -71,7 +71,7 @@ class PPOStrategy(AlgorithmStrategy):
         self.upper_cfg = {'min_size': 640, 'batch': 64, 'epochs': 5}
 
         self.cycle_num = 1
-        self.max_cycles = 25
+        self.max_cycles = 30
         
         # Initial settings for Cycle 1
         cfg = self.cycle_configs[self.cycle_num]
