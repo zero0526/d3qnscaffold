@@ -60,11 +60,11 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
             5: {'lower': 6,  'upper': 4,  'zeta': 1.0, 'det': True}
         }
 
-        self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
-        self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 5}
+        self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 1}
+        self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 1}
 
         self.cycle_num = 1
-        self.max_cycles = 5
+        self.max_cycles = 1
         
         # Initial settings for Cycle 1
         cfg = self.cycle_configs[self.cycle_num]

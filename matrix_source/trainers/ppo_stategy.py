@@ -457,8 +457,6 @@ class PPOStrategy(AlgorithmStrategy):
                                                      tasks_min_accuracy)
                     
                     # Compute next mean field based on choices
-                    B = len(t_idx)
-                    mf_dim = trainer.num_nodes + trainer.max_models
                     curr_lower_mf = self.compute_lower_mean_fields(trainer, t_idx, s_idx, n_idx, m_idx)
                     
                     # Update mean field in the results dict to carry it forward
