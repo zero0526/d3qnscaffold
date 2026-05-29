@@ -29,16 +29,18 @@ def one_hot(idx, dim):
     return vec
 
 def compute_kl(prop_logits, delta_logits, mask=None):
-    """KL(proposal ‖ final) — cả hai đều có gradient."""
-    final = prop_logits + delta_logits
+    p_detached = prop_logits.detach()
+    final = p_detached + delta_logits
+
     if mask is not None:
-        prop_logits = prop_logits.masked_fill(mask == 0, -1e9)
+        p_detached = p_detached.masked_fill(mask == 0, -1e9)
         final = final.masked_fill(mask == 0, -1e9)
 
-    log_p_prop = F.log_softmax(prop_logits, dim=-1)
-    log_p_final = F.log_softmax(final, dim=-1)
-    p_prop = F.softmax(prop_logits, dim=-1)
+    log_p = F.log_softmax(p_detached, dim=-1)
+    log_q = F.log_softmax(final, dim=-1)
+    p = F.softmax(p_detached, dim=-1)
 
-    # KL = Σ p_prop * (log_p_prop - log_p_final)
-    kl = (p_prop * (log_p_prop - log_p_final)).sum(dim=-1).mean()
+    kl = (p * (log_p - log_q)).sum(dim=-1).mean()
     return kl
+
+

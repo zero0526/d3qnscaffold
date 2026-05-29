@@ -54,7 +54,7 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
         self.current_phase_updates = 0
         self.entropy_decay_rate = 0.99
         self.is_evaluating = False
-        self.lower_collect_size= 256
+        self.lower_collect_size= 4096
         self.lower_batch_size= 128
         self.lower_train_epochs= 4
         self.model_workloads= None
@@ -273,10 +273,11 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
                     for i in range(B):
                         v, s = int(b_agent_idx[i]), int(b_svc_ids[i])
                         tasks_in_group = obs_lower["obs"]['task_reqs'][t_idx[pair_idx == i]].clone()
+                        # data_size
                         tasks_in_group[:, 0] /= trainer.config.norm_data_size
-                        tasks_in_group[:, 1] /= 100.0
-                        tasks_in_group[:, 2] /= (trainer.env.time_manager.max_deadline if hasattr(trainer.env.time_manager, 'max_deadline') else 10.0)
-                        
+                        # accuracy
+                        tasks_in_group[:, 2] /= 100.0
+
                         b_task_states.append(tasks_in_group)
                         b_svc_states.append(self._build_service_observation(trainer, s, obs_lower))
                         b_prev_mfs.append(self.lower_mf_prev[s, v])

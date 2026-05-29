@@ -28,7 +28,7 @@ from matrix_source.agents.base import MultiInstanceLinear, MultiInstanceRMSNorm
 from matrix_source.agents.buffer.rollout_buffer import MultiAgentRolloutBuffer
 
 def compute_overload(h, weights):
-    h_weighted_mean = (h * weights).sum()
+    h_weighted_mean = (h * weights).sum() / (weights.sum() + 1e-8)
     overload = (h - h_weighted_mean) / (h_weighted_mean + 1e-8)
     return overload
 
@@ -315,12 +315,6 @@ class ResidualRoutingAgent:
     def choose_action_batch(self, service_states, prev_mfs, task_states,
                             masks_batch=None, agent_indices=None,
                             deterministic=False, zeta=1.0):
-        """
-        Returns:
-            all_actions:   List[(N_i,) LongTensor]
-            all_log_probs: List[(N_i,) FloatTensor]
-            all_values:    (B,) FloatTensor
-        """
         B = service_states.shape[0]
         device = self.device
 
@@ -335,84 +329,103 @@ class ResidualRoutingAgent:
         # General task: (B, 7)
         general_task = self.tasks_to_general(task_states)
 
-        all_actions = []
-        all_log_probs = []
-        all_values = []
-
         with torch.no_grad():
-            # ═══ MF: once per agent ═══
+            # ═══ 1. MF (1 pass cho toàn batch) ═══
             mf_input = torch.cat([general_task, service_states, prev_mfs], dim=-1)
-            pred_mfs = self.mf_net(mf_input, indices=agent_indices)  # (B, mf_dim)
+            pred_mfs = self.mf_net(mf_input, indices=agent_indices)
 
-            for i in range(B):
-                n_i = task_states[i].shape[0]
-                tasks_i = task_states[i].to(device).float()  # (N_i, 4)
-                aid = agent_indices[i]
+            # ═══ 2. TẠO FLATTEN BATCH ═══
+            task_lens = torch.tensor([t.shape[0] for t in task_states], device=device)
+            total_tasks = int(task_lens.sum().item())
+            
+            # Map từng task về đúng index của agent: [0,0, 1,1,1, 2...]
+            batch_idx = torch.repeat_interleave(torch.arange(B, device=device), task_lens)
 
-                svc_i = service_states[i].unsqueeze(0).expand(n_i, -1)  # (N_i, 2M)
-                mf_i = pred_mfs[i].unsqueeze(0).expand(n_i, -1)  # (N_i, mf_dim)
-                idx_i = aid.unsqueeze(0).expand(n_i)  # (N_i,)
+            # Đưa toàn bộ tasks thành 1 tensor 2D duy nhất
+            tasks_cat = torch.cat(task_states, dim=0).to(device).float()
+            svc_exp = service_states[batch_idx]
+            mf_exp = pred_mfs[batch_idx]
+            idx_exp = agent_indices[batch_idx]
 
-                mask_i = (masks_batch[i].to(device)
-                          if masks_batch is not None else None)
-
-                # ── 1. Proposal: (task, svc, mf) → logits ──
-                prop_logits = self.proposal(tasks_i, svc_i, mf_i, indices=idx_i)
-                # (N_i, u_action_dim)
-
-                # ── 2. Histogram ──
-                prop_for_hist = prop_logits.clone()
-                if mask_i is not None:
-                    prop_for_hist = prop_for_hist.masked_fill(mask_i == 0, -1e9)
-
-                safe_logits = self._sanitize_logits(prop_for_hist)
-                prop_probs = F.softmax(safe_logits, dim=-1)  # (N_i, A)
-
-                prop_3d = prop_probs.view(n_i, self.M, self.max_models)
-                h_node = prop_3d.sum(dim=(0, 2))  # (M,)
-
-                # ── 3. Overload ──
-                f_v = service_states[i, :self.M]  # (M,)
-                overload = compute_overload(h_node, f_v)  # (M,)
-
-                # ── 4. Expand ──
-                hist_exp = h_node.unsqueeze(0).expand(n_i, -1)  # (N_i, M)
-                over_exp = overload.unsqueeze(0).expand(n_i, -1)  # (N_i, M)
-
-                # ── 5. Refinement: (task, svc, mf, prop, hist, over) → δ ──
-                delta_logits = self.refine(
-                    tasks_i, svc_i, mf_i,
-                    prop_logits, hist_exp, over_exp,
-                    indices=idx_i,
-                )  # (N_i, u_action_dim)
-
-                # ── 6. Fusion ──
-                final_logits = prop_logits + delta_logits
-
-                if mask_i is not None:
-                    final_logits = final_logits.masked_fill(mask_i == 0, -1e9)
-                if self.exclude_zero and self.u_action_dim > 1:
-                    final_logits[:, 0] = -1e9
-
-                final_logits = self._sanitize_logits(final_logits)
-
-                # ── 7. Sample ──
-                if deterministic:
-                    actions_i = final_logits.argmax(dim=-1)
-                    log_probs_i = torch.zeros(n_i, device=device)
+            if masks_batch is not None:
+                # Xử lý mask list
+                if masks_batch[0].dim() == 1:
+                    masks_exp = torch.stack(masks_batch).to(device)[batch_idx]
                 else:
-                    dist = Categorical(logits=final_logits)
-                    actions_i = dist.sample()
-                    log_probs_i = dist.log_prob(actions_i)
+                    masks_exp = torch.cat(masks_batch, dim=0).to(device)
+            else:
+                masks_exp = None
 
-                all_actions.append(actions_i)
-                all_log_probs.append(log_probs_i.mean())  # ← MEAN aggregation
+            # ═══ 3. PROPOSAL (1 pass cho TẤT CẢ tasks) ═══
+            prop_logits = self.proposal(tasks_cat, svc_exp, mf_exp, indices=idx_exp)
 
-            # ── 8. Critic: (general_task, svc, mf) → V ──
-            all_values = self.critic(
-                general_task, service_states, pred_mfs,
-                indices=agent_indices,
-            )  # (B,)
+            # ═══ 4. HISTOGRAM & OVERLOAD (Vectorized) ═══
+            prop_for_hist = prop_logits.clone()
+            if masks_exp is not None:
+                prop_for_hist = prop_for_hist.masked_fill(masks_exp == 0, -1e9)
+
+            safe_logits = self._sanitize_logits(prop_for_hist)
+            prop_probs = F.softmax(safe_logits, dim=-1)
+
+            # Gom xác suất theo Model -> (Total_N, M)
+            prop_probs_M = prop_probs.view(total_tasks, self.M, self.max_models).sum(dim=2)
+
+            # Dùng scatter_add_ để gom tổng từ level Task lên level Agent
+            h_node = torch.zeros(B, self.M, device=device)
+            h_node.scatter_add_(0, batch_idx.unsqueeze(1).expand(-1, self.M), prop_probs_M)
+
+            # FIX: Overload computation với chuẩn Weighted Mean
+            f_v = service_states[:, :self.M]                          # (B, M)
+            h_weighted_sum = (h_node * f_v).sum(dim=1, keepdim=True)  # (B, 1)
+            w_sum = f_v.sum(dim=1, keepdim=True)                      # (B, 1)
+            h_weighted_mean = h_weighted_sum / (w_sum + 1e-8)         # (B, 1)
+            overload = (h_node - h_weighted_mean) / (h_weighted_mean + 1e-8)
+
+            hist_exp = h_node[batch_idx]
+            over_exp = overload[batch_idx]
+
+            # ═══ 5. REFINEMENT (1 pass cho TẤT CẢ tasks) ═══
+            delta_logits = self.refine(
+                tasks_cat, svc_exp, mf_exp,
+                prop_logits, hist_exp, over_exp,
+                indices=idx_exp,
+            )
+
+            # ═══ 6. FUSION ═══
+            final_logits = prop_logits + delta_logits
+            if masks_exp is not None:
+                final_logits = final_logits.masked_fill(masks_exp == 0, -1e9)
+            if self.exclude_zero and self.u_action_dim > 1:
+                final_logits[:, 0] = -1e9
+            final_logits = self._sanitize_logits(final_logits)
+
+            # ═══ 7. SAMPLE ═══
+            if deterministic:
+                actions_cat = final_logits.argmax(dim=-1)
+                log_probs_cat = torch.zeros(total_tasks, device=device)
+            else:
+                dist = Categorical(logits=final_logits)
+                actions_cat = dist.sample()
+                log_probs_cat = dist.log_prob(actions_cat)
+
+            # Trả về format List[Tensor] gốc bằng .split() và unbind()
+            task_lens_list = task_lens.cpu().tolist()
+            all_actions = list(actions_cat.split(task_lens_list))
+
+            sum_lp = torch.zeros(B, device=device).scatter_add_(0, batch_idx, log_probs_cat)
+            all_log_probs = list((sum_lp / task_lens.float()).unbind())
+
+            # ═══ 8. CRITIC ═══
+            all_values = self.critic(general_task, service_states, pred_mfs, indices=agent_indices)
+
+            # ═══ 9. LOG INFERENCE (3 lần đầu để debug Delta z và Overload) ═══
+            if not hasattr(self, '_infer_logged'):
+                self._infer_logged = 0
+            if self._infer_logged < 3:
+                print(f"  [INFER] h_node[0]: {[f'{x:.2f}' for x in h_node[0].tolist()]}")
+                print(f"  [INFER] overload[0]: {[f'{x:.3f}' for x in overload[0].tolist()]}")
+                print(f"  [INFER] |Δz|: {delta_logits.abs().mean():.6f}")
+                self._infer_logged += 1
 
         return all_actions, all_log_probs, all_values
 
@@ -509,70 +522,6 @@ class ResidualRoutingAgent:
             offset += n_i
         return task_states
 
-    def _forward_single_with_action(self, tasks_i, svc_i, mf_i,
-                                    mask_i, aid, actions_i):
-        """
-        Args:
-            tasks_i:   (N_i, 4)
-            svc_i:     (N_i, 2M)  — detached (từ b_pred_mfs)
-            mf_i:      (N_i, mf_dim) — detached
-            mask_i:    (N_i, u_action_dim) hoặc None
-            aid:       scalar
-            actions_i: (N_i,) — action RIÊNG cho mỗi task
-
-        Returns:
-            log_probs:    (N_i,)
-            entropy:      (N_i,)
-            delta_logits: (N_i, u_action_dim)
-            prop_logits:  (N_i, u_action_dim)
-        """
-        n_i = tasks_i.shape[0]
-        idx_i = aid.unsqueeze(0).expand(n_i)
-
-        # 1. Proposal
-        prop_logits = self.proposal(tasks_i, svc_i, mf_i, indices=idx_i)
-
-        # 2. Histogram
-        prop_for_hist = prop_logits.clone()
-        if mask_i is not None:
-            prop_for_hist = prop_for_hist.masked_fill(mask_i == 0, -1e9)
-
-        safe_logits = self._sanitize_logits(prop_for_hist.detach())
-        prop_probs = F.softmax(safe_logits, dim=-1)
-
-        prop_3d = prop_probs.view(n_i, self.M, self.max_models)
-        h_node = prop_3d.sum(dim=(0, 2))
-
-        # 3. Overload
-        f_v = svc_i[0, :self.M]
-        overload = compute_overload(h_node, f_v)
-
-        # 4. Expand
-        hist_exp = h_node.unsqueeze(0).expand(n_i, -1)
-        over_exp = overload.unsqueeze(0).expand(n_i, -1)
-
-        # 5. Refinement
-        delta_logits = self.refine(
-            tasks_i, svc_i, mf_i,
-            prop_logits, hist_exp, over_exp,
-            indices=idx_i,
-        )
-
-        # 6. Final logits + log_prob
-        final_logits = prop_logits + delta_logits
-
-        if mask_i is not None:
-            final_logits = final_logits.masked_fill(mask_i == 0, -1e9)
-        if self.exclude_zero and self.u_action_dim > 1:
-            final_logits[:, 0] = -1e9
-
-        final_logits = self._sanitize_logits(final_logits)
-
-        dist = Categorical(logits=final_logits)
-        log_probs = dist.log_prob(actions_i)  # (N_i,)
-        entropy = dist.entropy()  # (N_i,)
-
-        return log_probs, entropy, delta_logits, prop_logits
 
     def learn(self, agents_ids=None, zeta=1.0):
         from matrix_source.trainers.ppo_stategy import compute_gae
@@ -580,9 +529,7 @@ class ResidualRoutingAgent:
         if agents_ids is not None:
             agents_ids = agents_ids.to(self.device).view(-1)
 
-        data = self.memory.get_all_ready(
-            min_size=self.min_batch_size, agent_ids_pool=agents_ids,
-        )
+        data = self.memory.get_all_ready(min_size=self.min_batch_size, agent_ids_pool=agents_ids)
         if data is None:
             return None
 
@@ -591,64 +538,83 @@ class ResidualRoutingAgent:
             self.min_entropy_coef,
         )
 
-        # ═══ UNPACK 14 FIELDS ═══
-        (service_states,  # 0  (D, svc_dim)
-         task_batch_cat,  # 1  (total_tasks, 4)
-         task_lens,  # 2  (D,)
-         actions_cat,  # 3  (total_tasks,)
-         action_lens,  # 4  (D,)
-         prev_mfs,  # 5  (D, mf_dim)
-         curr_mfs,  # 6  (D, mf_dim)
-         rewards,  # 7  (D, 1)
-         next_service_states,  # 8 (D, svc_dim)
-         dones,  # 9  (D, 1)
-         old_log_probs,  # 10 (D, 1)
-         old_values,  # 11 (D, 1)
-         masks,  # 12 List[D]
-         agent_ids,  # 13 (D,)
-         ) = data
+        # ═══ 1. UNPACK ═══
+        (service_states, task_batch_cat, task_lens, actions_cat, action_lens,
+         prev_mfs, curr_mfs, rewards, next_service_states, dones,
+         old_log_probs, old_values, masks, agent_ids) = data
 
-        old_log_probs = old_log_probs.squeeze(-1)
-        old_values = old_values.squeeze(-1)
-        rewards = rewards.squeeze(-1)
-        dones = dones.squeeze(-1)
+        service_states = service_states.to(self.device).float()
+        prev_mfs = prev_mfs.to(self.device).float()
+        agent_ids = agent_ids.to(self.device).long()
+        task_lens = task_lens.to(self.device).long()
+
+        task_batch_cat = task_batch_cat.to(self.device).float()
+        actions_cat = actions_cat.to(self.device).long()
+
+        old_log_probs = old_log_probs.to(self.device).squeeze(-1)
+        old_values = old_values.to(self.device).squeeze(-1)
+        rewards = rewards.to(self.device).squeeze(-1)
+        dones = dones.to(self.device).squeeze(-1)
 
         dataset_size = service_states.shape[0]
+        total_tasks_flat = task_batch_cat.shape[0]
 
-        # Reconstruct variable-length
-        task_states = self._unpack_task_batch(task_batch_cat, task_lens)
-        action_list = self._unpack_task_batch(actions_cat, action_lens)
+        # Reconstruct variable-length task states
+        task_states_list = self._unpack_task_batch(task_batch_cat, task_lens)
+        general_tasks = self.tasks_to_general(task_states_list).to(self.device)
 
-        general_tasks = self.tasks_to_general(task_states)
-
-        # ═══ GAE ═══
+        # ═══ 2. PRE-COMPUTE (no grad) ═══
         with torch.no_grad():
-            mf_in = torch.cat([general_tasks, next_service_states, curr_mfs], dim=-1)
+            # GAE
+            mf_in = torch.cat([general_tasks, next_service_states, curr_mfs.to(self.device)], dim=-1)
             next_mf = self.mf_net(mf_in, indices=agent_ids)
-            next_val = self.critic(general_tasks, next_service_states,
-                                   next_mf, indices=agent_ids)
+            next_val = self.critic(general_tasks, next_service_states, next_mf, indices=agent_ids)
 
             advantages = compute_gae(
                 rewards, next_val, old_values, dones, agent_ids,
                 self.gamma, self.lmbda,
             )
             returns = advantages + old_values
-
             if advantages.numel() > 1:
-                advantages = (
-                        (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                )
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # ═══ PPO ═══
+            # MF for entire dataset once
+            mf_in_all = torch.cat([general_tasks, service_states, prev_mfs], dim=-1)
+            detached_mfs_all = self.mf_net(mf_in_all, indices=agent_ids).detach()
+
+        # Pre-process masks → single tensor or None
+        if masks is not None and any(m is not None for m in masks):
+            # Find first non-None to check dim
+            first_valid = next(m for m in masks if m is not None)
+            if first_valid.dim() == 1:
+                # Replace None entries with zeros
+                clean_masks = [
+                    m if m is not None else torch.zeros_like(first_valid)
+                    for m in masks
+                ]
+                all_masks = torch.stack(clean_masks).to(self.device)
+            else:
+                all_masks = torch.cat([m for m in masks if m is not None], dim=0).to(self.device)
+        else:
+            all_masks = None
+
+        # Pre-compute flat index slicing (once, outside loop)
+        task_offsets = torch.zeros(dataset_size, dtype=torch.long, device=self.device)
+        task_offsets[1:] = task_lens.cumsum(0)[:-1]
+        all_flat_idx = torch.arange(total_tasks_flat, device=self.device)
+
+        # ═══ 3. PPO TRAINING LOOP (vectorized) ═══
         epoch_metrics = {'v': 0.0, 'p': 0.0, 'ent': 0.0, 'l2': 0.0, 'kl': 0.0}
         total_batches = 0
 
         for _ in range(self.k_epochs):
-            perm = np.random.permutation(dataset_size)
+            perm = torch.randperm(dataset_size, device=self.device)
 
             for start in range(0, dataset_size, self.batch_size):
                 idx = perm[start:start + self.batch_size]
+                B_sub = len(idx)
 
+                # ── Slice mini-batch ──
                 b_svc = service_states[idx]
                 b_prev = prev_mfs[idx]
                 b_old_lp = old_log_probs[idx]
@@ -656,86 +622,137 @@ class ResidualRoutingAgent:
                 b_ret = returns[idx]
                 b_aids = agent_ids[idx]
                 b_gen = general_tasks[idx]
-                b_masks = [masks[int(i)] for i in idx] if masks else None
+                b_mf = detached_mfs_all[idx]
+                b_t_lens = task_lens[idx]
 
-                # MF (detach)
-                mf_in = torch.cat([b_gen, b_svc, b_prev], dim=-1)
-                b_mf = self.mf_net(mf_in, indices=b_aids).detach()
+                # Flat indices for this mini-batch
+                segments = [
+                    all_flat_idx[task_offsets[i]:task_offsets[i] + task_lens[i]]
+                    for i in idx
+                ]
+                flat_indices = torch.cat(segments)
 
-                # Per-sample forward
-                # Per-sample forward
-                all_lp, all_ent, all_delta, all_prop, all_masks_j = [], [], [], [], []
+                t_cat = task_batch_cat[flat_indices]
+                act_cat = actions_cat[flat_indices]
+                total_n = t_cat.shape[0]
 
-                for j in range(len(idx)):
-                    orig = int(idx[j])
-                    n_j = task_states[orig].shape[0]
-                    t_j = task_states[orig].to(self.device).float()
-                    s_j = b_svc[j].unsqueeze(0).expand(n_j, -1)
-                    m_j = b_mf[j].unsqueeze(0).expand(n_j, -1)
-                    mk_j = b_masks[j] if b_masks else None
+                # Task → agent mapping within mini-batch
+                batch_idx = torch.repeat_interleave(
+                    torch.arange(B_sub, device=self.device), b_t_lens,
+                )
 
-                    act_j = action_list[orig].to(self.device)
+                svc_exp = b_svc[batch_idx]
+                mf_exp = b_mf[batch_idx]
+                aids_exp = b_aids[batch_idx]
+                masks_exp = all_masks[idx][batch_idx] if all_masks is not None else None
 
-                    lp, ent, delta, prop = self._forward_single_with_action(
-                        t_j, s_j, m_j, mk_j, b_aids[j],
-                        actions_i=act_j,
-                    )
+                # ── PROPOSAL (1 forward pass) ──
+                prop_logits = self.proposal(t_cat, svc_exp, mf_exp, indices=aids_exp)
 
-                    all_lp.append(lp)
-                    all_ent.append(ent)
-                    all_delta.append(delta)
-                    all_prop.append(prop)
-                    all_masks_j.append(mk_j)  # ← THÊM DÒNG NÀY
+                # ── HISTOGRAM + OVERLOAD ──
+                prop_for_hist = prop_logits
+                if masks_exp is not None:
+                    prop_for_hist = prop_for_hist.masked_fill(masks_exp == 0, -1e9)
 
-                # Aggregate
-                new_lp = torch.stack([lp.mean() for lp in all_lp])
-                ent_m = torch.stack([e.mean() for e in all_ent])
+                prop_probs = F.softmax(
+                    self._sanitize_logits(prop_for_hist.detach()), dim=-1,
+                )
 
-                # PPO
+                prop_probs_M = prop_probs.view(total_n, self.M, self.max_models).sum(dim=2)
+                h_node = torch.zeros(B_sub, self.M, device=self.device)
+                h_node.scatter_add_(
+                    0, batch_idx.unsqueeze(1).expand(-1, self.M), prop_probs_M,
+                )
+
+                f_v = b_svc[:, :self.M]
+                h_weighted_sum = (h_node * f_v).sum(dim=1, keepdim=True)
+                w_sum = f_v.sum(dim=1, keepdim=True)
+                h_weighted_mean = h_weighted_sum / (w_sum + 1e-8)
+                overload = (h_node - h_weighted_mean) / (h_weighted_mean + 1e-8)
+
+                hist_exp = h_node[batch_idx]
+                over_exp = overload[batch_idx]
+
+                # ── REFINEMENT (1 forward pass) ──
+                delta_logits = self.refine(
+                    t_cat, svc_exp, mf_exp,
+                    prop_logits, hist_exp, over_exp,
+                    indices=aids_exp,
+                )
+
+                # ── FUSION ──
+                final_logits = prop_logits + delta_logits
+                if masks_exp is not None:
+                    final_logits = final_logits.masked_fill(masks_exp == 0, -1e9)
+                if self.exclude_zero and self.u_action_dim > 1:
+                    final_logits[:, 0] = -1e9
+                final_logits = self._sanitize_logits(final_logits)
+
+                # ── LOG PROBS & ENTROPY ──
+                dist = Categorical(logits=final_logits)
+                lp_all = dist.log_prob(act_cat)  # (total_n,)
+                entropy_all = dist.entropy()  # (total_n,)
+
+                # Per-agent mean
+                sum_lp = torch.zeros(B_sub, device=self.device).scatter_add_(0, batch_idx, lp_all)
+                new_lp = sum_lp / b_t_lens.float()
+
+                sum_ent = torch.zeros(B_sub, device=self.device).scatter_add_(0, batch_idx, entropy_all)
+                ent_m = sum_ent / b_t_lens.float()
+
+                # ── L2 (delta only) ──
+                l2_all = delta_logits.norm(dim=-1)
+                sum_l2 = torch.zeros(B_sub, device=self.device).scatter_add_(0, batch_idx, l2_all)
+                l2_m = (sum_l2 / b_t_lens.float()).mean()
+
+                # ── KL (proposal ‖ final) — FIX: mask both sides ──
+                prop_detached = self._sanitize_logits(prop_logits.detach())
+                if masks_exp is not None:
+                    prop_detached = prop_detached.masked_fill(masks_exp == 0, -1e9)
+
+                prop_lp = F.log_softmax(prop_detached, dim=-1)
+                final_lp = F.log_softmax(final_logits, dim=-1)
+                kl_all = (prop_lp.exp() * (prop_lp - final_lp)).sum(dim=-1)
+
+                sum_kl = torch.zeros(B_sub, device=self.device).scatter_add_(0, batch_idx, kl_all)
+                kl_m = (sum_kl / b_t_lens.float()).mean()
+
+                # ── PPO CLIPPING ──
                 ratio = torch.exp(new_lp - b_old_lp)
                 surr1 = ratio * b_adv
-                surr2 = torch.clamp(ratio, 1 - self.eps_clip,
-                                    1 + self.eps_clip) * b_adv
-
-                # L2
-                l2 = torch.stack([d.norm(dim=-1).mean()
-                                  for d in all_delta]).mean()
-
-                # ═══ FIX: KL đúng — proposal vs final ═══
-                kl = torch.stack([
-                    math_utils.compute_kl(p, d, mk)
-                    for p, d, mk in zip(all_prop, all_delta, all_masks_j)
-                ]).mean()
+                surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * b_adv
 
                 actor_loss = (
                         -torch.min(surr1, surr2).mean()
                         - self.entropy_coef * ent_m.mean()
-                        + 0.01 * l2
-                        + 0.05 * kl
+                        + 0.01 * l2_m
+                        + 0.05 * kl_m
                 )
 
-                self.optimizer_proposal.zero_grad()
-                self.optimizer_refine.zero_grad()
+                # ── ACTOR UPDATE ──
+                self.optimizer_proposal.zero_grad(set_to_none=True)
+                self.optimizer_refine.zero_grad(set_to_none=True)
                 actor_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.proposal.parameters(), 0.5)
                 torch.nn.utils.clip_grad_norm_(self.refine.parameters(), 0.5)
                 self.optimizer_proposal.step()
                 self.optimizer_refine.step()
 
-                # Critic
+                # ── CRITIC UPDATE ──
                 c_vals = self.critic(b_gen, b_svc, b_mf, indices=b_aids)
                 c_loss = F.mse_loss(c_vals, b_ret)
 
-                self.optimizer_critic.zero_grad()
+                self.optimizer_critic.zero_grad(set_to_none=True)
                 c_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
                 self.optimizer_critic.step()
 
+                # ── Metrics ──
                 epoch_metrics['v'] += c_loss.item()
                 epoch_metrics['p'] += actor_loss.item()
                 epoch_metrics['ent'] += ent_m.mean().item()
-                epoch_metrics['l2'] += l2.item()
-                epoch_metrics['kl'] += kl.item()
+                epoch_metrics['l2'] += l2_m.item()
+                epoch_metrics['kl'] += kl_m.item()
                 total_batches += 1
 
         self.learn_step_counter += 1
