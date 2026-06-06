@@ -159,8 +159,9 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
         rew_divisor = trainer.config.norm_lower_rw
         reward -= 1.5*next_res["obs"]["virtual_drift"]
         norm_rew = log_transform(reward / (rew_divisor if rew_divisor != 0 else 1.0))
+        norm_rew -= 0.5*next_res["violations"]
+
         rewards = torch.full((len(t_idx),), norm_rew, dtype=torch.float32, device=trainer.device)
-        rewards -= 0.5*next_res["violations"]
         a_ids = (n_idx * trainer.max_models + m_idx).long()
         
         avg_mf_loss = trainer.shared_lower_agent.store_transition_train_mf_batch(
@@ -249,18 +250,14 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
             agent.save_base_initial()
 
     def perform_scaffold_aggregation_v2(self, agent, round_idx: int = 0):
-        """
-        Cluster-Based Federated Aggregation for D3QNAgentV2 (split backbone/head).
-        Called once per federated round, after all local learning steps are done.
-
-        Phase 1 & 2: averages backbone weights per cluster.
-        Phase 3:     backbone frozen, only control variates are synced.
-        Always:      c_b and c_h aggregated per cluster.
-        """
         if not agent.use_scaffold:
             return
 
-        phase = agent._get_phase(round_idx)
+        if round_idx < 1000:
+            agg_weight = 0.9  # 1000 eps đầu: Tuân thủ global mạnh (90%)
+        else:
+            decay_factor = 0.992 ** (round_idx - 1000)
+            agg_weight = max(0.05, 0.9 * decay_factor)
 
         with torch.no_grad():
             for node_id, terminal_ids in self.node_to_terminals.items():
@@ -269,27 +266,29 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
 
                 t_ids = torch.tensor(terminal_ids, device=agent.device)
 
-                # Step 1: Update local control variates before we read them
+                # Bước A: Cập nhật local control variates trước
                 agent.update_local_cvariates(t_ids)
 
-                # Step 2: Aggregate backbone weights (Phase 1 & 2 only)
-                # Fix 4: Do NOT hard-sync target net here — that breaks Polyak averaging.
-                # _soft_update() (alpha=0.005) is the only target-net update path.
-                if phase < 3:
-                    bone_params = list(agent.eval_net.backbone.parameters())
-                    for p in bone_params:
-                        cluster_mean = p.data[t_ids].mean(dim=0, keepdim=True)
-                        p.data[t_ids] = cluster_mean.expand(len(terminal_ids), *cluster_mean.shape[1:])
+                # Bước B: Aggregate Backbone CÓ TRỌNG SỐ (Thay vì ghi đè cứng)
+                bone_params = list(agent.eval_net.backbone.parameters())
+                for p in bone_params:
+                    cluster_mean = p.data[t_ids].mean(dim=0, keepdim=True)
+                    p.data[t_ids] = (1.0 - agg_weight) * p.data[t_ids] + \
+                                    agg_weight * cluster_mean.expand(len(terminal_ids), *cluster_mean.shape[1:])
 
-                # Step 3: Aggregate backbone control variates -> new c_b_global
                 c_b_local_slices = agent.get_c_b_local(t_ids)
                 c_b_new_global = [c.mean(dim=0, keepdim=True).expand(len(terminal_ids), *c.shape[1:])
-                                for c in c_b_local_slices]
-                agent.set_c_b_global(t_ids, c_b_new_global)
+                                  for c in c_b_local_slices]
 
-        # Reset grad accumulators and step counters for next round
+                for i in range(len(agent.c_b_global)):
+                    agent.c_b_global[i][t_ids] = (1.0 - agg_weight) * agent.c_b_global[i][t_ids] + \
+                                                 agg_weight * c_b_new_global[i]
+
         agent.save_base_initial()
         agent._soft_update()
+
+        if round_idx % 100 == 0 or round_idx == 1000:
+            print(f"[FL Aggregation] Round {round_idx:4d} | Aggregation Weight (Alpha): {agg_weight:.4f}")
 
     def run_training(self, trainer: Trainer):
         num_eps = trainer.config.hyper_neural['NUMOF_TRAIN_EP']
@@ -366,8 +365,9 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
                 self.store_lower_transitions(trainer, p_res, n_res, t_i, s_i, n_i, m_i, cur_m, cur_m)
 
             # update ep and history
-            # Federated Aggregation (SCAFFOLD) for lower agents
-            self.perform_scaffold_aggregation_v2(trainer.shared_lower_agent, round_idx=ep)
+            # Federated Aggregation (SCAFFOLD) for lower agent
+            if ep>30:
+                self.perform_scaffold_aggregation_v2(trainer.shared_lower_agent, round_idx=ep)
 
             trainer.update_rates(ep)
             trainer.aggregator.store_history()

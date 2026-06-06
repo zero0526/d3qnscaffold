@@ -6,6 +6,6 @@ from matrix_source.trainers.semi_distribute_task import PPOSCAFFOLDREPStrategy
 from matrix_source.trainers.pposcaffold import PPOSCAFFOLDREPStrategy
 from matrix_source.trainers.residual_routing_ppo import ResidualRoutingPPOStrategy
 if __name__ == '__main__':
-    strategy = PPOStrategy()
+    strategy = D3QNScaffoldStrategy()
     trainer = Trainer(strategy=strategy)
     trainer.train()

@@ -224,10 +224,8 @@ class D3QNAgentV2:
     # ── Phase helpers ─────────────────────────────────────────────────────────
 
     def _get_phase(self, round_idx):
-        if round_idx < self.T1:
+        if round_idx < 1000:
             return 1
-        elif round_idx < self.T2:
-            return 2
         else:
             return 3
 
@@ -239,10 +237,6 @@ class D3QNAgentV2:
         lr = self.lr_bone_high if phase == 1 else self.lr_bone_low
         for pg in self.bone_optimizer.param_groups:
             pg['lr'] = lr
-
-    def _freeze_backbone(self, freeze: bool):
-        for p in self.eval_net.backbone.parameters():
-            p.requires_grad = not freeze
 
     # ── SCAFFOLD round lifecycle ───────────────────────────────────────────────
 
@@ -379,13 +373,6 @@ class D3QNAgentV2:
 
         self.learn_mf_batch(states, prev_mfs, curr_mfs, agent_ids)
 
-        # ── Determine phase ───────────────────────────────────────────────────
-        phase     = self._get_phase(round_idx)
-        lambda_t  = self._get_lambda(round_idx)
-
-        # Phase 3: freeze backbone (no graph needed, saves VRAM)
-        self._freeze_backbone(phase == 3)
-
         # ── Forward pass ──────────────────────────────────────────────────────
         pred_curr_mfs = self.mf_net(torch.cat([states, prev_mfs], dim=-1), indices=agent_ids)
         feat          = self.eval_net.backbone(states, pred_curr_mfs.detach(), indices=agent_ids)
@@ -402,10 +389,13 @@ class D3QNAgentV2:
             q_next        = self.target_net.head(next_feat_tgt, indices=agent_ids).gather(1, next_actions)
             q_target      = rewards + self.gamma * q_next * (1 - dones)
 
-        # Fix 2: Clamp before loss to prevent Q-value explosion corrupting gradients
-        q_eval   = q_eval.clamp(-50.0, 50.0)
-        q_target = q_target.clamp(-50.0, 50.0)
+        phase = self._get_phase(round_idx)
 
+        if round_idx < 1000:
+            lambda_scaffold = 1.0
+        else:
+            decay_factor = 0.992 ** (round_idx - 1000)
+            lambda_scaffold = max(0.1, 1.0 * decay_factor)
         loss = self.loss_fn(q_eval, q_target).mean()
 
         # ── Backbone update (Phase 1 & 2 only) ────────────────────────────────
@@ -416,29 +406,20 @@ class D3QNAgentV2:
         if self.use_scaffold:
             with torch.no_grad():
                 unique_ids = torch.unique(agent_ids)
-
-                # Fix 3: Direct-index correction — no m_mask broadcasting.
-                # PyTorch zeroes gradients for non-participating instances automatically.
-
-                # ── Apply SCAFFOLD correction to backbone gradients ────────────
-                if phase < 3:
-                    bone_params = list(self.eval_net.backbone.parameters())
-                    for i, p in enumerate(bone_params):
-                        if p.grad is not None:
-                            raw_g = p.grad.data.clone()
-                            # g_b_corrected = g_b - c_b_local + c_b_global  (only active ids)
-                            p.grad.data[unique_ids] = raw_g[unique_ids] + (
-                                self.c_b_global[i][unique_ids] - self.c_b_local[i][unique_ids]
-                            )
-                            self.grad_b_sum[i][unique_ids] += raw_g[unique_ids]
+                bone_params = list(self.eval_net.backbone.parameters())
+                for i, p in enumerate(bone_params):
+                    if p.grad is not None:
+                        raw_g = p.grad.data.clone()
+                        # g_b_corrected = g_b - c_b_local + c_b_global  (only active ids)
+                        p.grad.data[unique_ids] = raw_g[unique_ids] + lambda_scaffold* (
+                            self.c_b_global[i][unique_ids] - self.c_b_local[i][unique_ids]
+                        )
+                        self.grad_b_sum[i][unique_ids] += raw_g[unique_ids]
 
                 self.steps_in_round[unique_ids] += 1
-
-        # Clip and step
-        if phase < 3:
-            self._set_backbone_lr(phase)
-            torch.nn.utils.clip_grad_norm_(self.eval_net.backbone.parameters(), max_norm=1.0)
-            self.bone_optimizer.step()
+        self._set_backbone_lr(phase)
+        torch.nn.utils.clip_grad_norm_(self.eval_net.backbone.parameters(), max_norm=1.0)
+        self.bone_optimizer.step()
 
         torch.nn.utils.clip_grad_norm_(self.eval_net.head.parameters(), max_norm=1.0)
         self.head_optimizer.step()
@@ -482,8 +463,6 @@ class D3QNAgentV2:
         Call at the END of a round (before aggregation), for each instance.
         SCAFFOLD Option I (Karimireddy et al. 2020):
           c_i+ = c_i - c_global + (1/K) * sum_k grad_k
-
-        Fix 1: Only update agents that actually trained this round (steps > 0).
         """
         if not self.use_scaffold:
             return
