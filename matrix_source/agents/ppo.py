@@ -91,8 +91,8 @@ class MultiInstanceActor(nn.Module):
         logits = self.forward(state, mf, indices)
 
         # Apply zeta (temperature scaling)
-        # if zeta != 1.0:
-        #     logits = logits * zeta
+        if zeta is not None:
+            logits = logits * zeta
 
         if masks is not None:
             logits = logits.masked_fill(masks == 0, -1e9)
@@ -152,7 +152,7 @@ class PPOAgent:
                  total_train_steps=100, hidden_sizes=(128, 64),
                  lr=1e-4,critic_lr=5e-4, gamma=0.99, alpha=0.005, buffer_size=100000, batch_size=64,
                  lam=0.95, clip_eps=0.4, k_epochs=5, entropy_coef=0.05,
-                 exclude_zero=False, num_instances=1, device=None):
+                 exclude_zero=False, num_instances=1, increase_rate_zeta=None, device=None):
 
         self.node_id = node_id
         self.node_type = node_type
@@ -201,6 +201,8 @@ class PPOAgent:
         self.memory = MultiAgentPolicyBuffer(num_instances, buffer_size, state_dim, self.action_dim, self.u_action_dim,
                                              self.device)
         self.learn_step_counter = 0
+        self.increase_rate_zeta = increase_rate_zeta
+        self.zeta = 1.0 if increase_rate_zeta else None
 
     def choose_action(self, state, prev_mf, epsilon, mask=None, agent_idx=0, zeta=1.0):
         # Single agent usage
@@ -246,8 +248,8 @@ class PPOAgent:
                 logits = logits.masked_fill(zero_mask, -1e9)
 
             # Apply zeta (temperature scaling)
-            # if zeta != 1.0:
-            #     logits = logits * zeta
+            if self.increase_rate_zeta is not None:
+                logits = self.zeta * logits
 
             # 4. Sample actions
             if deterministic:
@@ -350,7 +352,7 @@ class PPOAgent:
                 log_probs, entropy = self.actor.evaluate(
                     batch_states, batch_pred_mfs, batch_actions, masks=batch_masks,
                     indices=batch_agent_ids, exclude_zero=self.exclude_zero,
-                    zeta=zeta
+                    zeta=self.zeta
                 )
                 values = self.critic(batch_states, batch_pred_mfs, indices=batch_agent_ids)
 
@@ -374,7 +376,8 @@ class PPOAgent:
 
                 epoch_v_loss += critic_loss.item()
                 total_batches += 1
-
+        if self.zeta:
+            self.zeta= self.zeta*self.increase_rate_zeta
         self.learn_step_counter += 1
 
         log_freq = 10 if self.node_type == "Edge_Group" else 100
@@ -384,7 +387,8 @@ class PPOAgent:
             print(
                 f"[{self.node_type} PPO] Step {self.learn_step_counter:5d} | "
                 f"VLoss: {avg_v_loss:.5f} | AvgV: {avg_v:.3f} | "
-                f"EntCoef: {self.entropy_coef:.5f}")
+                f"EntCoef: {self.entropy_coef:.5f} | "
+                f"Zeta: {self.zeta:.5f}")
 
         self.memory.clear()
         return epoch_v_loss / total_batches if total_batches > 0 else 0

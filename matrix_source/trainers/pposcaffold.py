@@ -88,6 +88,7 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
             mf_lr=float(trainer.config.hyper_neural['MF_LR']),
             buffer_min_size=self.upper_cfg['min_size'],
             total_train_steps=30,
+            entropy_coef=0.001,
             hidden_sizes=trainer.config.hyper_neural['AGENT_HIDDEN_LAYER'],
             lr=float(trainer.config.hyper_neural['UPPER_LR']),
             gamma=trainer.config.hyper_neural['DISCOUNT_FACTOR'],
@@ -96,6 +97,7 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
             k_epochs=self.upper_cfg['epochs'],
             batch_size=self.upper_cfg['batch'],
             num_instances=trainer.num_edge_agents,
+            increase_rate_zeta= 1.001,
             device=trainer.device
         )
 
