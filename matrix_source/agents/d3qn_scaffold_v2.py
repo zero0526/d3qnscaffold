@@ -138,11 +138,6 @@ class MF(nn.Module):
 class D3QNAgentV2:
     """
     Multi-instance D3QN with split backbone/head SCAFFOLD.
-
-    Training phases (controlled externally by passing `round_idx` to learn()):
-      Phase 1  [0, T1):   backbone lr=lr_high,  lambda_scaffold=1.0
-      Phase 2  [T1, T2):  backbone lr=lr_low,   lambda_scaffold=1.0
-      Phase 3  [T2, T):   backbone frozen,       lambda_scaffold decays 1→0
     """
 
     def __init__(
@@ -151,7 +146,7 @@ class D3QNAgentV2:
         state_dim, action_dim, u_action_dim,
         mf_hidden_sizes, mf_lr, buffer_min_size,
         hidden_sizes=(128, 64),
-        lr=1e-4, lr_bone_low=5e-5,
+        lr=1e-4, lr_bone_low=1e-4,
         gamma=0.99, alpha=0.005,
         buffer_size=100000, batch_size=64,
         exclude_zero=False, num_instances=1,
@@ -188,8 +183,10 @@ class D3QNAgentV2:
         self.lr_bone_low  = lr_bone_low
         self.lr_head      = lr
 
-        self.bone_optimizer = optim.Adam(self.eval_net.backbone.parameters(), lr=lr)
-        self.head_optimizer  = optim.Adam(self.eval_net.head.parameters(), lr=lr)
+        self.optimizer = optim.Adam([
+            {'params': self.eval_net.backbone.parameters(), 'lr': lr * 0.2},  # Backbone học chậm hơn 5 lần
+            {'params': self.eval_net.head.parameters(), 'lr': lr}  # Head học tốc độ bình thường
+        ])
         self.mf_optimizer    = optim.Adam(self.mf_net.parameters(), lr=mf_lr)
 
         self.loss_fn = nn.SmoothL1Loss(reduction='none')
@@ -220,23 +217,6 @@ class D3QNAgentV2:
 
         # ── Misc ──────────────────────────────────────────────────────────────
         self.learn_step_counter = 0
-
-    # ── Phase helpers ─────────────────────────────────────────────────────────
-
-    def _get_phase(self, round_idx):
-        if round_idx < 1000:
-            return 1
-        else:
-            return 3
-
-    def _get_lambda(self, round_idx):
-        """No longer used as Head SCAFFOLD is disabled."""
-        return 0.0
-
-    def _set_backbone_lr(self, phase):
-        lr = self.lr_bone_high if phase == 1 else self.lr_bone_low
-        for pg in self.bone_optimizer.param_groups:
-            pg['lr'] = lr
 
     # ── SCAFFOLD round lifecycle ───────────────────────────────────────────────
 
@@ -389,40 +369,39 @@ class D3QNAgentV2:
             q_next        = self.target_net.head(next_feat_tgt, indices=agent_ids).gather(1, next_actions)
             q_target      = rewards + self.gamma * q_next * (1 - dones)
 
-        phase = self._get_phase(round_idx)
-
-        if round_idx < 1000:
+        if round_idx < 500:
             lambda_scaffold = 1.0
         else:
-            decay_factor = 0.992 ** (round_idx - 1000)
+            decay_factor = 0.992 ** (round_idx - 500)
             lambda_scaffold = max(0.1, 1.0 * decay_factor)
         loss = self.loss_fn(q_eval, q_target).mean()
 
         # ── Backbone update (Phase 1 & 2 only) ────────────────────────────────
-        self.bone_optimizer.zero_grad()
-        self.head_optimizer.zero_grad()
-        loss.backward()  # Fix 5: no retain_graph — single backward pass covers all leaf params
+        self.optimizer.zero_grad()
+        loss.backward()
 
         if self.use_scaffold:
             with torch.no_grad():
                 unique_ids = torch.unique(agent_ids)
-                bone_params = list(self.eval_net.backbone.parameters())
-                for i, p in enumerate(bone_params):
+                # Chỉ lặp qua các tham số của Backbone
+                for i, p in enumerate(self.eval_net.backbone.parameters()):
                     if p.grad is not None:
                         raw_g = p.grad.data.clone()
-                        # g_b_corrected = g_b - c_b_local + c_b_global  (only active ids)
-                        p.grad.data[unique_ids] = raw_g[unique_ids] + lambda_scaffold* (
-                            self.c_b_global[i][unique_ids] - self.c_b_local[i][unique_ids]
+
+                        # Áp dụng công thức SCAFFOLD: g_corrected = g_raw + lambda * (c_global - c_local)
+                        # Chỉ cập nhật cho các agent_ids đang hoạt động trong batch
+                        p.grad.data[unique_ids] = raw_g[unique_ids] + lambda_scaffold * (
+                                self.c_b_global[i][unique_ids] - self.c_b_local[i][unique_ids]
                         )
+
+                        # Tích lũy gradient thô để cập nhật c_local sau này
                         self.grad_b_sum[i][unique_ids] += raw_g[unique_ids]
 
                 self.steps_in_round[unique_ids] += 1
-        self._set_backbone_lr(phase)
-        torch.nn.utils.clip_grad_norm_(self.eval_net.backbone.parameters(), max_norm=1.0)
-        self.bone_optimizer.step()
 
-        torch.nn.utils.clip_grad_norm_(self.eval_net.head.parameters(), max_norm=1.0)
-        self.head_optimizer.step()
+        # 3. Gradient Clipping cho TOÀN BỘ MẠNG (An toàn hơn là chỉ clip riêng backbone)
+        torch.nn.utils.clip_grad_norm_(self.eval_net.parameters(), max_norm=1.0)
+        self.optimizer.step()
 
         self.learn_step_counter += 1
         # self._soft_update()
@@ -486,16 +465,28 @@ class D3QNAgentV2:
 
     def _soft_update(self):
         with torch.no_grad():
-            for tp, ep in zip(self.target_net.parameters(), self.eval_net.parameters()):
+            for tp, ep in zip(self.target_net.head.parameters(), self.eval_net.head.parameters()):
                 tp.data.copy_(self.alpha * ep.data + (1.0 - self.alpha) * tp.data)
+
+            alpha_bone = self.alpha * 0.2  # Ví dụ: alpha=0.005 -> alpha_bone=0.001
+
+            for tp, ep in zip(self.target_net.backbone.parameters(), self.eval_net.backbone.parameters()):
+                tp.data.copy_(alpha_bone * ep.data + (1.0 - alpha_bone) * tp.data)
+
+    def reset_round_accumulators(self):
+        """Gọi hàm này ở CUỐI MỖI EPISODE trong strategy"""
+        if not self.use_scaffold: return
+        with torch.no_grad():
+            for g in self.grad_b_sum:
+                g.zero_()
+            self.steps_in_round.zero_()
 
     def save(self, path):
         torch.save({
             'eval_net':    self.eval_net.state_dict(),
             'target_net':  self.target_net.state_dict(),
             'mf_net':      self.mf_net.state_dict(),
-            'bone_opt':    self.bone_optimizer.state_dict(),
-            'head_opt':    self.head_optimizer.state_dict(),
+            'bone_opt':    self.optimizer.state_dict(),
             'mf_opt':      self.mf_optimizer.state_dict(),
             'learn_step':  self.learn_step_counter,
         }, path)
@@ -505,7 +496,6 @@ class D3QNAgentV2:
         self.eval_net.load_state_dict(ckpt['eval_net'])
         self.target_net.load_state_dict(ckpt['target_net'])
         self.mf_net.load_state_dict(ckpt['mf_net'])
-        self.bone_optimizer.load_state_dict(ckpt['bone_opt'])
-        self.head_optimizer.load_state_dict(ckpt['head_opt'])
+        self.optimizer.load_state_dict(ckpt['bone_opt'])
         self.mf_optimizer.load_state_dict(ckpt['mf_opt'])
         self.learn_step_counter = ckpt.get('learn_step', 0)

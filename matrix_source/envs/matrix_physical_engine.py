@@ -46,6 +46,7 @@ class MatrixPhysicalEngine:
         self.backlog_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), device=self.device)
         self.backlog_counts = torch.zeros((self.num_nodes, self.num_services), dtype=torch.long, device=self.device)
         self.deadline_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), device=self.device)
+        self.age_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), device=self.device)
         self.f_min_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), device=self.device)
         
         self.cpu_alloc_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
@@ -105,6 +106,7 @@ class MatrixPhysicalEngine:
         self.backlog_queue.zero_()
         self.backlog_counts.zero_()
         self.deadline_queue.zero_()
+        self.age_queue.zero_()
         self.f_min_queue.zero_()
         self.immediate_fails.zero_()
         self.fail_placement.zero_()
@@ -381,6 +383,7 @@ class MatrixPhysicalEngine:
                     vq_n, vq_s, vq_k = v_hw_n[valid_queue_mask], v_hw_s[valid_queue_mask], absolute_ks[valid_queue_mask]
                     self.backlog_queue[vq_n, vq_s, vq_k] = v_hw_w[valid_queue_mask]
                     self.deadline_queue[vq_n, vq_s, vq_k] = v_hw_t[valid_queue_mask]
+                    self.age_queue[vq_n, vq_s, vq_k] = trans_delays[valid_mask][hw_mask][sort_idx][valid_queue_mask]
                     self.f_min_queue[vq_n, vq_s, vq_k] = v_hw_fmin[valid_queue_mask]
                     self.terminal_queue[vq_n, vq_s, vq_k] = terminal_indices[valid_mask][hw_mask][sort_idx][valid_queue_mask]
                     
@@ -420,7 +423,6 @@ class MatrixPhysicalEngine:
         # Z decays by max_node_capacity * slot_duration (virtual max throughput per slot)
         f_max = self.resource_specs[:, 0].unsqueeze(1) * self.placement_matrix  # (N, S)
         virtual_service = f_max * self.slot_duration   # max work node can do for each service
-        self.Z_queue = (self.Z_queue - virtual_service + self.rejected_workload_step).clamp(min=0)
         t0 = time.perf_counter()
         current_backlog_total = self.backlog_queue.sum(dim=-1)
         count_before = self.backlog_counts.clone()
@@ -429,15 +431,18 @@ class MatrixPhysicalEngine:
         # Terminal -> source node mapping (num_terminals,)
         src_node_mapping = torch.argmax(self.terminal_to_node_map, dim=1).long()
         
-        self.backlog_queue, actual_processed, local_processed = ops.deplete_float_queue(
-            self.backlog_queue, self.deadline_queue, self.terminal_queue, src_node_mapping, self.cpu_alloc_matrix, self.slot_duration
+        self.backlog_queue, actual_processed, local_processed, realized_delays = ops.deplete_float_queue(
+            self.backlog_queue, self.deadline_queue, self.terminal_queue, self.age_queue, src_node_mapping, self.cpu_alloc_matrix, self.slot_duration
         )
         
-        self.backlog_queue, self.deadline_queue, processed_aux, expired_counts_tensor, failed_terminal_ids, failed_svc_ids = ops.age_and_clean_dual_queue(
-            self.backlog_queue, self.deadline_queue, self.slot_duration, self.f_min_queue, self.terminal_queue
+        self.backlog_queue, self.deadline_queue, processed_aux, expired_counts_tensor, failed_terminal_ids, failed_svc_ids, failed_workload_total = ops.age_and_clean_dual_queue(
+            self.backlog_queue, self.deadline_queue, self.slot_duration, self.age_queue, self.f_min_queue, self.terminal_queue
         )
+        
+        # Thêm khối lượng task bị chết trong queue vào rejected_workload để tính Z_queue
+        self.rejected_workload_step += failed_workload_total
 
-        self.f_min_queue, self.terminal_queue = processed_aux[0], processed_aux[1]
+        self.age_queue, self.f_min_queue, self.terminal_queue = processed_aux[0], processed_aux[1], processed_aux[2]
         
         if failed_terminal_ids is not None and len(failed_terminal_ids) > 0:
             self.terminal_fail_counts.index_put_((failed_terminal_ids.long(), failed_svc_ids.long()), torch.ones_like(failed_terminal_ids, dtype=torch.float), accumulate=True)
@@ -460,10 +465,10 @@ class MatrixPhysicalEngine:
         total_drift = ops.calculate_lyapunov_drift(current_backlog_total, node_arrival_matrix, self.cpu_alloc_matrix * self.slot_duration)
 
         # --- Virtual Drift (Augmented Lyapunov) ---
-        # Penalizes accumulated rejected workload at each (node, service).
-        # virtual_drift = beta * sum(Z * rejected_workload_step)
-        # If an agent keeps sending tasks that die at hw limit, Z grows and
-        # this term keeps growing each slot -> agent cannot escape punishment.
+        # Cập nhật Z_queue NGAY LẬP TỨC với khối lượng task hỏng của slot này
+        self.Z_queue = (self.Z_queue - virtual_service + self.rejected_workload_step).clamp(min=0)
+        
+        # Tính hình phạt dựa trên Z mới (đã bao gồm task hỏng) để phạt nặng nhất có thể
         virtual_drift = self.beta_virtual * (self.Z_queue * self.rejected_workload_step).sum()
         # -----------------------------------------
 
@@ -475,8 +480,8 @@ class MatrixPhysicalEngine:
         
         f1 = total_drift + self.lypa_coef * total_energy
         self.reward_global_accumulator += f1
-        qos_penalty = self.omega_1 * torch.exp(num_violations.float() * 0.12)
-        reward = -(f1 + qos_penalty)
+        qos_penalty = self.omega_1 * num_violations.float()
+        reward = -f1 - qos_penalty
         obs = {
             "virtual_drift": virtual_drift,
             "total_drift": total_drift,
@@ -489,6 +494,7 @@ class MatrixPhysicalEngine:
         info = {
             "num_tasks": self.current_num_tasks,
             "external_snack": external_snack.clone(),
+            "realized_delay": realized_delays.clone() if realized_delays is not None else torch.tensor([], device=self.device),
             "immediate_fails": self.immediate_fails.sum(),
             "expired_count": violate_step_tensor.sum() - self.immediate_fails.sum(),
             "remaining": self.backlog_counts.sum(),

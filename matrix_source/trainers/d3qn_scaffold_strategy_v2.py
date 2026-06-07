@@ -10,6 +10,8 @@ from matrix_source.trainers.train import Trainer
 class D3QNScaffoldStrategy(AlgorithmStrategy):
     def initialize_agents(self, trainer):
         # Upper Agent
+        self.aggreate_step= 500
+        self.warm_up_step =50
         trainer.shared_upper_agent = D3QNAgent(
             node_id=-2, node_type="Edge_Group",
             state_dim=trainer.upper_state_dim,
@@ -157,9 +159,8 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
         next_states = build_state(n_obs, t_idx, s_idx, next_node_placements)
         
         rew_divisor = trainer.config.norm_lower_rw
-        reward -= 1.5*next_res["obs"]["virtual_drift"]
+        reward -= 1*next_res["obs"]["virtual_drift"]
         norm_rew = log_transform(reward / (rew_divisor if rew_divisor != 0 else 1.0))
-        norm_rew -= 0.5*next_res["violations"]
 
         rewards = torch.full((len(t_idx),), norm_rew, dtype=torch.float32, device=trainer.device)
         a_ids = (n_idx * trainer.max_models + m_idx).long()
@@ -253,10 +254,10 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
         if not agent.use_scaffold:
             return
 
-        if round_idx < 1000:
+        if round_idx < self.aggreate_step:
             agg_weight = 0.9  # 1000 eps đầu: Tuân thủ global mạnh (90%)
         else:
-            decay_factor = 0.992 ** (round_idx - 1000)
+            decay_factor = 0.992 ** (round_idx - self.aggreate_step)
             agg_weight = max(0.05, 0.9 * decay_factor)
 
         with torch.no_grad():
@@ -348,7 +349,7 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
                     prev_lower_res = results
                     
                     # train lower
-                    res = trainer.shared_lower_agent.learn(torch.arange(trainer.num_terminals, device=trainer.device))
+                    res = trainer.shared_lower_agent.learn(torch.arange(trainer.num_terminals, device=trainer.device), round_idx=ep)
                     if res is not None:
                         trainer.total_lower_steps += 1
                         if isinstance(res, dict):
@@ -366,9 +367,9 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
 
             # update ep and history
             # Federated Aggregation (SCAFFOLD) for lower agent
-            if ep>30:
+            if ep>self.warm_up_step:
                 self.perform_scaffold_aggregation_v2(trainer.shared_lower_agent, round_idx=ep)
-
+            trainer.shared_lower_agent.reset_round_accumulators()
             trainer.update_rates(ep)
             trainer.aggregator.store_history()
             trainer.aggregator.report_episode(ep)

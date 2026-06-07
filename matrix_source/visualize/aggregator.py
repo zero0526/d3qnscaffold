@@ -53,6 +53,7 @@ class MetricsAggregator:
         self.episode_assigned_list = []
         self.episode_failed_list = []
         self.episode_realized_delay = []
+        self.episode_virtual_drift = []
         
         # Training/State tracking
         self.episode_upper_mf_losses = []
@@ -105,7 +106,9 @@ class MetricsAggregator:
             
         info = step_output.get("info", {})
         obs = step_output.get("obs", {})
-        if obs: self.episode_backlog_drift.append(obs.get("total_drift", 0))
+        if obs: 
+            self.episode_backlog_drift.append(obs.get("total_drift", 0))
+            self.episode_virtual_drift.append(obs.get("virtual_drift", 0))
         
         self.episode_energy.append(step_output.get("energy", 0))
         self.episode_violations.append(step_output.get("violations", 0))
@@ -127,11 +130,9 @@ class MetricsAggregator:
                 self.episode_terminal_fails = np.zeros_like(term_fails)
             self.episode_terminal_fails += term_fails
         
-        r_delay = info.get("realized_delay", {})
-        if r_delay:
-            # Vectorized mean of all delays in the dict (each value is a tensor)
-            delays = [torch.mean(v) for v in r_delay.values()]
-            self.episode_realized_delay.append(torch.stack(delays).mean())
+        r_delay = info.get("realized_delay")
+        if r_delay is not None and r_delay.numel() > 0:
+            self.episode_realized_delay.append(r_delay.mean())
 
         # Failure reasons
         reasons = info.get("fail_reasons")
@@ -217,6 +218,7 @@ class MetricsAggregator:
         self.history["avg_backlog_drift"].append(_get_avg(self.episode_backlog_drift, "avg_backlog_drift"))
         self.history["avg_remaining_tasks"].append(_get_avg(self.episode_remaining_tasks, "avg_remaining_tasks"))
         self.history["avg_realized_delay"].append(_get_avg(self.episode_realized_delay, "avg_realized_delay"))
+        self.history["avg_virtual_drift"].append(_get_avg(self.episode_virtual_drift, "avg_virtual_drift"))
         self.history["total_violations"].append(violate)
         
         # Additional metrics for restored plots
@@ -272,7 +274,7 @@ class MetricsAggregator:
 
     def plot_history(self, ep=None):
         if not self.history["total_reward"]: return
-        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        fig, axes = plt.subplots(4, 3, figsize=(18, 16))
         plt.suptitle(f"Training Progress (Episode {len(self.history['total_reward'])})", fontsize=16)
         
         window = 10
@@ -282,12 +284,19 @@ class MetricsAggregator:
             ("total_energy", "Energy Consumption", "orange"),
             ("avg_realized_delay", "Delay Evolution", "red"),
             ("qos_success_rate", "QoS Satisfaction", "purple"),
-            ("completion_rate", "Task Throughput", "blue")
+            ("completion_rate", "Task Throughput", "blue"),
+            ("avg_upper_td_loss", "Upper TD Loss", "brown"),
+            ("avg_lower_td_loss", "Lower TD Loss", "cyan"),
+            ("avg_upper_mf_loss", "Upper MF Loss", "olive"),
+            ("avg_lower_mf_loss", "Lower MF Loss", "pink"),
+            ("total_violations", "Total Violations", "red"),
+            ("avg_virtual_drift", "Virtual Drift (Cheating Penalty)", "orange")
         ]
 
         for i, (key, title, color) in enumerate(metrics):
             ax = axes[i // 3, i % 3]
             data = self.history[key]
+            if not data: continue
             
             # Plot raw data with transparency
             ax.plot(data, color=color, alpha=0.3, label="Raw")
@@ -298,11 +307,11 @@ class MetricsAggregator:
                 ax.plot(range(window-1, len(data)), ma_data, color=color, linewidth=2, label=f"MA-{window}")
             
             ax.set_title(title)
-            ax.legend()
+            # ax.legend()
             ax.grid(True)
             
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        plt.savefig(os.path.join(cfg.plot_dir, f"training_progress_{ep if ep else 'latest'}.png"))
+        plt.savefig(os.path.join(cfg.plot_dir, "training_progress.png"))
         plt.close()
 
     def save_history_csv(self):

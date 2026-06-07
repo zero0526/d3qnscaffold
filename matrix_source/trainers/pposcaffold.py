@@ -53,11 +53,33 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
 
         # Hyperparams from user (Strict 5-Cycle Curriculum)
         self.cycle_configs = {
-            1: {'lower': 15, 'upper': 10, 'zeta': 1.0, 'det': False},
-            2: {'lower': 12, 'upper': 8,  'zeta': 1.0, 'det': False},
-            3: {'lower': 10, 'upper': 7,  'zeta': 1.0, 'det': False},
-            4: {'lower': 8,  'upper': 5,  'zeta': 1.0, 'det': False},
-            5: {'lower': 6,  'upper': 4,  'zeta': 1.0, 'det': True}
+            1: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            2: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            3: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            4: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            5: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            6: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            7: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            8: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            9: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            10: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            11: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            12: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            13: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            14: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            15: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            16: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            17: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            18: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            19: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            20: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            21: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            22: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            23: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            24: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            25: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            26: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            27: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': True},
         }
 
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
@@ -438,6 +460,11 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
         Cluster-Based Federated Aggregation for PPO (split backbone/head).
         Synchronizes terminals connected to the same Edge Node.
         """
+        if self.cycle_num <= 2:
+            agg_weight = 0.9
+        else:
+            decay_factor = 0.99 ** (self.cycle_num - 2)
+            agg_weight = max(0.1, 0.9 * decay_factor)
         with torch.no_grad():
             for group_idx, terminal_ids in self.node_to_terminals.items():
                 if not terminal_ids:
@@ -455,14 +482,15 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                     # Compute mean of weights for terminals in this cluster
                     cluster_mean = p.data[t_ids].mean(dim=0, keepdim=True)
                     # Broadcast average back to all cluster members
-                    p.data[t_ids] = cluster_mean.expand(len(terminal_ids), *cluster_mean.shape[1:])
+                    p.data[t_ids] = (1.0 - agg_weight) * p.data[t_ids] + \
+                                    agg_weight * cluster_mean.expand(len(terminal_ids), *cluster_mean.shape[1:])
 
                 # Step 3: Aggregate backbone control variates to update the global correction term
                 c_b_local_slices = agent.get_c_b_local(t_ids)
                 # Global variate for the cluster is the average of local variates
                 c_b_new_global = [c.mean(dim=0, keepdim=True).expand(len(terminal_ids), *c.shape[1:]) 
                                   for c in c_b_local_slices]
-                agent.set_c_b_global(t_ids, c_b_new_global)
+                agent.set_c_b_global(t_ids, c_b_new_global, agg_weight)
 
         # Step 4: Reset round-specific accumulators (gradients and step counts)
         agent.save_base_initial()
@@ -648,8 +676,10 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                     current_upper_state = next_upper_state
                     obs_upper = res_upper
 
-            # 3. Synchronize Clusters (SCAFFOLD Aggregation)
-            self.perform_scaffold_aggregation(trainer.shared_lower_agent)
+            if self.cycle_num > 2:
+                self.perform_scaffold_aggregation(trainer.shared_lower_agent)
+            else:
+                trainer.shared_lower_agent.save_base_initial()
 
             trainer.aggregator.store_history()
             trainer.aggregator.report_episode(ep)

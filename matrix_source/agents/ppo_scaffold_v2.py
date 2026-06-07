@@ -324,10 +324,11 @@ class PPOSCAFFOLDREPAgent:
     def get_c_b_local(self, instance_ids):
         return [c[instance_ids].clone() for c in self.c_b_local]
 
-    def set_c_b_global(self, instance_ids, c_b_global_list):
+    def set_c_b_global(self, instance_ids, c_b_global_list, agg_weight):
         with torch.no_grad():
             for c_g, new_val in zip(self.c_b_global, c_b_global_list):
-                c_g[instance_ids] = new_val
+                c_g[instance_ids] = (1.0 - agg_weight) * c_g[instance_ids] + \
+                                    agg_weight * new_val
 
     def update_local_cvariates(self, instance_ids: torch.Tensor):
         with torch.no_grad():
@@ -445,6 +446,12 @@ class PPOSCAFFOLDREPAgent:
         # 3. Post-PPO SCAFFOLD Update for Backbone (CHẠY 1 LẦN DUY NHẤT SAU LOOP)
         self.update_local_cvariates(target_agents) # Cập nhật c_local dựa trên grad tích lũy
 
+        if self.learn_step_counter < 50:
+            lambda_scaffold = 1.0
+        else:
+            decay_factor = 0.99 ** (self.learn_step_counter - 50)
+            lambda_scaffold = max(0.1, 1.0 * decay_factor)
+
         with torch.no_grad():
             active_mask = self.steps_in_round > 0
             if active_mask.any():
@@ -458,8 +465,9 @@ class PPOSCAFFOLDREPAgent:
                     avg_grad = self.grad_b_sum[i][active_ids] / K
                     
                     # Áp dụng công thức SCAFFOLD: g_corrected = g_avg + (c_global - c_local)
+                    correction_term = self.c_b_global[i][active_ids] - self.c_b_local[i][active_ids]
                     p.grad = torch.zeros_like(p)
-                    p.grad.data[active_ids] = avg_grad + (self.c_b_global[i][active_ids] - self.c_b_local[i][active_ids])
+                    p.grad.data[active_ids] = avg_grad + (lambda_scaffold * correction_term)
                 
                 # STEP BACKBONE
                 torch.nn.utils.clip_grad_norm_(self.bone_params, max_norm=1.0)
