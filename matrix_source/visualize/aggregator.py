@@ -285,7 +285,7 @@ class MetricsAggregator:
             ("total_reward", "Reward Convergence", "blue"),
             ("avg_backlog_drift", "System Stability (Drift)", "green"),
             ("total_energy", "Energy Consumption", "orange"),
-            ("avg_realized_delay", "Delay Evolution", "red"),
+            ("realized_delay", "Delay Evolution", "red"),
             ("qos_success_rate", "QoS Satisfaction", "purple"),
             ("completion_rate", "Task Throughput", "blue"),
             ("avg_upper_td_loss", "Upper TD Loss", "brown"),
@@ -321,8 +321,16 @@ class MetricsAggregator:
         path = os.path.join(cfg.results, "training_history.csv")
         if not os.path.exists(cfg.results): os.makedirs(cfg.results)
         keys = sorted(self.history.keys())
+        # Find maximum length to handle inconsistent history (e.g. after a rename)
+        max_len = max(len(self.history[k]) for k in keys) if keys else 0
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(keys)
-            for i in range(len(self.history[keys[0]])):
-                writer.writerow([self.history[k][i] for k in keys])
+            for i in range(max_len):
+                row = []
+                for k in keys:
+                    if i < len(self.history[k]):
+                        row.append(self.history[k][i])
+                    else:
+                        row.append(0.0) # Padding for mismatched history lengths
+                writer.writerow(row)
