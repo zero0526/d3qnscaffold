@@ -50,21 +50,36 @@ class PPOStrategy(AlgorithmStrategy):
 
         # Hyperparams from user (Strict 5-Cycle Curriculum)
         self.cycle_configs = {
-            1: {'lower': 10, 'upper': 10, 'zeta': 1.0, 'det': False},
-            2: {'lower': 10, 'upper': 10,  'zeta': 1.0, 'det': False},
-            3: {'lower': 10, 'upper': 10,  'zeta': 1.0, 'det': False},
-            4: {'lower': 8,  'upper': 8,  'zeta': 1.0, 'det': False},
-            5: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
-            6: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
-            7: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
-            8: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
-            9: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
-            10: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
-            11: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
-            13: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
-            14: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
-            15: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
-            16: {'lower': 8,  'upper': 8,  'zeta': 1.0, 'det': True}
+            1: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            2: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            3: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            4: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            5: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            6: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            7: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            8: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            9: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            10: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            11: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            12: {'lower': 6, 'upper': 3, 'zeta': 1.0, 'det': False},
+            13: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            14: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            15: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            16: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            17: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            18: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            19: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            20: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            21: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            22: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            23: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            24: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            25: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            26: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            27: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            28: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            29: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            30: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': True},
         }
         
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
@@ -100,9 +115,11 @@ class PPOStrategy(AlgorithmStrategy):
             gamma=trainer.config.hyper_neural['DISCOUNT_FACTOR'],
             lam=trainer.config.hyper_neural.get('LAMBDA', 0.95),
             clip_eps=trainer.config.hyper_neural.get('CLIP_EPS', 0.2),
+            entropy_coef=0.001,
             k_epochs=self.upper_cfg['epochs'],
             batch_size=self.upper_cfg['batch'],
             num_instances=trainer.num_edge_agents,
+            increase_rate_zeta=1.001,
             device=trainer.device
         )
 

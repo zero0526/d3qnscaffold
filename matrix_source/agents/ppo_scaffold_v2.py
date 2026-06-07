@@ -372,7 +372,7 @@ class PPOSCAFFOLDREPAgent:
         batch_group_ids = group_ids[agent_ids].to(self.device)
 
         # 0. Save Base Initial: Reset grad accumulators and steps at start of round
-        self.save_base_initial()
+        # self.save_base_initial()
 
         # 1. Compute GAE
         pred_mfs, advantages, returns = self._compute_gae(

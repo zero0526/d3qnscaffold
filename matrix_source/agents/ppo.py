@@ -174,7 +174,7 @@ class PPOAgent:
         self.initial_entropy_coef = entropy_coef  # Lưu lại giá trị ban đầu (ví dụ 0.05)
         self.entropy_coef = entropy_coef          # Giá trị đang dùng hiện tại
         self.entropy_decay_rate = 0.99          # Tốc độ giảm sau mỗi lần learn (thử 0.999 - 0.9999)
-        self.min_entropy_coef = 0.001             # Giá trị nhỏ nhất cho phép (không để nó bằng 0 hoàn toàn)
+        self.min_entropy_coef = 0.0001             # Giá trị nhỏ nhất cho phép (không để nó bằng 0 hoàn toàn)
 
         # PPO Hyperparameters
         self.gamma = gamma

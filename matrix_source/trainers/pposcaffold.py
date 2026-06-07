@@ -79,7 +79,10 @@ class PPOSCAFFOLDREPStrategy(AlgorithmStrategy):
             24: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
             25: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
             26: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
-            27: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': True},
+            27: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            28: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            29: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': False},
+            30: {'lower': 5, 'upper': 3, 'zeta': 1.0, 'det': True},
         }
 
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
