@@ -217,7 +217,7 @@ class MetricsAggregator:
         self.history["completion_rate"].append(success / total_resolved if total_resolved > 0 else 0.0)
         self.history["avg_backlog_drift"].append(_get_avg(self.episode_backlog_drift, "avg_backlog_drift"))
         self.history["avg_remaining_tasks"].append(_get_avg(self.episode_remaining_tasks, "avg_remaining_tasks"))
-        self.history["avg_realized_delay"].append(_get_avg(self.episode_realized_delay, "avg_realized_delay"))
+        self.history["realized_delay"].append(_get_avg(self.episode_realized_delay, "realized_delay"))
         self.history["avg_virtual_drift"].append(_get_avg(self.episode_virtual_drift, "avg_virtual_drift"))
         self.history["total_violations"].append(violate)
         
@@ -225,9 +225,10 @@ class MetricsAggregator:
         self.history["qos_rate"].append(success / (violate if violate > 0 else 1.0))
 
         self.episode_count += 1
+        if self.episode_count % 5 == 0:
+            self.save_history_csv()
         if self.episode_count % 50 == 0:
             self.plot_history(ep=self.episode_count)
-            self.save_history_csv()
 
     def report_episode(self, ep):
         """Prints summary. history[-1] contains processed results for current ep."""
@@ -240,7 +241,9 @@ class MetricsAggregator:
         total_success = sum(self.episode_success_qos)
         total_failed = sum(self.episode_violate_qos)
         
-        self.log(f"EP {ep:4d} | Rew: {tr:8.2f} | Energy: {en:8.2f} | QoS: {qos:6.2%} | Comp: {cr:6.2%} | OK: {total_success:4.0f} | FAIL: {total_failed:4.0f}")
+        delay = self.history["realized_delay"][-1] if self.history["realized_delay"] else 0
+        
+        self.log(f"EP {ep:4d} | Rew: {tr:8.2f} | Delay: {delay:6.2f} | Energy: {en:8.2f} | QoS: {qos:6.2%} | Comp: {cr:6.2%} | OK: {total_success:4.0f} | FAIL: {total_failed:4.0f}")
         
         if self.episode_terminal_fails is not None and np.sum(self.episode_terminal_fails) > 0:
             pass
