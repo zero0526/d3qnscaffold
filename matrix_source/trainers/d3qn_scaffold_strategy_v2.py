@@ -109,7 +109,7 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
             
         masks = D3QNScaffoldStrategy.calculate_lower_masks(trainer, t_idx, s_idx, tasks_min_accuracy, placement_matrix)
         batch_actions = trainer.shared_lower_agent.choose_action_batch(
-            states, mf_terminals[t_idx], trainer.eps_lower, trainer.zeta_lower, masks_batch=masks.to(trainer.device),
+            states, mf_terminals[t_idx], trainer.zeta_lower, masks_batch=masks.to(trainer.device),
             agent_indices=torch.arange(trainer.num_terminals, device=trainer.device)
         )
         
@@ -195,60 +195,6 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
             edge_states, edge_c_mfs, edge_n_mfs, edge_a_ids, rewards, edge_next_states, dones, agent_ids=instance_indices
         )
         trainer.aggregator.add_upper(next_res, mf_loss=avg_mf_loss, state=edge_states[0] if len(edge_states) > 0 else None)
-
-    def perform_scaffold_aggregation(self, agent: D3QNAgent):
-        """
-        Cluster-Based Federated aggregation for Multi-Instance D3QNAgent using SCAFFOLD.
-        Aggregates terminals locally within each Edge Node cluster.
-        """
-        if not agent.use_scaffold:
-            return
-
-        with torch.no_grad():
-            # Parameters in agent.eval_net.get_base_params() are shape (num_instances, ...)
-            # We iterate through each cluster of terminals connected to a specific edge or cloud node
-            for node_id, terminal_ids in self.node_to_terminals.items():
-                if not terminal_ids: continue
-                
-                t_ids = torch.tensor(terminal_ids, device=agent.device)
-                
-                # 1. Aggregate local base weights (theta_i) for THIS cluster only
-                for i, p in enumerate(agent.eval_net.get_base_params()):
-                    # p.data[t_ids] has shape (len(terminal_ids), ...)
-                    cluster_p = p.data[t_ids].mean(dim=0, keepdim=True)
-                    
-                    # SCAFFOLD Control Variate (c_i) update logic:
-                    # c_i = c_i - c_cluster + (grad_sum / K)
-                    K_dims = [len(terminal_ids)] + [1] * (p.data.dim() - 1)
-                    K_expanded = agent.steps_in_round[t_ids].float().view(*K_dims)
-                    K_expanded = torch.clamp(K_expanded, min=1.0)
-                    
-                    # c_cluster for this specific parameter set and this specific cluster
-                    # self.c_global[i] in the agent stores the "global" for each instance.
-                    # We treat all instances in t_ids as sharing the same global value.
-                    
-                    # delta_c: (len(terminal_ids), ...)
-                    delta_c = agent.grad_sum[i][t_ids] / K_expanded
-                    
-                    # Update local c_i for cluster members
-                    agent.c_i[i][t_ids] = agent.c_i[i][t_ids] - agent.c_global[i][t_ids] + delta_c
-                    
-                    # Broadcast average cluster_p back to all terminals in this cluster
-                    p.data[t_ids] = cluster_p.expand(len(terminal_ids), *cluster_p.shape[1:])
-                
-                # 2. Update cluster-specific global control variate (c_global)
-                # All terminals in t_ids should now share the same new c_global value
-                for i in range(len(agent.c_i)):
-                    new_cluster_c_global = agent.c_i[i][t_ids].mean(dim=0, keepdim=True)
-                    agent.c_global[i][t_ids] = new_cluster_c_global.expand(len(terminal_ids), *new_cluster_c_global.shape[1:])
-            
-            # 3. Synchronize Target Network (Base part) for all instances
-            # (Targets are synchronized to their local eval weights which were just averaged per-cluster)
-            for target_p, eval_p in zip(agent.target_net.get_base_params(), agent.eval_net.get_base_params()):
-                target_p.data.copy_(eval_p.data)
-                
-            # 4. Checkpoint for next round
-            agent.save_base_initial()
 
     def perform_scaffold_aggregation_v2(self, agent, round_idx: int = 0):
         if not agent.use_scaffold:
@@ -370,11 +316,12 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
             if ep>self.warm_up_step:
                 self.perform_scaffold_aggregation_v2(trainer.shared_lower_agent, round_idx=ep)
             trainer.shared_lower_agent.reset_round_accumulators()
+            trainer.shared_lower_agent.update_epsilon()
             trainer.update_rates(ep)
             trainer.aggregator.store_history()
             trainer.aggregator.report_episode(ep)
             print(f"--- Global Metrics ---")
             print(f"Lower Samples: {trainer.total_lower_steps} | Upper Samples: {trainer.total_upper_steps}")
             print(f"Zeta Lower: {trainer.zeta_lower:.4f} | Zeta Upper: {trainer.zeta_upper:.4f}")
-            print(f"Current Epsilon upper: {trainer.eps_upper:.4f} lower: {trainer.eps_lower:.4f}")
+            print(f"Current Epsilon upper: {trainer.eps_upper:.4f} lower: {trainer.shared_lower_agent.epsilon:.4f}")
 

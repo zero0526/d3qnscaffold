@@ -217,6 +217,9 @@ class D3QNAgentV2:
 
         # ── Misc ──────────────────────────────────────────────────────────────
         self.learn_step_counter = 0
+        self.epsilon = 0.5
+        self.eps_min = 0.0
+        self.eps_decay = (self.epsilon - self.eps_min) / 500.0
 
     # ── SCAFFOLD round lifecycle ───────────────────────────────────────────────
 
@@ -229,20 +232,29 @@ class D3QNAgentV2:
                 g.zero_()
             self.steps_in_round.zero_()
 
+    def sync_target_backbone(self):
+        """
+        HARD UPDATE: Copy 100% trọng số từ eval_net.backbone sang target_net.backbone.
+        Được gọi DUY NHẤT ngay sau khi Federated Aggregation diễn ra.
+        """
+        with torch.no_grad():
+            for tp, ep in zip(self.target_net.backbone.parameters(), self.eval_net.backbone.parameters()):
+                tp.data.copy_(ep.data)
+
     # ── Action selection (unchanged from v1) ──────────────────────────────────
 
-    def choose_action(self, state, prev_mf, epsilon, zeta, mask=None, agent_idx=0):
+    def choose_action(self, state, prev_mf, zeta, mask=None, agent_idx=0):
         idx_tensor = torch.tensor([agent_idx], device=self.device)
         actions = self.choose_action_batch(
             state.unsqueeze(0) if not torch.is_tensor(state) else state.detach().unsqueeze(0),
             prev_mf.unsqueeze(0) if not torch.is_tensor(prev_mf) else prev_mf.detach().unsqueeze(0),
-            epsilon, zeta,
+            zeta,
             masks_batch=mask.unsqueeze(0) if mask is not None else None,
             agent_indices=idx_tensor
         )
         return int(actions[0])
 
-    def choose_action_batch(self, states_batch, prev_mfs_batch, epsilon, zeta, masks_batch=None, agent_indices=None):
+    def choose_action_batch(self, states_batch, prev_mfs_batch, zeta, masks_batch=None, agent_indices=None):
         batch_size = states_batch.shape[0]
         if agent_indices is None:
             agent_indices = torch.zeros(batch_size, dtype=torch.long, device=self.device)
@@ -252,7 +264,7 @@ class D3QNAgentV2:
         if masks_batch is not None:
             masks_batch = masks_batch.to(self.device)
 
-        states_batch  = states_batch.to(self.device).float()
+        states_batch = states_batch.to(self.device).float()
         prev_mfs_batch = prev_mfs_batch.to(self.device).float()
 
         is_policy_agent = torch.tensor([
@@ -277,8 +289,8 @@ class D3QNAgentV2:
         policy_mask = is_policy_agent
         if policy_mask.any():
             indices = policy_mask.nonzero(as_tuple=True)[0]
-            s_subset   = states_batch[indices]
-            mf_subset  = prev_mfs_batch[indices]
+            s_subset = states_batch[indices]
+            mf_subset = prev_mfs_batch[indices]
             aid_subset = agent_indices[indices]
 
             with torch.no_grad():
@@ -296,16 +308,27 @@ class D3QNAgentV2:
                 q_values = torch.nan_to_num(q_values, nan=0.0, posinf=50.0, neginf=-50.0)
                 q_values = q_values.clamp(-50.0, 50.0)
 
-                probs = torch.softmax(q_values, dim=1)
+                probs_boltzmann = torch.softmax(q_values, dim=1)
 
-                # Guard: repair NaN rows (e.g. if all logits are identical after clamping)
-                bad_rows = torch.isnan(probs).any(dim=1) | torch.isinf(probs).any(dim=1)
+                # Guard: repair NaN rows
+                bad_rows = torch.isnan(probs_boltzmann).any(dim=1) | torch.isinf(probs_boltzmann).any(dim=1)
                 if bad_rows.any():
                     if masks_batch is not None:
-                        probs[bad_rows] = (masks_batch[indices][bad_rows].float() + 1e-8)
-                    probs[bad_rows] = probs[bad_rows] / probs[bad_rows].sum(dim=1, keepdim=True)
+                        probs_boltzmann[bad_rows] = (masks_batch[indices][bad_rows].float() + 1e-8)
+                    probs_boltzmann[bad_rows] = probs_boltzmann[bad_rows] / probs_boltzmann[bad_rows].sum(dim=1,
+                                                                                                          keepdim=True)
 
-                final_actions[indices] = torch.multinomial(probs, 1).squeeze(1)
+                # if random.random() < self.epsilon:
+                #     if masks_batch is not None:
+                #         m = masks_batch[indices]
+                #         random_probs = m / m.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                #     else:
+                #         random_probs = torch.ones_like(q_values) / self.u_action_dim
+                #     final_actions[indices] = torch.multinomial(random_probs, 1).squeeze(1)
+                # else:
+                #     # EXPLOIT: Chọn theo Q-network (Boltzmann)
+                final_actions[indices] = torch.multinomial(probs_boltzmann, 1).squeeze(1)
+                # =========================================================
 
         return final_actions.tolist()
 
@@ -351,11 +374,10 @@ class D3QNAgentV2:
         states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids, masks, next_masks = \
             self.memory.sample(self.batch_size, agent_ids=target_agents)
 
-        self.learn_mf_batch(states, prev_mfs, curr_mfs, agent_ids)
 
         # ── Forward pass ──────────────────────────────────────────────────────
         pred_curr_mfs = self.mf_net(torch.cat([states, prev_mfs], dim=-1), indices=agent_ids)
-        feat          = self.eval_net.backbone(states, pred_curr_mfs.detach(), indices=agent_ids)
+        feat          = self.eval_net.backbone(states, curr_mfs, indices=agent_ids)
         q_eval        = self.eval_net.head(feat, indices=agent_ids).gather(1, actions)
 
         with torch.no_grad():
@@ -404,7 +426,6 @@ class D3QNAgentV2:
         self.optimizer.step()
 
         self.learn_step_counter += 1
-        # self._soft_update()
 
         if self.logs_q:
             return {
@@ -468,10 +489,8 @@ class D3QNAgentV2:
             for tp, ep in zip(self.target_net.head.parameters(), self.eval_net.head.parameters()):
                 tp.data.copy_(self.alpha * ep.data + (1.0 - self.alpha) * tp.data)
 
-            alpha_bone = self.alpha * 0.2  # Ví dụ: alpha=0.005 -> alpha_bone=0.001
-
             for tp, ep in zip(self.target_net.backbone.parameters(), self.eval_net.backbone.parameters()):
-                tp.data.copy_(alpha_bone * ep.data + (1.0 - alpha_bone) * tp.data)
+                tp.data.copy_(self.alpha * ep.data + (1.0 - self.alpha) * tp.data)
 
     def reset_round_accumulators(self):
         """Gọi hàm này ở CUỐI MỖI EPISODE trong strategy"""
@@ -480,6 +499,10 @@ class D3QNAgentV2:
             for g in self.grad_b_sum:
                 g.zero_()
             self.steps_in_round.zero_()
+
+    def update_epsilon(self):
+        """Decrease epsilon by decay amount, but stay above min."""
+        self.epsilon = max(self.eps_min, self.epsilon - self.eps_decay)
 
     def save(self, path):
         torch.save({
