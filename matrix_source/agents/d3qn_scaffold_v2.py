@@ -217,9 +217,9 @@ class D3QNAgentV2:
 
         # ── Misc ──────────────────────────────────────────────────────────────
         self.learn_step_counter = 0
-        self.epsilon = 0.9
-        self.eps_min = 0.1
-        self.eps_decay = (self.epsilon - self.eps_min) / 500.0
+        self.epsilon = 1.0
+        self.eps_min = 0.01
+        self.eps_decay_rate = 0.993442  # (0.01/1.0)**(1/700)
 
     # ── SCAFFOLD round lifecycle ───────────────────────────────────────────────
 
@@ -301,20 +301,6 @@ class D3QNAgentV2:
                     m = masks_batch[indices]
                     q_values = q_values + (m - 1.0) * 1e10
 
-                # Guard: clamp q_values to prevent softmax overflow
-                q_values = torch.nan_to_num(q_values, nan=0.0, posinf=50.0, neginf=-50.0)
-                q_values = q_values.clamp(-50.0, 50.0)
-
-                probs_boltzmann = torch.softmax(q_values, dim=1)
-
-                # Guard: repair NaN rows
-                bad_rows = torch.isnan(probs_boltzmann).any(dim=1) | torch.isinf(probs_boltzmann).any(dim=1)
-                if bad_rows.any():
-                    if masks_batch is not None:
-                        probs_boltzmann[bad_rows] = (masks_batch[indices][bad_rows].float() + 1e-8)
-                    probs_boltzmann[bad_rows] = probs_boltzmann[bad_rows] / probs_boltzmann[bad_rows].sum(dim=1,
-                                                                                                          keepdim=True)
-
                 if random.random() < self.epsilon:
                     # EXPLORE: Random choice within valid mask
                     if masks_batch is not None:
@@ -324,8 +310,8 @@ class D3QNAgentV2:
                     else:
                         final_actions[indices] = torch.randint(0, self.u_action_dim, (len(indices),), device=self.device)
                 else:
-                    # STOCHASTIC: Choose action using Boltzmann distribution
-                    final_actions[indices] = torch.multinomial(probs_boltzmann, 1).squeeze(1)
+                    # GREEDY: Choose action with highest Q-value
+                    final_actions[indices] = q_values.argmax(dim=1)
                 # =========================================================
 
         return final_actions.tolist()
@@ -421,7 +407,7 @@ class D3QNAgentV2:
 
         # 3. Gradient Clipping cho TOÀN BỘ MẠNG (An toàn hơn là chỉ clip riêng backbone)
         torch.nn.utils.clip_grad_norm_(self.eval_net.parameters(), max_norm=1.0)
-        # self.optimizer.step()
+        self.optimizer.step()
 
         self.learn_step_counter += 1
         self._soft_update()
@@ -499,8 +485,8 @@ class D3QNAgentV2:
             self.steps_in_round.zero_()
 
     def update_epsilon(self):
-        """Decrease epsilon by decay amount, but stay above min."""
-        self.epsilon = max(self.eps_min, self.epsilon - self.eps_decay)
+        """Decrease epsilon exponentially, but stay above min."""
+        self.epsilon = max(self.eps_min, self.epsilon * self.eps_decay_rate)
 
     def save(self, path):
         torch.save({
