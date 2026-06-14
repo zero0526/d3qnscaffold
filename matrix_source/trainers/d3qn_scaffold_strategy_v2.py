@@ -159,7 +159,7 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
         next_states = build_state(n_obs, t_idx, s_idx, next_node_placements)
         
         rew_divisor = trainer.config.norm_lower_rw
-        # reward -= 1*next_res["obs"]["virtual_drift"]
+        reward -= 1*next_res["obs"]["virtual_drift"]
         norm_rew = log_transform(reward / (rew_divisor if rew_divisor != 0 else 1.0))
 
         rewards = torch.full((len(t_idx),), norm_rew, dtype=torch.float32, device=trainer.device)
