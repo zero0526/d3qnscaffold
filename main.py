@@ -12,9 +12,6 @@ cfg.hyper_neural["NUM_LOWER_AGENTS"] =60
 if cfg.hyper_neural["NUM_LOWER_AGENTS"]==60:
     cfg.norm_upper_rw*=2
     cfg.norm_lower_rw*=2
-elif cfg.hyper_neural["NUM_LOWER_AGENTS"]==40:
-    cfg.norm_upper_rw *= 1
-    cfg.norm_lower_rw *= 1
 if __name__ == '__main__':
     strategy = D3QNScaffoldStrategy()
     trainer = Trainer(strategy=strategy)
